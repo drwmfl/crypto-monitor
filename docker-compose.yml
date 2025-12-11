@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  # 1. 数据库服务
+  db:
+    image: postgres:15
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: crypto_db
+    ports:
+      - "5432:5432"
+
+  # 2. 后端 API + 采集器
+  backend:
+    build: ./backend
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://user:password@db:5432/crypto_db
+      - CMC_API_KEY=909286096de241b8868ad1d075c86ebb
+    depends_on:
+      - db
+
+  # 3. 前端 (本地开发模式)
+  # 生产环境通常会 build 成静态文件，但为了方便修改，这里用 dev 模式
+  frontend:
+    image: node:20
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    command: sh -c "npm install && npm run dev -- --host"
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
+
+volumes:
+  postgres_data:
