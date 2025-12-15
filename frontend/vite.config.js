@@ -5,11 +5,12 @@ import react from '@vitejs/plugin-react'
 export default defineConfig({
   plugins: [react()],
   server: {
-    host: true, // 监听所有 IP，Docker 必须
-    port: 5173,
-    watch: {
-      usePolling: true,   // 🟢 关键：开启轮询模式，强制检查文件变化
-      interval: 100       // 每 100ms 检查一次
-    }
+    host: '0.0.0.0',
+    // ✅ 关键修复：允许你的域名访问
+    allowedHosts: [
+      'alphamonitorpro.com',
+      'www.alphamonitorpro.com',
+      'localhost' 
+    ]
   }
 })
