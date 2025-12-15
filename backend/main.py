@@ -1,18 +1,21 @@
+import time
+import threading
 from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import desc
-import threading
+from sqlalchemy import desc, func, text # ✅ 补全 sqlalchemy 工具
+from sqlalchemy.exc import OperationalError
 
-# 导入数据库配置
-# 🔥 注意：必须导入 wait_for_db_connection 这个函数
-from database import get_db, engine, Base, wait_for_db_connection
+# 1. 导入项目模块
+# 如果 database.py 里没有 wait_for_db_connection 也不怕，我们在下面自己定义了
+from database import get_db, engine, Base, SessionLocal
+import models
 from models import MarketData
-from collector import run_collector
+import collector # 确保导入采集器
 
 app = FastAPI()
 
-# 配置跨域，允许前端 (localhost:5173) 访问
+# 2. 配置跨域
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,45 +25,79 @@ app.add_middleware(
 )
 
 # ==========================================
-# 🔥 核心启动逻辑 (解决报错的关键)
+# 🛡️ 安全函数：等待数据库连接
+# (直接写在这里，避免 import 报错)
+# ==========================================
+def wait_for_db_connection(max_retries=60, wait_interval=2):
+    print(f"🔄 [System] 正在尝试连接数据库...")
+    for i in range(max_retries):
+        try:
+            # 尝试获取一个连接并执行简单查询
+            db = SessionLocal()
+            db.execute(text("SELECT 1"))
+            db.close()
+            print("✅ [System] 数据库连接成功！")
+            return
+        except OperationalError:
+            print(f"⏳ [System] 数据库未就绪，等待 {wait_interval} 秒... ({i+1}/{max_retries})")
+            time.sleep(wait_interval)
+        except Exception as e:
+            print(f"❌ [System] 数据库连接发生未知错误: {e}")
+            time.sleep(wait_interval)
+    
+    print("❌ [System] 无法连接到数据库，系统可能会崩溃。")
+
+# ==========================================
+# 🔥 核心启动逻辑
 # ==========================================
 @app.on_event("startup")
 def startup_event():
     print("------ 系统初始化开始 ------")
     
-    # 1. ⛔️ 阻断式等待：数据库没连上之前，程序会卡在这里，不会报错退出
-    # 只要这个函数不返回，下面的代码就不会执行
+    # 1. 等待数据库
     wait_for_db_connection()
     
-    # 2. 数据库连接成功后，检查并创建表结构
+    # 2. 创建表结构
     print("🛠️ 正在检查并创建数据库表...")
-    Base.metadata.create_all(bind=engine)
+    models.Base.metadata.create_all(bind=engine)
     
-    # 3. 一切就绪，启动采集器后台线程
+    # 3. 启动后台采集
     print("🚀 启动后台采集线程...")
-    t = threading.Thread(target=run_collector, daemon=True)
-    t.start()
+    try:
+        t = threading.Thread(target=collector.run_collector, daemon=True)
+        t.start()
+    except Exception as e:
+        print(f"❌ 采集器启动失败: {e}")
     
     print("------ 系统启动完成 ------")
 
 # ==========================================
 # API 接口定义
 # ==========================================
-
 @app.get("/")
 def read_root():
-    """健康检查接口"""
     return {"status": "ok", "message": "Crypto Monitor Backend is Running"}
 
 @app.get("/api/market-data")
 def get_latest_market_data(db: Session = Depends(get_db)):
-    """获取最新批次的所有市场数据"""
-    # 1. 查最新的时间戳
-    last_record = db.query(MarketData).order_by(desc(MarketData.timestamp)).first()
-    
-    if not last_record:
-        return [] # 数据库如果是空的，返回空列表
-    
-    # 2. 根据这个时间戳，把该批次几百个币的数据全查出来
-    data = db.query(MarketData).filter(MarketData.timestamp == last_record.timestamp).all()
-    return data
+    """
+    获取最新批次的所有数据
+    优化：只查询最新时间戳的数据，解决加载卡顿问题
+    """
+    try:
+        # 1. 查找最新时间 (使用 func.max 极速查询)
+        latest_timestamp = db.query(func.max(MarketData.timestamp)).scalar()
+        
+        if not latest_timestamp:
+            return [] # 没数据直接返回空
+        
+        # 2. 只拿那一刻的数据，并按市值排序
+        data = db.query(MarketData)\
+            .filter(MarketData.timestamp == latest_timestamp)\
+            .order_by(MarketData.mc.desc())\
+            .all()
+            
+        return data
+    except Exception as e:
+        print(f"❌ 查询数据出错: {e}")
+        return []

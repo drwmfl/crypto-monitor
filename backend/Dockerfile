@@ -15,3 +15,6 @@ COPY . .
 
 # 暴露端口（虽然 docker-compose 会覆盖，但写上是好习惯）
 EXPOSE 8000
+
+# 启动命令
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

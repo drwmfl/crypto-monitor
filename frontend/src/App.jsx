@@ -35,9 +35,36 @@ const columns = [
     dataIndex: 'symbol',
     key: 'symbol',
     fixed: 'left',
-    width: 100,
-    sorter: (a, b) => a.symbol.localeCompare(b.symbol),
-    render: (text) => <span style={{ fontWeight: 'bold' }}>{text.replace('/USDT', '')}</span>,
+    // 2. ✅ [优化] 宽度加宽到 180，防止长名字遮挡价格
+    width: 150, 
+    render: (text, record) => (
+      <div style={{ display: 'flex', alignItems: 'center', fontWeight: 'bold' }}>
+        {/* 点击跳转到币安 */}
+        <a 
+          // 3. ✅ [修复] 链接去掉了中间的斜杠 (比如 WLFI/USDT -> WLFIUSDT)
+          href={`https://www.binance.com/zh-CN/futures/${text.replace('/', '')}`} 
+          target="_blank" 
+          rel="noopener noreferrer"
+          style={{ color: '#1677ff', marginRight: 4 }}
+        >
+          {text}
+        </a>
+        
+        {/* 1. ✅ [优化] 标签改为“现”，字体极小化 */}
+        {record.has_spot && (
+          <Tag color="cyan" style={{ 
+            marginRight: 0, 
+            fontSize: '10px',      // 字体改小
+            lineHeight: '14px',    // 行高收紧
+            padding: '0 3px',      // 内边距缩小
+            transform: 'scale(0.9)', // 整体再稍微缩小一点点
+            transformOrigin: 'left center' // 保证缩放不偏移
+          }}>
+            现
+          </Tag>
+        )}
+      </div>
+    ),
   },
   {
     title: '价格',
@@ -175,29 +202,63 @@ const columns = [
 
 // ---------------- 主组件 ----------------
 function App() {
+  const searchTextRef = useRef('');
   const [data, setData] = useState([]);
   const [filteredData, setFilteredData] = useState([]);
   const [loading, setLoading] = useState(true);
-  
+  const [lastUpdated, setLastUpdated] = useState(null);
   const [searchText, setSearchText] = useState('');
   const [options, setOptions] = useState([]);
-  const searchTextRef = useRef('');
 
-  const fetchData = async () => {
-    try {
-      const res = await axios.get('http://localhost:8000/api/market-data');
-      const newData = res.data;
-      setData(newData);
 
-      const currentSearch = searchTextRef.current;
-      setFilteredData(getFilteredList(newData, currentSearch));
+// 🔍 调试版 fetchData 函数 (请只粘贴这一段)
+const fetchData = async () => {
+  try {
+    console.log("🚀 [1] 开始请求数据...")
+    
+    // 发起请求
+    const res = await axios.get('/api/market-data')
+    const newData = res.data
 
-    } catch (error) {
-      console.error("Fetch error:", error);
-    } finally {
-      setLoading(false);
+    console.log("📦 [2] 后端返回数据:", newData)
+    console.log("📏 [3] 数据长度:", Array.isArray(newData) ? newData.length : "不是数组!")
+
+    // 1. 设置原始数据
+    setData(newData)
+    //setLastUpdated(new Date())
+    
+    // 2. 获取当前搜索词
+    // 这里加个保险，防止 searchTextRef 还没初始化
+    const currentSearch = searchTextRef.current || ''
+    console.log("🔍 [4] 当前搜索词:", currentSearch)
+
+    // 3. 过滤并更新展示列表
+    let list_to_show = []
+    
+    if (currentSearch) {
+      // 如果有搜索词，执行过滤
+      list_to_show = newData.filter(item => 
+        item.symbol && item.symbol.toLowerCase().includes(currentSearch.toLowerCase())
+      )
+      console.log("✂️ [5] 过滤后剩余:", list_to_show.length)
+    } else {
+      // 如果没搜索词，显示全部
+      list_to_show = newData
+      console.log("✅ [5] 无搜索，显示全部:", list_to_show.length)
     }
-  };
+
+    // 🔥 核心：这里是把数据放进表格的地方
+    setFilteredData(list_to_show)
+    
+    // 4. 关闭加载状态
+    setLoading(false)
+    console.log("🏁 [6] 流程结束，Loading 已关闭")
+
+  } catch (error) {
+    console.error("❌ [CRITICAL] fetchData 发生崩溃:", error)
+    setLoading(false)
+  }
+}
 
   useEffect(() => {
     fetchData();
@@ -205,22 +266,28 @@ function App() {
     return () => clearInterval(interval);
   }, []);
 
+  // 监听搜索输入 (和数据变化)
   useEffect(() => {
     searchTextRef.current = searchText;
+    
     const timeoutId = setTimeout(() => {
-      const results = getFilteredList(data, searchText);
+      // ✅ 这里的 data 现在是最新的了
+      const results = filterDataList(data, searchText);
       setFilteredData(results);
+
+      // 处理搜索建议
       if (searchText) {
         const suggestOptions = results.slice(0, 10).map(item => ({
-          value: item.symbol.replace('/USDT', ''),
+          value: item.symbol.replace('USDT', ''), 
         }));
         setOptions(suggestOptions);
       } else {
         setOptions([]);
       }
     }, 300);
+
     return () => clearTimeout(timeoutId);
-  }, [searchText]);
+  }, [searchText, data]); // ✅✅✅ 关键修改：必须把 data 加进依赖数组！
 
   // ================= 统计计算逻辑 =================
   const squeezeCandidates = data.filter(i => i.funding_rate < 0).length;

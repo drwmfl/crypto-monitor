@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # 1. 数据库服务
   db:
@@ -7,39 +5,64 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
     environment:
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
-      POSTGRES_DB: crypto_db
-    ports:
-      - "5432:5432"
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=crypto_monitor
+    restart: always
 
-  # 2. 后端 API + 采集器
+  # 2. 后端服务
   backend:
     build: ./backend
-    command: uvicorn main:app --host 0.0.0.0 --port 8000
+    # 注意：这里改成了 expose，不再直接把 8000 暴露给电脑，而是暴露给 Caddy
+    expose:
+      - "8000"
     volumes:
       - ./backend:/app
-    ports:
-      - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://user:password@db:5432/crypto_db
-      - CMC_API_KEY=909286096de241b8868ad1d075c86ebb
+      - DATABASE_URL=postgresql://user:password@db:5432/crypto_monitor
+      - CMC_API_KEY=${CMC_API_KEY}
     depends_on:
       - db
+    restart: always
 
-  # 3. 前端 (本地开发模式)
-  # 生产环境通常会 build 成静态文件，但为了方便修改，这里用 dev 模式
+  # 3. 前端服务
   frontend:
+    # ❌ 删掉 build: ... 这一块
+    # build:
+    #   context: ./frontend
+    #   dockerfile: Dockerfile
+    
+    # ✅ 改用直接镜像
     image: node:20
     working_dir: /app
+    # 这里的 command 是关键，它会在容器启动时安装依赖并运行
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
     volumes:
       - ./frontend:/app
       - /app/node_modules
-    command: sh -c "npm install && npm run dev -- --host"
-    ports:
-      - "5173:5173"
+    expose:
+      - "5173"
+    environment:
+      - VITE_API_URL=/api
     depends_on:
       - backend
+    restart: always
+
+  # 4. Caddy 网关服务 (新增的!)
+  caddy:
+    image: caddy:latest
+    ports:
+      - "8080:80"    # 只有 Caddy 负责对外(也就是对你的浏览器)营业
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - backend
+      - frontend
+    restart: always
 
 volumes:
   postgres_data:
+  caddy_data:
+  caddy_config:
