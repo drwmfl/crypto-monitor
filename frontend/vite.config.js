@@ -6,7 +6,10 @@ export default defineConfig({
   plugins: [react()],
   server: {
     host: '0.0.0.0',
-    // ✅ 关键修复：允许你的域名访问
+    // ✅ 关键配置：开启轮询，强制 Docker 监听 Windows 文件变化
+    watch: {
+      usePolling: true,
+    },
     allowedHosts: [
       'alphamonitorpro.com',
       'www.alphamonitorpro.com',

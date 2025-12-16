@@ -27,11 +27,6 @@ services:
 
   # 3. 前端服务
   frontend:
-    # ❌ 删掉 build: ... 这一块
-    # build:
-    #   context: ./frontend
-    #   dockerfile: Dockerfile
-    
     # ✅ 改用直接镜像
     image: node:20
     working_dir: /app
@@ -52,7 +47,8 @@ services:
   caddy:
     image: caddy:latest
     ports:
-      - "8080:80"    # 只有 Caddy 负责对外(也就是对你的浏览器)营业
+      - "80:80"
+      - "443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data

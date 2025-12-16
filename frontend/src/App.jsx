@@ -1,9 +1,9 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useState, useMemo } from 'react';
 import { Table, Card, Row, Col, Statistic, Tag, AutoComplete, Input, Empty } from 'antd';
 import { FireOutlined, SearchOutlined, RiseOutlined } from '@ant-design/icons'; 
 import axios from 'axios';
 
-// ---------------- 辅助函数 ----------------
+// ---------------- 1. 静态辅助函数 ----------------
 
 const formatLargeNumber = (val) => {
   if (!val || val === 0) return '-';
@@ -19,29 +19,17 @@ const formatFullCurrency = (val) => {
   });
 };
 
-const getFilteredList = (list, text) => {
-  if (!text) return list;
-  const upperText = text.toUpperCase();
-  return list.filter(item => {
-    const cleanSymbol = item.symbol.replace('/USDT', '');
-    return cleanSymbol.includes(upperText);
-  });
-};
-
-// ---------------- 表格列定义 ----------------
+// ---------------- 2. 表格列定义 ----------------
 const columns = [
   {
     title: '交易对',
     dataIndex: 'symbol',
     key: 'symbol',
     fixed: 'left',
-    // 2. ✅ [优化] 宽度加宽到 180，防止长名字遮挡价格
     width: 150, 
     render: (text, record) => (
       <div style={{ display: 'flex', alignItems: 'center', fontWeight: 'bold' }}>
-        {/* 点击跳转到币安 */}
         <a 
-          // 3. ✅ [修复] 链接去掉了中间的斜杠 (比如 WLFI/USDT -> WLFIUSDT)
           href={`https://www.binance.com/zh-CN/futures/${text.replace('/', '')}`} 
           target="_blank" 
           rel="noopener noreferrer"
@@ -49,17 +37,8 @@ const columns = [
         >
           {text}
         </a>
-        
-        {/* 1. ✅ [优化] 标签改为“现”，字体极小化 */}
         {record.has_spot && (
-          <Tag color="cyan" style={{ 
-            marginRight: 0, 
-            fontSize: '10px',      // 字体改小
-            lineHeight: '14px',    // 行高收紧
-            padding: '0 3px',      // 内边距缩小
-            transform: 'scale(0.9)', // 整体再稍微缩小一点点
-            transformOrigin: 'left center' // 保证缩放不偏移
-          }}>
+          <Tag color="cyan" style={{ marginRight: 0, fontSize: '10px', lineHeight: '14px', padding: '0 3px', transform: 'scale(0.9)', transformOrigin: 'left center' }}>
             现
           </Tag>
         )}
@@ -200,106 +179,98 @@ const columns = [
   }
 ];
 
-// ---------------- 主组件 ----------------
+// ---------------- 3. 主组件 ----------------
 function App() {
-  const searchTextRef = useRef('');
-  const [data, setData] = useState([]);
-  const [filteredData, setFilteredData] = useState([]);
+  const [data, setData] = useState([]); // 原始全量数据
   const [loading, setLoading] = useState(true);
-  const [lastUpdated, setLastUpdated] = useState(null);
-  const [searchText, setSearchText] = useState('');
-  const [options, setOptions] = useState([]);
 
+  // 1. inputValue: 绑定输入框，实时响应，保证打字不卡
+  const [inputValue, setInputValue] = useState(''); 
+  
+  // 2. debouncedSearchText: 延迟更新的搜索词，用于驱动表格筛选
+  const [debouncedSearchText, setDebouncedSearchText] = useState('');
 
-// 🔍 调试版 fetchData 函数 (请只粘贴这一段)
-const fetchData = async () => {
-  try {
-    console.log("🚀 [1] 开始请求数据...")
-    
-    // 发起请求
-    const res = await axios.get('/api/market-data')
-    const newData = res.data
-
-    console.log("📦 [2] 后端返回数据:", newData)
-    console.log("📏 [3] 数据长度:", Array.isArray(newData) ? newData.length : "不是数组!")
-
-    // 1. 设置原始数据
-    setData(newData)
-    //setLastUpdated(new Date())
-    
-    // 2. 获取当前搜索词
-    // 这里加个保险，防止 searchTextRef 还没初始化
-    const currentSearch = searchTextRef.current || ''
-    console.log("🔍 [4] 当前搜索词:", currentSearch)
-
-    // 3. 过滤并更新展示列表
-    let list_to_show = []
-    
-    if (currentSearch) {
-      // 如果有搜索词，执行过滤
-      list_to_show = newData.filter(item => 
-        item.symbol && item.symbol.toLowerCase().includes(currentSearch.toLowerCase())
-      )
-      console.log("✂️ [5] 过滤后剩余:", list_to_show.length)
-    } else {
-      // 如果没搜索词，显示全部
-      list_to_show = newData
-      console.log("✅ [5] 无搜索，显示全部:", list_to_show.length)
+  // 🔄 数据获取
+  const fetchData = async () => {
+    try {
+      const res = await axios.get('/api/market-data');
+      setData(res.data);
+      setLoading(false);
+    } catch (error) {
+      console.error("Fetch Error:", error);
+      setLoading(false);
     }
-
-    // 🔥 核心：这里是把数据放进表格的地方
-    setFilteredData(list_to_show)
-    
-    // 4. 关闭加载状态
-    setLoading(false)
-    console.log("🏁 [6] 流程结束，Loading 已关闭")
-
-  } catch (error) {
-    console.error("❌ [CRITICAL] fetchData 发生崩溃:", error)
-    setLoading(false)
-  }
-}
+  };
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, 5000);
+    const interval = setInterval(fetchData, 5000); 
     return () => clearInterval(interval);
   }, []);
 
-  // 监听搜索输入 (和数据变化)
+  // ⚡️ 防抖逻辑：只有当用户停止打字 300ms 后，才去更新 debouncedSearchText
   useEffect(() => {
-    searchTextRef.current = searchText;
-    
-    const timeoutId = setTimeout(() => {
-      // ✅ 这里的 data 现在是最新的了
-      const results = filterDataList(data, searchText);
-      setFilteredData(results);
-
-      // 处理搜索建议
-      if (searchText) {
-        const suggestOptions = results.slice(0, 10).map(item => ({
-          value: item.symbol.replace('USDT', ''), 
-        }));
-        setOptions(suggestOptions);
-      } else {
-        setOptions([]);
-      }
+    const handler = setTimeout(() => {
+      setDebouncedSearchText(inputValue);
     }, 300);
 
-    return () => clearTimeout(timeoutId);
-  }, [searchText, data]); // ✅✅✅ 关键修改：必须把 data 加进依赖数组！
+    return () => clearTimeout(handler);
+  }, [inputValue]);
+
+  // 🔍 表格过滤逻辑：完全依赖 useMemo
+  // 只有当 data 更新，或者 debouncedSearchText 变化时，这里才会重新计算
+  // 之前这里报错是因为调用了不存在的 filterDataList，现在直接把逻辑写在这里
+  const filteredData = useMemo(() => {
+    // 1. 如果没有搜索词，直接返回全量数据（速度最快）
+    if (!debouncedSearchText) return data;
+    
+    // 2. 准备搜索词
+    const upperText = debouncedSearchText.toUpperCase();
+    
+    // 3. 执行过滤
+    return data.filter(item => {
+      const symbol = item.symbol || ''; // 防止 symbol 为空导致报错
+      const cleanSymbol = symbol.replace('/USDT', '');
+      // 同时匹配 "BTC" 和 "BTC/USDT"
+      return symbol.includes(upperText) || cleanSymbol.includes(upperText);
+    });
+  }, [data, debouncedSearchText]); 
+
+  // 💡 搜索建议逻辑：依赖实时的 inputValue
+  const options = useMemo(() => {
+    if (!inputValue) return [];
+    
+    const upperText = inputValue.toUpperCase();
+    return data
+      .filter(item => {
+        const s = item.symbol || '';
+        return s.toUpperCase().replace('/USDT', '').includes(upperText);
+      })
+      .slice(0, 10) // 只取前10个，防止卡顿
+      .map(item => ({
+        value: item.symbol.replace('/USDT', ''), 
+      }));
+  }, [data, inputValue]);
+
+  // 处理输入变化
+  const handleSearchChange = (value) => {
+    setInputValue(value); 
+  };
+
+  // 处理选中建议
+  const handleSelect = (value) => {
+    setInputValue(value);
+    setDebouncedSearchText(value); // 选中建议时不需要延迟，立即搜索
+  };
 
   // ================= 统计计算逻辑 =================
   const squeezeCandidates = data.filter(i => i.funding_rate < 0).length;
   const highRisk = data.filter(i => i.oi_mc_ratio > 0.5).length;
 
-  // 🔥 需求2：计算费率最负 (寻找最小值)
   let mostNegativeFundingItem = null;
   if (data.length > 0) {
-    // 排序找最小
     const sortedByFunding = [...data].sort((a, b) => a.funding_rate - b.funding_rate);
     const minItem = sortedByFunding[0];
-    // 必须小于 0 才算
     if (minItem && minItem.funding_rate < 0) {
       mostNegativeFundingItem = minItem;
     }
@@ -307,26 +278,25 @@ const fetchData = async () => {
 
   // ================= 搜索框渲染 =================
   const renderSearchBox = () => (
-    <div style={{ width: '380px' }}> {/* 🔥 需求1：宽度加长 */}
+    <div style={{ width: '380px' }}> 
       <AutoComplete
         options={options}
         style={{ width: '100%' }}
-        onSelect={(val) => setSearchText(val)}
-        onSearch={(val) => setSearchText(val)}
-        value={searchText}
+        onSelect={handleSelect}
+        onSearch={handleSearchChange}
+        value={inputValue}
         placeholder="搜索代币 (如 BTC)"
         allowClear
       >
         <Input 
-          size="large" // 大号输入框
+          size="large" 
           placeholder="搜索代币..." 
-          prefix={<SearchOutlined style={{ color: '#1890ff', fontSize: '18px' }} />} // 图标也变大变色
+          prefix={<SearchOutlined style={{ color: '#1890ff', fontSize: '18px' }} />} 
           style={{ 
-            // 🔥 需求1：样式增强 (高度、边框、阴影)
             height: '46px', 
             borderRadius: '8px',
-            border: '2px solid #1890ff', // 醒目的蓝色边框
-            boxShadow: '0 2px 6px rgba(24, 144, 255, 0.15)', // 增加阴影增加立体感
+            border: '2px solid #1890ff', 
+            boxShadow: '0 2px 6px rgba(24, 144, 255, 0.15)', 
             fontSize: '16px'
           }}
         />
@@ -346,75 +316,44 @@ const fetchData = async () => {
         </span>
       </div>
       
-      {/* 🔥 需求4：一行显示4个数据 */}
       <Row gutter={[16, 16]} style={{ marginBottom: 20 }}>
-        
-        {/* 🔥 需求2：费率最负 (第1位) */}
         <Col xs={24} sm={12} md={6}>
           <Card bordered={false} bodyStyle={{ padding: '12px 24px' }}>
             <Statistic 
               title="费率最负" 
               value={mostNegativeFundingItem ? (mostNegativeFundingItem.funding_rate * 100).toFixed(4) + '%' : '无'} 
-              valueStyle={{ 
-                color: '#cf1322', // 红色数值
-                fontSize: '22px', 
-                fontWeight: 'bold' 
-              }} 
-              // 前缀显示代币名称 (黑色)
+              valueStyle={{ color: '#cf1322', fontSize: '22px', fontWeight: 'bold' }} 
               prefix={mostNegativeFundingItem ? <span style={{color: '#000', marginRight: '8px', fontSize: '18px'}}>{mostNegativeFundingItem.symbol.replace('/USDT','')}</span> : null}
             />
           </Card>
         </Col>
 
-        {/* 🔥 需求3：负费率 (第2位，改名) */}
         <Col xs={24} sm={12} md={6}>
           <Card bordered={false} bodyStyle={{ padding: '12px 24px' }}>
-            <Statistic 
-              title="负费率 (逼空)" 
-              value={squeezeCandidates} 
-              valueStyle={{ color: '#cf1322' }} 
-              suffix="个"
-            />
+            <Statistic title="负费率 (逼空)" value={squeezeCandidates} valueStyle={{ color: '#cf1322' }} suffix="个" />
           </Card>
         </Col>
 
-        {/* 杠杆率 (第3位) */}
         <Col xs={24} sm={12} md={6}>
           <Card bordered={false} bodyStyle={{ padding: '12px 24px' }}>
-            <Statistic 
-              title="杠杆率 > 0.5 (高险)" 
-              value={highRisk} 
-              valueStyle={{ color: '#faad14' }} 
-              suffix="个"
-            />
+            <Statistic title="杠杆率 > 0.5 (高险)" value={highRisk} valueStyle={{ color: '#faad14' }} suffix="个" />
           </Card>
         </Col>
 
-        {/* 监控币种 (第4位) */}
         <Col xs={24} sm={12} md={6}>
           <Card bordered={false} bodyStyle={{ padding: '12px 24px' }}>
             <Statistic title="监控币种" value={data.length} suffix="个" />
           </Card>
         </Col>
-
       </Row>
 
       <Card 
         bordered={false} 
         bodyStyle={{ padding: 0 }}
-        // 🔥 需求5：Title 样式更突出 (左侧竖线 + 大字号)
         title={
-          <div style={{ 
-            display: 'flex', 
-            alignItems: 'center', 
-            fontSize: '18px', 
-            fontWeight: '800',
-            color: '#1f1f1f'
-          }}>
+          <div style={{ display: 'flex', alignItems: 'center', fontSize: '18px', fontWeight: '800', color: '#1f1f1f' }}>
             <RiseOutlined style={{ marginRight: '8px', color: '#1890ff', fontSize: '22px' }} />
-            <span style={{ position: 'relative', paddingLeft: '0px' }}>
-              实时监控列表
-            </span>
+            <span style={{ position: 'relative', paddingLeft: '0px' }}>实时监控列表</span>
           </div>
         }
         extra={renderSearchBox()} 
@@ -424,7 +363,6 @@ const fetchData = async () => {
           dataSource={filteredData} 
           rowKey="symbol"
           loading={loading}
-          // 🔥 需求6：禁用表头悬停提示
           showSorterTooltip={false}
           pagination={{ 
             defaultPageSize: 20, showSizeChanger: true, 
@@ -436,11 +374,7 @@ const fetchData = async () => {
             emptyText: (
               <Empty 
                 image={Empty.PRESENTED_IMAGE_SIMPLE} 
-                description={
-                  <span style={{ color: '#8c8c8c' }}>
-                    未搜索到结果 "{searchText}"
-                  </span>
-                } 
+                description={<span style={{ color: '#8c8c8c' }}>未搜索到结果 "{inputValue}"</span>} 
               />
             )
           }}
