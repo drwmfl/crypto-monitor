@@ -1,4 +1,7 @@
-alphamonitorpro.com {
+:80 {
+    # 转发后端 API
     reverse_proxy /api/* backend:8000
+
+    # 转发前端页面
     reverse_proxy * frontend:5173
 }

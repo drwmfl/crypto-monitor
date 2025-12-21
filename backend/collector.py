@@ -5,6 +5,7 @@ import requests
 import re
 import warnings
 import os
+import redis
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
@@ -16,28 +17,44 @@ warnings.filterwarnings("ignore")
 MIN_VOLUME_USDT = 10_000_000  
 TARGET_QUOTE = 'USDT'
 MAX_WORKERS = 10
-CMC_API_KEY = os.getenv("CMC_API_KEY", "909286096de241b8868ad1d075c86ebb")
+CMC_API_KEY = os.getenv("CMC_API_KEY", "d5a96ddc6d7340d59be22e18e64eab66")
+
+# Redis 连接 (带调试信息)
+print("🔌 [Collector] 正在初始化 Redis 连接...")
+try:
+    # 如果是在本地运行且没有用 Docker 网络，可能需要改成 localhost
+    redis_client = redis.Redis(host='redis', port=6379, db=0, decode_responses=True)
+    redis_client.ping() # 测试连接
+    print("✅ [Collector] Redis 连接成功！")
+except Exception as e:
+    print(f"⚠️ [Collector] Redis 连接警告: {e}")
+    redis_client = None
 
 EXCLUDE_SYMBOLS = [
     'BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'ADA', 'DOGE', 'TRX', 'USDC', 'FDUSD', 
     'AVAX', 'LINK', 'DOT', 'MATIC', 'WBTC', 'LTC', 'BCH', 'XPR', 'ETC', 'UNI'
 ]
 
-# 🔥 [配置 1] 特殊符号映射表 (Binance Symbol -> CMC Symbol)
+# 特殊符号映射表 (Binance -> CMC)
 SPECIAL_CMC_MAPPING = {
     'LUNA2': 'LUNA',      
     '1000LUNC': 'LUNC',   
     '1000SATS': 'SATS',
     '1000PEPE': 'PEPE',
-    '1000BONK': 'BONK',
     '1000RATS': 'RATS',
+    '1000BONK': 'BONK',
+    '1000FLOKI': 'FLOKI',
     'MYRO': 'MYRO',
 }
 
-# 🔥 [配置 2] ID 专用映射表 (Binance Symbol -> CMC ID)
 SPECIAL_CMC_IDS = {
-    '币安人生': '38590', # 兼容中文名配置
-    'MOVE': '32452', 
+    '币安人生': '38590',
+    'MOVE': '32452',
+    'SAPIEN': '38117',
+    'TRADOOR': '36737',
+    'TAC': '37338',
+    'B2': '36352',
+ 
 }
 
 # ================= 辅助函数 =================
@@ -50,94 +67,90 @@ def safe_float(val):
 
 def fetch_cmc_data(symbol_list):
     """
-    [升级版] 批量获取 CMC 数据
-    支持双轨制：大部分币查 Symbol，特殊币查 ID
+    [调试版] 获取供应量，并打印详细的 API 错误信息
     """
-    if not CMC_API_KEY or '你的' in CMC_API_KEY: return {}
+    if not CMC_API_KEY or '你的' in CMC_API_KEY: 
+        print("❌ [CMC] API Key 未配置！")
+        return {}
     
-    # 1. 准备工作：分拣篮子
-    normal_symbols = set() # 存放普通币 (查 Symbol)
-    id_map = {}            # 存放 ID 映射关系 (CMC_ID -> Binance_Symbol)
-    ids_to_fetch = set()   # 存放需要查询的 ID 列表
+    print(f"🌍 [CMC] 正在请求 API... 目标: {len(symbol_list)} 个币种")
+    
+    normal_symbols = set()
+    id_map = {}
+    ids_to_fetch = set()
 
     for s in symbol_list:
-        # 清理 Binance 的名字 (去除 /USDT)
         base = s.split('/')[0]
-        
-        # 处理 1000 前缀 (如 1000PEPE -> PEPE)
-        if base.startswith('1000') and len(base) > 4: 
-            base = base[4:]
-            
-        # [判断] 是否在 VIP ID 名单里 (优先处理 ID)
+        if base.startswith('1000') and len(base) > 4: base = base[4:]
         if base in SPECIAL_CMC_IDS:
             cmc_id = SPECIAL_CMC_IDS[base]
             ids_to_fetch.add(cmc_id)
             id_map[str(cmc_id)] = base 
             continue 
-
-        # [判断] 普通映射 (处理 LUNA2 -> LUNA)
         base = SPECIAL_CMC_MAPPING.get(base, base)
-        
-        # 只要是正常的英文名，就加入普通查询队列
-        if re.match(r'^[a-zA-Z0-9]+$', base): 
-            normal_symbols.add(base)
+        if re.match(r'^[a-zA-Z0-9]+$', base): normal_symbols.add(base)
             
     cmc_map = {}
     url = 'https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest'
     headers = {'Accepts': 'application/json', 'X-CMC_PRO_API_KEY': CMC_API_KEY}
     
-    # ================= 第一轨：普通 Symbol 查询 =================
+    def parse_response(response_data):
+        result_map = {}
+        for key, info in response_data.items():
+            if isinstance(info, list): info = info[0]
+            circulating = info.get('circulating_supply')
+            max_sup = info.get('max_supply')
+            if max_sup is None:
+                max_sup = info.get('total_supply')
+            result_map[key] = {
+                'supply': safe_float(circulating),
+                'max_supply': safe_float(max_sup)
+            }
+        return result_map
+
+    # 1. 普通 Symbol 查询
     batch_size = 100
     normal_list = list(normal_symbols)
-    
     if normal_list:
+        print(f"🔍 [CMC] 正在查询 {len(normal_list)} 个普通 Symbol...")
         for i in range(0, len(normal_list), batch_size):
             batch = normal_list[i : i + batch_size]
             try:
-                # 这里的参数是 symbol
-                response = requests.get(url, headers=headers, params={'symbol': ','.join(batch), 'convert': 'USD'}, timeout=5)
+                response = requests.get(url, headers=headers, params={'symbol': ','.join(batch), 'convert': 'USD'}, timeout=10)
+                
+                # 🔥 [关键修改] 打印错误详情
                 if response.status_code == 200:
                     data = response.json().get('data', {})
-                    for sym, info in data.items():
-                        if isinstance(info, list): info = info[0]
-                        quote = info['quote']['USD']
-                        cmc_map[sym] = {
-                            'mc': quote.get('market_cap', 0), 
-                            'fdv': quote.get('fully_diluted_market_cap', 0)
-                        }
+                    cmc_map.update(parse_response(data))
+                    print(f"✅ [CMC] 批次 {i//batch_size + 1} 成功")
+                else:
+                    print(f"❌ [CMC] 请求失败! 状态码: {response.status_code}")
+                    print(f"❌ [CMC] 错误信息: {response.text}")
+                    
                 time.sleep(0.1)
             except Exception as e:
-                print(f"[CMC] Symbol query error: {e}")
-                continue
+                print(f"❌ [CMC] 网络异常: {e}")
 
-    # ================= 第二轨：特殊 ID 查询 =================
+    # 2. ID 查询
     if ids_to_fetch:
         try:
-            # 这里的参数是 id
             response = requests.get(url, headers=headers, params={'id': ','.join(ids_to_fetch), 'convert': 'USD'}, timeout=5)
             if response.status_code == 200:
                 data = response.json().get('data', {})
-                # data 的 Key 是数字 ID (如 "38590")
-                for cmc_id, info in data.items():
-                    quote = info['quote']['USD']
-                    
-                    # 关键步骤：把 ID 映射回原来的币安名字
+                parsed = parse_response(data)
+                for cmc_id, val in parsed.items():
                     original_symbol = id_map.get(str(cmc_id))
-                    
                     if original_symbol:
-                        cmc_map[original_symbol] = {
-                            'mc': quote.get('market_cap', 0), 
-                            'fdv': quote.get('fully_diluted_market_cap', 0)
-                        }
+                        cmc_map[original_symbol] = val
+            else:
+                print(f"❌ [CMC ID] 请求失败: {response.status_code}")
         except Exception as e:
-            print(f"[CMC] ID query error: {e}")
+            print(f"❌ [CMC ID] 异常: {e}")
 
+    print(f"📊 [CMC] 最终获取了 {len(cmc_map)} 个币种的数据")
     return cmc_map
 
 def process_single_symbol(symbol, exchange_instance, ticker, interval_map, funding_map, cmc_map, spot_symbols_set):
-    """
-    处理单个交易对数据，增加 spot_symbols_set 用于检查现货
-    """
     try:
         market_info = exchange_instance.market(symbol)
         raw_id = market_info['id']
@@ -145,7 +158,7 @@ def process_single_symbol(symbol, exchange_instance, ticker, interval_map, fundi
         price = safe_float(ticker['last'])
         if price == 0: return None
 
-        # 1. 获取持仓量
+        # 1. 获取持仓量 (OI)
         val_usdt = 0.0
         try:
             oi_data = exchange_instance.fetch_open_interest(symbol)
@@ -158,34 +171,55 @@ def process_single_symbol(symbol, exchange_instance, ticker, interval_map, fundi
         change_1h = 0.0
         try:
             klines = exchange_instance.fetch_ohlcv(symbol, timeframe='1h', limit=1)
-            if klines:
-                open_price_1h = float(klines[0][1])
-                if open_price_1h > 0:
-                    change_1h = (price - open_price_1h) / open_price_1h * 100
+            if klines and float(klines[0][1]) > 0:
+                change_1h = (price - float(klines[0][1])) / float(klines[0][1]) * 100
         except: pass
 
         interval = interval_map.get(raw_id, 8)
         volume_24h = safe_float(ticker.get('quoteVolume'))
         change_24h = safe_float(ticker.get('percentage'))
-        
         ratio_vol = val_usdt / volume_24h if volume_24h > 0 else 0.0
 
-        # 🔥 [核心逻辑] 获取 CMC 数据
-        lookup_symbol = base_symbol[4:] if base_symbol.startswith('1000') else base_symbol
+        # 🔥 [核心修改] 处理供应量 (解决 1000 前缀导致市值放大 1000 倍的问题)
+        
+        # 判断是否是 1000 开头的代币
+        is_1000_token = base_symbol.startswith('1000') and len(base_symbol) > 4
+        
+        # 获取 CMC 原始数据
+        lookup_symbol = base_symbol[4:] if is_1000_token else base_symbol
         lookup_symbol = SPECIAL_CMC_MAPPING.get(lookup_symbol, lookup_symbol)
         
-        mc = cmc_map.get(lookup_symbol, {}).get('mc', 0)
-        fdv = cmc_map.get(lookup_symbol, {}).get('fdv', 0)
+        cmc_data = cmc_map.get(lookup_symbol, {})
+        raw_supply = cmc_data.get('supply', 0)
+        raw_max_supply = cmc_data.get('max_supply', 0)
         
+        # 计算有效供应量 (Effective Supply)
+        # 如果币安价格是 1000 倍，我们就把供应量除以 1000，抵消价格的放大
+        if is_1000_token:
+            supply = raw_supply / 1000.0 if raw_supply else 0
+            max_supply = raw_max_supply / 1000.0 if raw_max_supply else 0
+        else:
+            supply = raw_supply
+            max_supply = raw_max_supply
+        
+        # 实时计算 (使用修正后的 supply)
+        mc = price * supply
+        fdv = price * max_supply
         ratio_mc = val_usdt / mc if mc > 0 else 0.0
 
-        # 🔥 [新增逻辑] 检查是否有现货
-        # 逻辑：如果是 1000PEPE，要去现货里找 PEPE/USDT
+        # 🔥 [写入 Redis] 存入修正后的供应量，供 Streamer 使用
+        if redis_client:
+            try:
+                clean_symbol = symbol.split(':')[0].replace('/', '')
+                if supply > 0:
+                    redis_client.set(f"supply:{clean_symbol}", supply, ex=90000)
+                if max_supply > 0:
+                    redis_client.set(f"max_supply:{clean_symbol}", max_supply, ex=90000)
+            except Exception:
+                pass
+
         check_spot_base = base_symbol[4:] if base_symbol.startswith('1000') else base_symbol
-        spot_pair_name = f"{check_spot_base}/USDT"
-        
-        # 判断是否存在于现货集合中
-        has_spot = spot_pair_name in spot_symbols_set
+        has_spot = f"{check_spot_base}/USDT" in spot_symbols_set
 
         return {
             'symbol': symbol.replace(f':{TARGET_QUOTE}', ''),
@@ -200,81 +234,58 @@ def process_single_symbol(symbol, exchange_instance, ticker, interval_map, fundi
             'oi': val_usdt,
             'oi_mc_ratio': ratio_mc,
             'oi_vol_ratio': ratio_vol,
-            'has_spot': has_spot  # ✅ 返回现货状态
+            'has_spot': has_spot 
         }
     except Exception: 
         return None
 
-def get_market_data():
-    # 1. 实例化合约客户端
+def get_market_data(cached_cmc_data):
     exchange = ccxt.binance({'enableRateLimit': True, 'options': {'defaultType': 'future'}})
-    
-    # 🔥 2. 实例化现货客户端 (专门查名单)
     spot_exchange = ccxt.binance({'enableRateLimit': True})
     
     try:
-        # 加载合约市场
         markets = exchange.load_markets()
         tickers = exchange.fetch_tickers()
         funding_rates = exchange.fetch_funding_rates()
-        
-        # 🔥 加载现货市场
-        print("🔍 正在获取现货市场列表...")
         try:
             spot_markets = spot_exchange.load_markets()
-            # 做成一个集合，查找速度快。格式如: 'BTC/USDT', 'ETH/USDT'
             spot_symbols_set = set(spot_markets.keys())
-            print(f"✅ 获取到 {len(spot_symbols_set)} 个现货交易对")
-        except Exception as e:
-            print(f"⚠️ 获取现货列表失败: {e}")
-            spot_symbols_set = set() # 如果失败，默认都没现货，防止程序崩溃
+        except: spot_symbols_set = set()
         
         interval_map = {}
         try:
             special_info = exchange.fapiPublicGetFundingInfo()
             for item in special_info: interval_map[item['symbol']] = int(item['fundingIntervalHours'])
         except: pass 
-
         funding_map = {k: safe_float(v['info'].get('lastFundingRate')) for k, v in funding_rates.items()}
+        
         target_symbols = []
-        cmc_query_list = []
-
         for s, t in tickers.items():
             market_info = markets.get(s)
             if not market_info or not market_info.get('active'): continue
             if 'info' in market_info and market_info['info'].get('status') != 'TRADING': continue
             if not s.endswith(f':{TARGET_QUOTE}'): continue
-            
-            vol = safe_float(t.get('quoteVolume'))
-            if vol < MIN_VOLUME_USDT: continue
+            if safe_float(t.get('quoteVolume')) < MIN_VOLUME_USDT: continue
             if market_info['base'] in EXCLUDE_SYMBOLS: continue
-            
             target_symbols.append(s)
-            cmc_query_list.append(s)
 
         print(f"🎯 目标监控币种数: {len(target_symbols)}")
-        # 调用 CMC 数据获取
-        cmc_data_map = fetch_cmc_data(cmc_query_list)
         data_list = []
-        
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            # ✅ 将 spot_symbols_set 传递给处理函数
-            futures = {executor.submit(process_single_symbol, s, exchange, tickers[s], interval_map, funding_map, cmc_data_map, spot_symbols_set): s for s in target_symbols}
+            futures = {executor.submit(process_single_symbol, s, exchange, tickers[s], interval_map, funding_map, cached_cmc_data, spot_symbols_set): s for s in target_symbols}
             for future in as_completed(futures):
                 res = future.result()
                 if res: data_list.append(res)
-        
         return pd.DataFrame(data_list)
     except Exception as e:
-        print(f"Error getting market data: {e}")
+        print(f"Error: {e}")
         return pd.DataFrame()
 
-def save_to_postgres(df: pd.DataFrame):
+def save_to_postgres(df):
     if df.empty: return
     db = SessionLocal()
     try:
         current_time = pd.Timestamp.now()
-        
         previous_oi_map = {}
         last_record = db.query(MarketData).order_by(desc(MarketData.timestamp)).first()
         if last_record:
@@ -286,11 +297,8 @@ def save_to_postgres(df: pd.DataFrame):
         for _, row in df.iterrows():
             current_oi = row['oi']
             prev_oi = previous_oi_map.get(row['symbol'], current_oi)
-            
             oi_change_val = current_oi - prev_oi
-            oi_change_pct = 0.0
-            if prev_oi > 0:
-                oi_change_pct = oi_change_val / prev_oi
+            oi_change_pct = 0.0 if prev_oi <= 0 else oi_change_val / prev_oi
 
             item = MarketData(
                 timestamp=current_time,
@@ -308,30 +316,60 @@ def save_to_postgres(df: pd.DataFrame):
                 oi_change_pct=oi_change_pct,
                 oi_mc_ratio=row['oi_mc_ratio'],
                 oi_vol_ratio=row['oi_vol_ratio'],
-                has_spot=row['has_spot'] # ✅ 存入数据库
+                has_spot=row['has_spot']
             )
             data_objects.append(item)
-            
         db.add_all(data_objects)
         db.commit()
         print(f"✅ [{current_time.strftime('%H:%M:%S')}] 存入 {len(data_objects)} 条数据")
     except Exception as e:
-        print(f"❌ 数据库写入错误: {e}")
         db.rollback()
     finally:
         db.close()
 
 def run_collector():
     print("🚀 采集器后台进程已启动...")
+    cmc_cache = {}
+    last_cmc_update = 0
+    # ⚠️ 测试完记得改回 14400！你的额度只剩 70 多了！
+    CMC_UPDATE_INTERVAL = 14400
+
     while True:
         try:
-            df = get_market_data()
-            if not df.empty:
-                save_to_postgres(df)
+            current_time = time.time()
+            if current_time - last_cmc_update > CMC_UPDATE_INTERVAL:
+                print("⏰ 需要更新 CMC 供应量数据...")
+                
+                # 🔥 [核心修改] 这里加上 options，指定连接合约市场
+                tmp_exchange = ccxt.binance({'options': {'defaultType': 'future'}}) 
+                
+                tickers = tmp_exchange.fetch_tickers()
+                target_for_cmc = []
+                for s, t in tickers.items():
+                    if not s.endswith(f':{TARGET_QUOTE}'): continue
+                    if safe_float(t.get('quoteVolume')) < MIN_VOLUME_USDT: continue
+                    target_for_cmc.append(s)
+                
+                print(f"🔍 筛选出 {len(target_for_cmc)} 个目标币种，准备请求 CMC...")
+                
+                # 获取数据
+                if target_for_cmc:
+                    cmc_cache = fetch_cmc_data(target_for_cmc)
+                    if cmc_cache:
+                        last_cmc_update = current_time
+                        print(f"✅ CMC 供应量缓存已更新 (包含 {len(cmc_cache)} 个币种)")
+                    else:
+                        print("⚠️ CMC 返回空数据")
+                else:
+                    print("⚠️ 未找到符合条件的币种 (target_for_cmc 为空)")
             else:
-                print("⚠️ 本轮未获取到数据")
-        except Exception as e:
-            print(f"❌ 采集循环异常: {e}")
+                print(f"♻️ 复用 CMC 供应量缓存")
+
+            df = get_market_data(cmc_cache)
+            if not df.empty: save_to_postgres(df)
+            else: print("⚠️ 本轮未获取到数据")
+        except Exception as e: print(f"❌ 异常: {e}")
+        
         print("💤 休眠 300 秒...")
         time.sleep(300)
 

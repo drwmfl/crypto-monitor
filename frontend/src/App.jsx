@@ -50,7 +50,10 @@ const columns = [
     dataIndex: 'price',
     key: 'price',
     width: 100,
-    render: (val) => `$${parseFloat(val.toFixed(6))}`,
+    render: (val) => {
+        // 增加颜色跳动提示的逻辑可以放在这里，目前先保持基础展示
+        return <span style={{ fontWeight: '600' }}>${parseFloat(val).toFixed(5)}</span>;
+    },
   },
   {
     title: '1h 涨跌',
@@ -72,7 +75,7 @@ const columns = [
     sorter: (a, b) => a.change_24h - b.change_24h,
     render: (val) => {
       const color = val > 0 ? '#388e3c' : val < 0 ? '#d32f2f' : 'black';
-      return <span style={{ color }}>{val > 0 ? '+' : ''}{val.toFixed(2)}%</span>;
+      return <span style={{ color }}>{val > 0 ? '+' : ''}{parseFloat(val).toFixed(2)}%</span>;
     },
   },
   {
@@ -184,31 +187,90 @@ function App() {
   const [data, setData] = useState([]); // 原始全量数据
   const [loading, setLoading] = useState(true);
 
-  // 1. inputValue: 绑定输入框，实时响应，保证打字不卡
+  // 1. inputValue: 绑定输入框，实时响应
   const [inputValue, setInputValue] = useState(''); 
   
-  // 2. debouncedSearchText: 延迟更新的搜索词，用于驱动表格筛选
+  // 2. debouncedSearchText: 延迟更新的搜索词
   const [debouncedSearchText, setDebouncedSearchText] = useState('');
 
-  // 🔄 数据获取
-  const fetchData = async () => {
+  // 🔄 慢车道：获取全量数据 (OI, 市值等) - 5分钟一次
+  const fetchFullData = async () => {
     try {
       const res = await axios.get('/api/market-data');
       setData(res.data);
       setLoading(false);
     } catch (error) {
-      console.error("Fetch Error:", error);
+      console.error("Fetch Full Data Error:", error);
       setLoading(false);
     }
   };
 
+  // ⚡️ 快车道：获取实时价格 (Redis) - 2秒一次
+  const fetchRealtimePrice = async () => {
+    // 只有当表格里有数据时才去刷价格
+    if (data.length === 0) return;
+
+    try {
+      const res = await axios.get('/api/market-data/realtime');
+      const realtimeList = res.data || [];
+
+      // 将数组转为 Map，方便 O(1) 查找
+      const realtimeMap = new Map();
+      realtimeList.forEach(item => {
+        realtimeMap.set(item.symbol, item);
+      });
+
+      // 合并数据
+      setData(prevData => {
+        return prevData.map(item => {
+          // 后端 Redis 返回的是 "BTCUSDT"，前端表格里是 "BTC/USDT"
+          // 需要去掉斜杠来匹配
+          const lookupKey = item.symbol.replace('/', '');
+          const realtime = realtimeMap.get(lookupKey);
+
+          if (realtime) {
+            // 只更新变动的字段
+            return {
+              ...item,
+              price: realtime.price,
+              change_24h: realtime.change_24h,
+              volume_24h: realtime.volume_24h,
+
+              // ✅ [新增] 如果 Redis 里有市值，也一并更新！
+              // 注意：如果后端算出是 0 (没取到supply)，就保留原来的 item.mc
+              mc: realtime.mc > 0 ? realtime.mc : item.mc,
+              fdv: realtime.fdv > 0 ? realtime.fdv : item.fdv,
+              // 🔥 [新增] 实时更新费率
+              // 只要 realtime 里有费率 (不为 undefined)，就用实时的，否则用数据库旧值
+              funding_rate: (realtime.funding_rate !== undefined) ? realtime.funding_rate : item.funding_rate
+            };
+          }
+          return item;
+        });
+      });
+    } catch (error) {
+      console.error("Realtime Fetch Error:", error);
+    }
+  };
+
+  // 初始化：启动慢轮询 (5分钟)
   useEffect(() => {
-    fetchData();
-    const interval = setInterval(fetchData, 5000); 
+    fetchFullData();
+    const interval = setInterval(fetchFullData, 5 * 60 * 1000); 
     return () => clearInterval(interval);
   }, []);
 
-  // ⚡️ 防抖逻辑：只有当用户停止打字 300ms 后，才去更新 debouncedSearchText
+  // 启动快轮询 (2秒) - 依赖 data.length 确保初始化后再开始
+  useEffect(() => {
+    if (data.length === 0) return;
+
+    const interval = setInterval(fetchRealtimePrice, 2000);
+    return () => clearInterval(interval);
+  }, [data.length]); 
+  // 注意：这里依赖 data.length 只是为了启动定时器。
+  // 定时器内部使用的是 setData(prev => ...) 函数式更新，所以闭包里即使 data 是旧的也没关系。
+
+  // ⚡️ 防抖搜索逻辑
   useEffect(() => {
     const handler = setTimeout(() => {
       setDebouncedSearchText(inputValue);
@@ -217,26 +279,20 @@ function App() {
     return () => clearTimeout(handler);
   }, [inputValue]);
 
-  // 🔍 表格过滤逻辑：完全依赖 useMemo
-  // 只有当 data 更新，或者 debouncedSearchText 变化时，这里才会重新计算
-  // 之前这里报错是因为调用了不存在的 filterDataList，现在直接把逻辑写在这里
+  // 🔍 表格过滤逻辑
   const filteredData = useMemo(() => {
-    // 1. 如果没有搜索词，直接返回全量数据（速度最快）
     if (!debouncedSearchText) return data;
     
-    // 2. 准备搜索词
     const upperText = debouncedSearchText.toUpperCase();
     
-    // 3. 执行过滤
     return data.filter(item => {
-      const symbol = item.symbol || ''; // 防止 symbol 为空导致报错
+      const symbol = item.symbol || '';
       const cleanSymbol = symbol.replace('/USDT', '');
-      // 同时匹配 "BTC" 和 "BTC/USDT"
       return symbol.includes(upperText) || cleanSymbol.includes(upperText);
     });
   }, [data, debouncedSearchText]); 
 
-  // 💡 搜索建议逻辑：依赖实时的 inputValue
+  // 💡 搜索建议逻辑
   const options = useMemo(() => {
     if (!inputValue) return [];
     
@@ -246,7 +302,7 @@ function App() {
         const s = item.symbol || '';
         return s.toUpperCase().replace('/USDT', '').includes(upperText);
       })
-      .slice(0, 10) // 只取前10个，防止卡顿
+      .slice(0, 10)
       .map(item => ({
         value: item.symbol.replace('/USDT', ''), 
       }));
@@ -260,7 +316,7 @@ function App() {
   // 处理选中建议
   const handleSelect = (value) => {
     setInputValue(value);
-    setDebouncedSearchText(value); // 选中建议时不需要延迟，立即搜索
+    setDebouncedSearchText(value);
   };
 
   // ================= 统计计算逻辑 =================
@@ -312,7 +368,7 @@ function App() {
           🦅 币安合约监控
         </h1>
         <span style={{ color: '#8c8c8c', fontSize: '12px' }}>
-          最后更新: {new Date().toLocaleTimeString()}
+          系统状态: {loading ? '初始化数据中...' : '运行中'} | 实时更新: 已启用
         </span>
       </div>
       
@@ -362,7 +418,7 @@ function App() {
           columns={columns} 
           dataSource={filteredData} 
           rowKey="symbol"
-          loading={loading}
+          loading={loading && data.length === 0}
           showSorterTooltip={false}
           pagination={{ 
             defaultPageSize: 20, showSizeChanger: true, 

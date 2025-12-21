@@ -10,10 +10,9 @@ services:
       - POSTGRES_DB=crypto_monitor
     restart: always
 
-  # 2. 后端服务
+  # 2. 后端服务 (API & 定时任务)
   backend:
     build: ./backend
-    # 注意：这里改成了 expose，不再直接把 8000 暴露给电脑，而是暴露给 Caddy
     expose:
       - "8000"
     volumes:
@@ -27,10 +26,8 @@ services:
 
   # 3. 前端服务
   frontend:
-    # ✅ 改用直接镜像
     image: node:20
     working_dir: /app
-    # 这里的 command 是关键，它会在容器启动时安装依赖并运行
     command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
     volumes:
       - ./frontend:/app
@@ -43,12 +40,21 @@ services:
       - backend
     restart: always
 
-  # 4. Caddy 网关服务 (新增的!)
+  # 4. Redis 服务
+  redis:
+    image: redis:alpine
+    container_name: crypto_redis
+    restart: always
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  # 5. Caddy 网关服务
   caddy:
     image: caddy:latest
     ports:
-      - "80:80"
-      - "443:443"
+      - "8080:80"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy_data:/data
@@ -58,7 +64,23 @@ services:
       - frontend
     restart: always
 
+  # 6. ✅ [新增] 实时采集服务 (Streamer)
+  # 这个服务专门负责运行 stream_collector.py，挂了会自动重启
+  streamer:
+    build: ./backend             # 复用后端的代码和环境
+    container_name: crypto_streamer
+    restart: always              # ⭐️ 核心：无论报错还是断网，永远自动重启
+    command: python stream_collector.py  # 启动时直接执行采集脚本
+    volumes:
+      - ./backend:/app           # 挂载代码，本地修改后重启即可生效
+    environment:
+      # 保持和 backend 一致的环境变量，防止脚本引用 models 时报错
+      - DATABASE_URL=postgresql://user:password@db:5432/crypto_monitor
+    depends_on:
+      - redis                    # 必须等 Redis 启动后它才能连
+
 volumes:
   postgres_data:
   caddy_data:
   caddy_config:
+  redis_data:
