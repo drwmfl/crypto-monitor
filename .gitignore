@@ -1,10 +1,21 @@
-# 忽略 Python 缓存
+﻿# Python cache
 __pycache__/
 *.pyc
 
-# 忽略 环境变量/敏感信息
+# Local env / secrets
 .env
+.env.local
+.env.*.local
+apps/*/config/.env.local
 .venv
 venv/
 
+# Local compose overrides
 docker-compose.dev.yml
+
+# Runtime and research artifacts
+data/runtime/
+data/reports/
+
+# Runtime failure queues can contain noisy operational data
+data/runtime/**/telegram_retry_failed.jsonl

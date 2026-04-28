@@ -1,0 +1,465 @@
+{
+  "symbols": [],
+  "windows": [
+    "1m",
+    "5m",
+    "15m",
+    "30m",
+    "1h"
+  ],
+  "poll_interval_sec": 5,
+  "timezone": "Asia/Shanghai",
+  "log_level": "INFO",
+  "telegram": {
+    "enabled": true,
+    "token": "",
+    "chat_id": "",
+    "send_low_priority": false
+  },
+  "atr": {
+    "enabled": true,
+    "period": 14,
+    "k_by_window": {
+      "1m": 1.8,
+      "5m": 2.2,
+      "15m": 2.6,
+      "30m": 3.0,
+      "1h": 3.5
+    }
+  },
+  "indicators": {
+    "rsi_period": 14,
+    "bb_period": 20,
+    "bb_std": 2.0,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "macd_signal": 9,
+    "ma_period": 20,
+    "std_period": 20
+  },
+  "rules": {
+    "short_breakout": {
+      "enabled": true,
+      "windows": [
+        "1m",
+        "5m"
+      ],
+      "price_change_pct": {
+        "1m": 1.8,
+        "5m": 3.2
+      },
+      "min_change_pct": {
+        "1m": 1.5,
+        "5m": 2.8
+      },
+      "atr_multiplier": 1.6,
+      "volume_multiplier": 1.8,
+      "use_rsi_filter": true,
+      "rsi_upper": 70,
+      "rsi_lower": 30,
+      "force_trigger_pct": {
+        "1m": 4.0,
+        "5m": 6.0
+      },
+      "force_trigger_min_rvol": 1.2,
+      "force_trigger_severity": "high",
+      "severity": "medium"
+    },
+    "trend_acceleration": {
+      "enabled": true,
+      "windows": [
+        "15m",
+        "30m"
+      ],
+      "price_change_pct": {
+        "15m": 5.5,
+        "30m": 8.0
+      },
+      "min_change_pct": {
+        "15m": 5.0,
+        "30m": 7.0
+      },
+      "atr_multiplier": 1.6,
+      "use_bb_breakout": true,
+      "use_macd_confirm": true,
+      "severity": "high"
+    },
+    "long_anomaly": {
+      "enabled": true,
+      "windows": [
+        "1h"
+      ],
+      "price_change_pct": {
+        "1h": 10.0
+      },
+      "min_change_pct": {
+        "1h": 10.0
+      },
+      "atr_multiplier": 1.4,
+      "use_ma_sd_filter": true,
+      "ma_period": 20,
+      "std_period": 20,
+      "sd_multiplier": 2.2,
+      "severity": "high"
+    }
+  },
+  "cooldown_minutes": {
+    "default": 8,
+    "high_priority_extra_minutes": 3,
+    "by_window": {
+      "1m": 5,
+      "5m": 8,
+      "15m": 12,
+      "30m": 18,
+      "1h": 35
+    }
+  },
+  "confidence": {
+    "enabled": true,
+    "min_push_score": 60.0,
+    "bands": [
+      {
+        "label": "A",
+        "min_score": 85.0,
+        "cooldown_adjust_minutes": -2
+      },
+      {
+        "label": "B",
+        "min_score": 70.0,
+        "cooldown_adjust_minutes": 0
+      },
+      {
+        "label": "C",
+        "min_score": 60.0,
+        "cooldown_adjust_minutes": 2
+      }
+    ]
+  },
+  "push_policy": {
+    "repeat_window_minutes": 10,
+    "merge_window_minutes": 8,
+    "symbol_hourly_max_pushes": 6,
+    "cross_window_merge_enabled": true,
+    "cross_window_merge_windows": [
+      "15m",
+      "30m",
+      "1h"
+    ],
+    "cross_window_coalesce_sec": 90,
+    "cross_window_upgrade_sec": 180,
+    "cross_window_upgrade_min_score_delta": 8.0,
+    "attention_windows": [
+      "5m"
+    ],
+    "high_priority": {
+      "window": "5m",
+      "confidence_min": 85.0,
+      "rvol_min": 2.0
+    },
+    "watch_bars_by_window": {
+      "1m": 10,
+      "5m": 6,
+      "15m": 4,
+      "30m": 3,
+      "1h": 2
+    },
+    "trade_params_by_window": {
+      "1m": {
+        "sl_pct": 1.4,
+        "tp1_pct": 1.6,
+        "tp2_pct": 2.6
+      },
+      "5m": {
+        "sl_pct": 3.0,
+        "tp1_pct": 3.6,
+        "tp2_pct": 6.0
+      },
+      "15m": {
+        "sl_pct": 4.0,
+        "tp1_pct": 5.0,
+        "tp2_pct": 8.0
+      },
+      "30m": {
+        "sl_pct": 5.0,
+        "tp1_pct": 6.5,
+        "tp2_pct": 10.0
+      },
+      "1h": {
+        "sl_pct": 6.0,
+        "tp1_pct": 8.0,
+        "tp2_pct": 12.0
+      }
+    },
+    "position_by_tier": {
+      "observation": {
+        "conservative_pct": 3.0,
+        "aggressive_pct": 5.0,
+        "conservative_max_lev": 1.5,
+        "aggressive_max_lev": 2.0
+      },
+      "attention": {
+        "conservative_pct": 5.0,
+        "aggressive_pct": 8.0,
+        "conservative_max_lev": 1.8,
+        "aggressive_max_lev": 2.5
+      },
+      "high_priority": {
+        "conservative_pct": 8.0,
+        "aggressive_pct": 12.0,
+        "conservative_max_lev": 2.0,
+        "aggressive_max_lev": 3.0
+      }
+    }
+  },
+  "alert_strategy": {
+    "enabled": true,
+    "direct_tg_enabled": false,
+    "telegram_detail_level": "compact",
+    "runtime_dir": "",
+    "raw_event_file": "raw_events.jsonl",
+    "candidate_file": "candidates.json",
+    "policy_state_file": "alert_policy_state.json",
+    "candidate_ttl_minutes": 120,
+    "min_watch_score": 50.0,
+    "min_actionable_score": 75.0,
+    "max_watch_risk": 60.0,
+    "max_actionable_risk": 45.0,
+    "risk_alert_score": 70.0,
+    "watch_cooldown_minutes": 30,
+    "actionable_cooldown_minutes": 60,
+    "risk_cooldown_minutes": 60,
+    "global_max_10m": 5,
+    "global_max_hour": 20,
+    "require_oi_for_actionable": true,
+    "min_actionable_oi_signal_level": "L2",
+    "strong_direct_enabled": true,
+    "strong_direct_windows": [
+      "1m",
+      "5m"
+    ],
+    "strong_direct_change_pct": {
+      "1m": 4.0,
+      "5m": 6.0
+    },
+    "strong_direct_cooldown_minutes": 12,
+    "event_dedupe_enabled": true,
+    "event_dedupe_state_file": "event_dedupe_state.json",
+    "event_dedupe_window_minutes": 30,
+    "event_dedupe_min_abs_change_delta_pct": 3.0,
+    "event_dedupe_min_relative_change_delta": 0.35,
+    "event_dedupe_min_score_delta": 8.0,
+    "event_dedupe_min_risk_delta": 15.0,
+    "event_dedupe_factor_upgrade_enabled": true,
+    "event_dedupe_window_upgrade_enabled": true,
+    "event_dedupe_window_upgrade_requires_score_delta": true,
+    "event_dedupe_reversal_enabled": true,
+    "confirmation_factors": {
+      "enabled": true,
+      "cache_ttl_sec": 60,
+      "min_base_score": 40.0,
+      "min_event_count": 2,
+      "binance": {
+        "enabled": true,
+        "base_url": "https://fapi.binance.com",
+        "timeout_sec": 3.0,
+        "depth_limit": 100,
+        "depth_levels": 20,
+        "fetch_open_interest": true,
+        "fetch_open_interest_hist": true,
+        "fetch_funding": true,
+        "fetch_long_short_ratio": false,
+        "fetch_taker_buy_sell": true,
+        "fetch_orderbook": true,
+        "fetch_liquidations": true,
+        "liquidation_lookback_minutes": 5,
+        "open_interest_hist_period": "5m",
+        "open_interest_hist_limit": 576,
+        "taker_buy_sell_period": "5m",
+        "oi_history": {
+          "enabled": true,
+          "history_file": "oi_history.json",
+          "max_samples_per_symbol": 1200,
+          "bootstrap_ttl_sec": 300,
+          "min_bootstrap_samples": 12,
+          "min_zscore_samples": 20,
+          "signal_thresholds": {
+            "price_up_pct": 1.5,
+            "price_down_pct": -1.5,
+            "price_flat_abs_pct": 2.0,
+            "oi_l0_1h_pct": 0.06,
+            "oi_l1_5m_pct": 0.02,
+            "oi_l1_15m_pct": 0.03,
+            "oi_l2_15m_pct": 0.05,
+            "oi_l2_1h_pct": 0.1,
+            "oi_l3_4h_pct": 0.25,
+            "oi_l3_24h_pct": 0.5,
+            "rvol_confirm": 2.0,
+            "taker_buy_confirm": 0.55,
+            "funding_overheated": 0.0015
+          }
+        },
+        "microstructure": {
+          "enabled": true,
+          "ws_url": "wss://fstream.binance.com/ws",
+          "rest_base_url": "https://fapi.binance.com",
+          "bootstrap_agg_trades_enabled": true,
+          "bootstrap_lookback_sec": 300,
+          "bootstrap_min_interval_sec": 30,
+          "bootstrap_limit": 1000,
+          "track_ttl_sec": 900,
+          "subscription_refresh_sec": 5,
+          "reconnect_sec": 3,
+          "max_active_symbols": 40,
+          "max_trades_per_symbol": 5000,
+          "max_liquidations_per_symbol": 1000,
+          "windows_sec": [
+            10,
+            30,
+            60,
+            180,
+            300
+          ],
+          "signal_thresholds": {
+            "min_trade_notional_1m": 25000.0,
+            "min_trade_notional_5m": 100000.0,
+            "new_longs_cvd_1m": 10000.0,
+            "new_longs_cvd_5m": 35000.0,
+            "new_longs_buy_ratio_1m": 0.55,
+            "new_longs_buy_ratio_5m": 0.53,
+            "breakout_cvd_1m": 18000.0,
+            "breakout_cvd_3m": 45000.0,
+            "breakout_cvd_5m": 80000.0,
+            "breakout_buy_ratio_1m": 0.57,
+            "breakout_buy_ratio_3m": 0.55,
+            "breakout_buy_ratio_5m": 0.54,
+            "breakout_short_liq_share_1m_max": 0.45,
+            "absorption_trade_notional_30s": 8000.0,
+            "absorption_cvd_10s": 3500.0,
+            "absorption_cvd_30s": 7500.0,
+            "absorption_cvd_1m": 8000.0,
+            "absorption_buy_ratio_10s": 0.6,
+            "absorption_buy_ratio_30s": 0.58,
+            "absorption_buy_ratio_1m": 0.55,
+            "absorption_cvd_5m_floor": -20000.0,
+            "absorption_buy_ratio_gap": 0.08,
+            "absorption_oi_15m_min": -0.01,
+            "short_cover_liq_1m": 50000.0,
+            "short_cover_liq_share_1m": 0.55,
+            "short_cover_oi_15m_max": 0.03,
+            "churn_abs_cvd_ratio_1m": 0.08,
+            "churn_abs_cvd_ratio_5m": 0.12,
+            "churn_buy_ratio_delta": 0.04,
+            "oi_positive_15m": 0.015,
+            "oi_positive_1h": 0.015
+          }
+        }
+      },
+      "accumulation_pool": {
+        "enabled": true,
+        "runtime_dir": "",
+        "pool_file": "accumulation_pool.json",
+        "history_file": "accumulation_pool_history.jsonl",
+        "max_age_hours": 36,
+        "cache_ttl_sec": 60,
+        "scan": {
+          "enabled": true,
+          "base_url": "https://fapi.binance.com",
+          "lookback_days": 210,
+          "min_data_days": 60,
+          "min_sideways_days": 45,
+          "max_range_pct": 80.0,
+          "max_slope_pct": 20.0,
+          "min_avg_quote_vol_usdt": 500000.0,
+          "max_avg_quote_vol_usdt": 20000000.0,
+          "warming_vol_ratio": 1.5,
+          "ready_vol_ratio": 2.5,
+          "max_recent_pump_pct": 250.0,
+          "min_score": 60.0,
+          "max_symbols": 0,
+          "concurrency": 2,
+          "request_delay_sec": 0.15,
+          "market_cap_api_enabled": true
+        }
+      }
+    }
+  },
+  "data_feed": {
+    "kline_limit": 200,
+    "volume_lookback": 20,
+    "close_candle_only": true,
+    "max_concurrent_requests": 6,
+    "symbol_universe_mode": "all_usdt_perp",
+    "universe_refresh_sec": 60,
+    "exclude_symbols": [
+      "BTCUSDT",
+      "ETHUSDT",
+      "SOLUSDT",
+      "BNBUSDT",
+      "XRPUSDT",
+      "ADAUSDT",
+      "DOGEUSDT",
+      "TRXUSDT",
+      "LINKUSDT",
+      "LTCUSDT",
+      "BCHUSDT"
+    ],
+    "include_symbols": [],
+    "min_quote_volume_usdt": 1000000.0,
+    "max_quote_volume_usdt": 0.0,
+    "exclude_top_quote_volume_enabled": false,
+    "exclude_top_quote_volume_n": 20,
+    "max_symbols": 0,
+    "window_schedule_enabled": true,
+    "symbol_batch_size": 60,
+    "full_scan_windows": [
+      "1m",
+      "5m"
+    ],
+    "symbol_batch_size_by_window": {
+      "1m": 0,
+      "5m": 0,
+      "15m": 60,
+      "30m": 40,
+      "1h": 30
+    },
+    "priority_scan_enabled": true,
+    "priority_scan_top_n": 50,
+    "priority_scan_windows": [
+      "1m",
+      "5m"
+    ],
+    "priority_scan_min_24h_change_pct": 0.0,
+    "scan_coverage_file": "scan_coverage.json",
+    "scan_coverage_flush_sec": 15,
+    "ws_gap_detection_enabled": true,
+    "ws_gap_window": "1m",
+    "ws_gap_min_silence_sec": 90,
+    "ws_gap_min_change_pct": {
+      "1m": 4.0,
+      "5m": 6.0
+    },
+    "ws_realtime_enabled": true,
+    "ws_realtime_windows": [
+      "1m"
+    ],
+    "ws_realtime_skip_poll_windows": true,
+    "ws_realtime_prefilter_pct": {
+      "1m": 1.0
+    },
+    "ws_realtime_recheck_interval_sec": 6.0,
+    "ws_realtime_reconnect_sec": 3,
+    "ws_realtime_no_message_reconnect_sec": 45,
+    "ws_realtime_subscription_chunk_size": 180,
+    "ws_realtime_symbol_refresh_sec": 60,
+    "ws_realtime_url": "wss://fstream.binance.com/ws",
+    "ws_local_agg_enabled": true,
+    "ws_local_agg_windows": [
+      "15m",
+      "30m",
+      "1h"
+    ],
+    "ws_local_agg_skip_poll_windows": true,
+    "ws_local_agg_bootstrap_concurrency": 2,
+    "ws_local_agg_history_limit": 200
+  }
+}

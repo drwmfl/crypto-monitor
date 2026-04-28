@@ -1,0 +1,8 @@
+ccxt
+pandas
+requests
+python-dotenv
+redis>=5.0.0
+python-telegram-bot>=21.0
+websockets>=12.0
+aiohttp>=3.9.0

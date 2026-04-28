@@ -1,0 +1,1 @@
+"""Market monitor application package."""
