@@ -22,6 +22,15 @@ WINDOW_MS: Dict[str, int] = {
     "48h": 48 * 60 * 60 * 1000,
 }
 
+DEFAULT_MAX_WINDOW_SAMPLE_LAG_SEC: Dict[str, int] = {
+    "5m": 10 * 60,
+    "15m": 20 * 60,
+    "1h": 90 * 60,
+    "4h": 5 * 60 * 60,
+    "24h": 30 * 60 * 60,
+    "48h": 60 * 60 * 60,
+}
+
 DEFAULT_THRESHOLDS: Dict[str, float] = {
     "price_up_pct": 1.5,
     "price_down_pct": -1.5,
@@ -51,6 +60,13 @@ class OIHistoryStore:
         self.history_path = self.runtime_dir / history_file
         self.max_samples_per_symbol = max(50, _safe_int(self.settings.get("max_samples_per_symbol"), 1200))
         self.bootstrap_ttl_sec = max(30, _safe_int(self.settings.get("bootstrap_ttl_sec"), 300))
+        self.bootstrap_refresh_sec = max(0, _safe_int(self.settings.get("bootstrap_refresh_sec"), 3600))
+        self.max_latest_sample_age_sec = max(
+            0,
+            _safe_int(self.settings.get("max_latest_sample_age_sec"), 30 * 60),
+        )
+        self.min_recent_samples_4h = max(0, _safe_int(self.settings.get("min_recent_samples_4h"), 24))
+        self.max_window_sample_lag_ms = _parse_window_lag_ms(self.settings.get("max_window_sample_lag_sec"))
         self.min_bootstrap_samples = max(2, _safe_int(self.settings.get("min_bootstrap_samples"), 12))
         self.min_zscore_samples = max(8, _safe_int(self.settings.get("min_zscore_samples"), 20))
         self.save_interval_sec = max(0.0, _safe_float(self.settings.get("save_interval_sec"), 2.0))
@@ -69,9 +85,22 @@ class OIHistoryStore:
             return False
         if len(samples) < self.min_bootstrap_samples:
             return True
+        if not bootstrap_loaded_at:
+            return True
         newest = _safe_int(samples[-1].get("timestamp_ms"), 0)
         oldest = _safe_int(samples[0].get("timestamp_ms"), 0)
-        return (newest - oldest) < WINDOW_MS["4h"]
+        now_ms = int(now * 1000)
+        if newest <= 0:
+            return True
+        if self.max_latest_sample_age_sec > 0 and (now_ms - newest) > (self.max_latest_sample_age_sec * 1000):
+            return True
+        if (newest - oldest) < WINDOW_MS["4h"]:
+            return True
+        if self.min_recent_samples_4h > 0 and _count_samples_since(samples, now_ms - WINDOW_MS["4h"]) < self.min_recent_samples_4h:
+            return True
+        if self.bootstrap_refresh_sec > 0 and (now - bootstrap_loaded_at) >= float(self.bootstrap_refresh_sec):
+            return True
+        return False
 
     def mark_bootstrapped(self, symbol: str) -> None:
         symbol = _normalize_symbol(symbol)
@@ -141,22 +170,46 @@ class OIHistoryStore:
             "oi_history_span_minutes": round(max(0, latest_ts - timestamps[0]) / 60000.0, 2),
             "oi_history_latest_ts": latest_ts,
         }
+        valid_windows: List[str] = []
+        stale_windows: Dict[str, Dict[str, Any]] = {}
         primary_window = ""
         primary_change: Optional[float] = None
         primary_change_usdt: Optional[float] = None
 
         for window, window_ms in WINDOW_MS.items():
-            previous = _sample_at_or_before(samples, timestamps, latest_ts - window_ms)
+            target_ts = latest_ts - window_ms
+            previous = _sample_at_or_before(samples, timestamps, target_ts)
             if not previous:
+                stale_windows[window] = {"reason": "missing_baseline"}
+                continue
+            previous_ts = _safe_int(previous.get("timestamp_ms"), 0)
+            baseline_lag_ms = target_ts - previous_ts
+            max_lag_ms = self.max_window_sample_lag_ms.get(window, window_ms)
+            if baseline_lag_ms < 0 or baseline_lag_ms > max_lag_ms:
+                stale_windows[window] = {
+                    "reason": "stale_baseline",
+                    "baseline_lag_sec": round(max(0, baseline_lag_ms) / 1000.0, 2),
+                    "max_lag_sec": round(max_lag_ms / 1000.0, 2),
+                }
                 continue
             prev_value = _oi_value(previous)
             if prev_value <= 0:
+                stale_windows[window] = {"reason": "invalid_baseline"}
                 continue
             change = (latest_value - prev_value) / prev_value
             change_usdt = latest_value - prev_value
             metrics[f"oi_change_pct_{window}"] = change
             metrics[f"oi_change_usdt_{window}"] = change_usdt
-            zscore = _window_change_zscore(samples, timestamps, window_ms, current_change=change, min_count=self.min_zscore_samples)
+            metrics[f"oi_baseline_lag_sec_{window}"] = round(max(0, baseline_lag_ms) / 1000.0, 2)
+            valid_windows.append(window)
+            zscore = _window_change_zscore(
+                samples,
+                timestamps,
+                window_ms,
+                current_change=change,
+                min_count=self.min_zscore_samples,
+                max_baseline_lag_ms=max_lag_ms,
+            )
             if zscore is not None:
                 metrics[f"oi_zscore_{window}"] = zscore
             if primary_change is None or abs(change) > abs(primary_change):
@@ -170,6 +223,9 @@ class OIHistoryStore:
             metrics["oi_change_pct"] = primary_change
             if primary_change_usdt is not None:
                 metrics["oi_change_usdt"] = primary_change_usdt
+        metrics["oi_valid_windows"] = valid_windows
+        if stale_windows:
+            metrics["oi_stale_windows"] = stale_windows
         return metrics
 
     def _merge_samples(self, symbol: str, incoming: List[Dict[str, Any]]) -> None:
@@ -349,12 +405,18 @@ def _window_change_zscore(
     *,
     current_change: float,
     min_count: int,
+    max_baseline_lag_ms: int,
 ) -> Optional[float]:
     changes: List[float] = []
     for index, sample in enumerate(samples):
         ts_ms = timestamps[index]
-        previous = _sample_at_or_before(samples, timestamps, ts_ms - window_ms)
+        target_ts = ts_ms - window_ms
+        previous = _sample_at_or_before(samples, timestamps, target_ts)
         if not previous:
+            continue
+        previous_ts = _safe_int(previous.get("timestamp_ms"), 0)
+        baseline_lag_ms = target_ts - previous_ts
+        if baseline_lag_ms < 0 or baseline_lag_ms > max_baseline_lag_ms:
             continue
         prev_value = _oi_value(previous)
         curr_value = _oi_value(sample)
@@ -376,6 +438,26 @@ def _sample_at_or_before(samples: List[Dict[str, Any]], timestamps: List[int], t
     if index < 0:
         return None
     return samples[index]
+
+
+def _count_samples_since(samples: List[Dict[str, Any]], min_ts: int) -> int:
+    return sum(1 for sample in samples if _safe_int(sample.get("timestamp_ms"), 0) >= min_ts)
+
+
+def _parse_window_lag_ms(value: Any) -> Dict[str, int]:
+    result = {
+        window: max(1, int(seconds * 1000))
+        for window, seconds in DEFAULT_MAX_WINDOW_SAMPLE_LAG_SEC.items()
+    }
+    if not isinstance(value, dict):
+        return result
+    for window in WINDOW_MS:
+        if window not in value:
+            continue
+        seconds = _safe_float(value.get(window), 0.0)
+        if seconds > 0:
+            result[window] = int(seconds * 1000)
+    return result
 
 
 def _oi_value(sample: Dict[str, Any]) -> float:

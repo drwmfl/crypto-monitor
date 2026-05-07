@@ -196,6 +196,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                     "history_file": "oi_history.json",
                     "max_samples_per_symbol": 1200,
                     "bootstrap_ttl_sec": 300,
+                    "bootstrap_refresh_sec": 3600,
+                    "max_latest_sample_age_sec": 1800,
+                    "min_recent_samples_4h": 24,
+                    "max_window_sample_lag_sec": {
+                        "5m": 600,
+                        "15m": 1200,
+                        "1h": 5400,
+                        "4h": 18000,
+                        "24h": 108000,
+                        "48h": 216000,
+                    },
                     "min_bootstrap_samples": 12,
                     "min_zscore_samples": 20,
                     "signal_thresholds": {
@@ -1435,6 +1446,49 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         30,
         _to_int(oi_history.get("bootstrap_ttl_sec"), _to_int(oi_defaults.get("bootstrap_ttl_sec"), 300)),
     )
+    oi_history["bootstrap_refresh_sec"] = max(
+        0,
+        _to_int(
+            oi_history.get("bootstrap_refresh_sec"),
+            _to_int(oi_defaults.get("bootstrap_refresh_sec"), 3600),
+        ),
+    )
+    oi_history["max_latest_sample_age_sec"] = max(
+        0,
+        _to_int(
+            oi_history.get("max_latest_sample_age_sec"),
+            _to_int(oi_defaults.get("max_latest_sample_age_sec"), 1800),
+        ),
+    )
+    oi_history["min_recent_samples_4h"] = max(
+        0,
+        _to_int(
+            oi_history.get("min_recent_samples_4h"),
+            _to_int(oi_defaults.get("min_recent_samples_4h"), 24),
+        ),
+    )
+    default_lag_by_window = {
+        "5m": 600,
+        "15m": 1200,
+        "1h": 5400,
+        "4h": 18000,
+        "24h": 108000,
+        "48h": 216000,
+    }
+    if isinstance(oi_defaults.get("max_window_sample_lag_sec"), dict):
+        default_lag_by_window.update(
+            {
+                str(window): _to_int(value, default_lag_by_window.get(str(window), 0))
+                for window, value in oi_defaults["max_window_sample_lag_sec"].items()
+            }
+        )
+    raw_lag_by_window = oi_history.get("max_window_sample_lag_sec")
+    if not isinstance(raw_lag_by_window, dict):
+        raw_lag_by_window = {}
+    oi_history["max_window_sample_lag_sec"] = {
+        window: max(1, _to_int(raw_lag_by_window.get(window), default_lag_by_window[window]))
+        for window in default_lag_by_window
+    }
     oi_history["min_bootstrap_samples"] = max(
         2,
         _to_int(oi_history.get("min_bootstrap_samples"), _to_int(oi_defaults.get("min_bootstrap_samples"), 12)),
