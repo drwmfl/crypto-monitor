@@ -82,6 +82,18 @@ class AlertStrategyPipeline:
         self.candidate_engine.save()
 
         if self._is_strong_direct_event(payload):
+            if self.factor_enricher.should_enrich(candidate, base_score=score):
+                candidate = await self.factor_enricher.enrich(candidate)
+                score, score_breakdown, priority = score_candidate(candidate)
+                risk_score_value, risk_level, risk_breakdown = score_risk(candidate)
+                candidate.score = score
+                candidate.score_breakdown = score_breakdown
+                candidate.priority = priority
+                candidate.risk_score = risk_score_value
+                candidate.risk_level = risk_level
+                candidate.risk_breakdown = risk_breakdown
+                self.candidate_engine.save()
+
             decision = self.policy.allow_alert_type(
                 candidate.symbol,
                 "strong_direct_alert",
@@ -92,7 +104,7 @@ class AlertStrategyPipeline:
             if decision.should_send:
                 dedupe_decision = self.event_deduper.decide(candidate, alert_type="strong_direct_alert")
                 if dedupe_decision.should_send:
-                    alert_sent = await self._send_strong_direct(notifier=notifier, payload=payload)
+                    alert_sent = await self._send_strong_direct(notifier=notifier, candidate=candidate)
                     if alert_sent:
                         self.event_deduper.mark_sent(candidate, alert_type="strong_direct_alert")
                         self.policy.mark_sent(candidate.symbol, "strong_direct_alert")
@@ -208,16 +220,25 @@ class AlertStrategyPipeline:
     def _strong_direct_cooldown_minutes(self) -> int:
         return max(1, _to_int(self.settings.get("strong_direct_cooldown_minutes"), 12))
 
-    async def _send_strong_direct(self, *, notifier: Any, payload: Dict[str, Any]) -> bool:
-        direct_payload = dict(payload)
-        reasons = [str(item) for item in (direct_payload.get("reasons") or [])]
-        reasons.insert(0, "strong_direct: bypass strategy filters")
-        direct_payload["reasons"] = reasons
-        direct_payload["level"] = "high"
-        direct_payload["strong_direct"] = True
-        if hasattr(notifier, "notify_from_dict"):
-            return await notifier.notify_from_dict(direct_payload)
-        logger.warning("Notifier does not support notify_from_dict; strong direct alert dropped: %s", payload.get("symbol"))
+    async def _send_strong_direct(self, *, notifier: Any, candidate: Any) -> bool:
+        detail_level = str(self.settings.get("telegram_detail_level") or "compact")
+        decision = AlertDecision(True, alert_type="strong_direct_alert", reason="strong_direct")
+        message = format_strategy_alert(candidate, decision, detail_level=detail_level)
+        if hasattr(notifier, "notify_text"):
+            return await notifier.notify_text(
+                message,
+                symbol=candidate.symbol,
+                rule_name="strategy_strong_direct_alert",
+                level="high",
+                metadata={
+                    "candidate_id": candidate.candidate_id,
+                    "candidate_score": candidate.score,
+                    "risk_score": candidate.risk_score,
+                    "alert_type": "strong_direct_alert",
+                    "strong_direct": True,
+                },
+            )
+        logger.warning("Notifier does not support notify_text; strong direct alert dropped: %s", candidate.symbol)
         return False
 
 

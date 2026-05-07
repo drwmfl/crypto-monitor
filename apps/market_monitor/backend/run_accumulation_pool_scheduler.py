@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import json
 import logging
 import os
@@ -238,16 +239,17 @@ def _build_summary_message(payload: Dict[str, Any], pool_path: Path, limit: int)
     status_counts = _status_counts(symbols.values())
 
     generated_at = _format_beijing_time(str(payload.get("generated_at") or ""))
+    total_count = int(payload.get("count") or len(symbols))
     lines = [
-        "**收筹池日报 | 放量/升温 Top20**",
-        f"时间：{generated_at}",
+        f"<b>吸筹池日报 | 放量/升温 Top{limit}</b>",
+        f"时间：{_html(generated_at)}",
         (
-            f"入池：{int(payload.get('count') or len(symbols))} | "
-            f"放量 {status_counts.get('ready', 0)} | "
-            f"升温 {status_counts.get('warming', 0)} | "
-            f"沉睡 {status_counts.get('dormant', 0)}"
+            f"概览：入池 <b>{total_count}</b> ｜ "
+            f"放量 <b>{status_counts.get('ready', 0)}</b> ｜ "
+            f"升温 <b>{status_counts.get('warming', 0)}</b> ｜ "
+            f"沉睡 <b>{status_counts.get('dormant', 0)}</b>"
         ),
-        f"文件：{pool_path.name}",
+        f"文件：<code>{_html(pool_path.name)}</code>",
         "",
     ]
 
@@ -266,20 +268,25 @@ def _build_summary_message(payload: Dict[str, Any], pool_path: Path, limit: int)
         vol_ratio = _safe_float(item.get("recent_vol_ratio_7d"))
         range_position = _safe_float(item.get("range_position")) * 100.0
         market_cap = _fmt_usd(item.get("market_cap"))
-        lines.append(
-            f"{idx}. **{base}** {status_label} {score:.1f} | "
-            f"横盘{sideways_days}天 | 区间{range_pct:.1f}% | "
-            f"Vol {vol_ratio:.1f}x | 位置{range_position:.0f}% | 市值{market_cap}"
+        if idx > 1:
+            lines.append("")
+        symbol_label = _symbol_link(symbol=symbol, label=base)
+        lines.extend(
+            [
+                f"{idx}. {symbol_label}  {status_label}  评分 <b>{score:.1f}</b>",
+                f"   横盘：{sideways_days}天 ｜ 区间：{range_pct:.1f}% ｜ 位置：{range_position:.0f}%",
+                f"   量能：Vol {vol_ratio:.1f}x ｜ 市值：{_html(market_cap)}",
+            ]
         )
     return "\n".join(lines)
 
 
 def _build_failure_message(max_attempts: int, last_error: str) -> str:
-    error_text = str(last_error or "unknown")[:300]
+    error_text = _html(str(last_error or "unknown")[:300])
     return "\n".join(
         [
-            "**收筹池日报失败**",
-            f"时间：{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S UTC+8')}",
+            "<b>吸筹池日报失败</b>",
+            f"时间：{_html(datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S UTC+8'))}",
             f"尝试：{max_attempts} 次",
             f"最后错误：{error_text}",
         ]
@@ -304,6 +311,7 @@ async def _send_telegram(message: str) -> bool:
     payload = {
         "chat_id": chat_id,
         "text": message,
+        "parse_mode": "HTML",
         "disable_web_page_preview": True,
     }
     timeout = aiohttp.ClientTimeout(total=connect_timeout + read_timeout + 5.0, connect=connect_timeout, sock_read=read_timeout)
@@ -384,6 +392,23 @@ def _status(item: Any) -> str:
 def _status_label(status: str) -> str:
     key = str(status or "").strip().lower()
     return STATUS_LABELS.get(key, key or "unknown")
+
+
+def _html(value: Any) -> str:
+    return html.escape(str(value), quote=False)
+
+
+def _html_attr(value: Any) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def _symbol_link(*, symbol: str, label: str) -> str:
+    clean_symbol = str(symbol or "").strip().upper()
+    clean_label = _html(str(label or clean_symbol or "UNKNOWN").strip().upper())
+    if not clean_symbol:
+        return f"<b>{clean_label}</b>"
+    url = f"https://www.binance.com/futures/{_html_attr(clean_symbol)}"
+    return f'<b><a href="{url}">{clean_label}</a></b>'
 
 
 def _status_counts(items: Sequence[Any]) -> Dict[str, int]:

@@ -14,6 +14,7 @@ ALERT_TYPE_LABELS = {
     "watchlist_alert": "观察候选",
     "actionable_alert": "高价值候选",
     "risk_alert": "高风险提醒",
+    "strong_direct_alert": "急速异动",
 }
 
 DETAIL_LEVELS = {"compact", "full", "verbose"}
@@ -52,7 +53,7 @@ def format_strategy_alert(
     derivatives = candidate.derivatives or {}
     accumulation = candidate.accumulation or {}
     latest = candidate.latest_features or {}
-    alert_label = ALERT_TYPE_LABELS.get(decision.alert_type, "策略提醒")
+    alert_label = ALERT_TYPE_LABELS.get(decision.alert_type, "观察候选")
     token_name = str(candidate.base_asset or "").strip().upper() or _token_name(candidate.symbol)
     trigger_count = max(1, int(candidate.event_count or 0))
     direction = _direction_label(str(latest.get("direction") or ""))
