@@ -66,11 +66,17 @@ async def _run_cycle(
     symbols: Optional[List[str]] = None,
     strategy: Optional[AlertStrategyPipeline] = None,
     scan_source: str = "poll",
+    backfill_closed_bars: int = 1,
 ) -> Tuple[int, int, int, int]:
     if windows is not None and len(windows) == 0:
         return 0, 0, 0, 0
 
-    snapshots = await feed.fetch_all_snapshots(windows=windows, symbols=symbols, scan_source=scan_source)
+    snapshots = await feed.fetch_all_snapshots(
+        windows=windows,
+        symbols=symbols,
+        scan_source=scan_source,
+        backfill_closed_bars=backfill_closed_bars,
+    )
     event_count = 0
     sent_count = 0
     skipped_by_cooldown = 0
@@ -226,6 +232,20 @@ def _pick_priority_symbols(config: AlertConfig, feed: BinanceKlineDataFeed) -> L
     return feed.top_24h_gainer_symbols(limit=top_n, min_change_pct=min_change)
 
 
+def _priority_backfill_closed_bars(config: AlertConfig, window: str) -> int:
+    data_feed_cfg = config.data_feed or {}
+    raw = data_feed_cfg.get("priority_scan_backfill_closed_bars", {})
+    value: object = 1
+    if isinstance(raw, dict):
+        value = raw.get(window, raw.get("default", 1))
+    elif raw is not None:
+        value = raw
+    try:
+        return max(1, int(value or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
 def _attach_ws_gap_if_needed(config: AlertConfig, feed: BinanceKlineDataFeed, event: Dict[str, object]) -> None:
     data_feed_cfg = config.data_feed or {}
     if not bool(data_feed_cfg.get("ws_gap_detection_enabled", False)):
@@ -359,11 +379,12 @@ async def run_alert_monitor(config_path: Optional[str] = None) -> None:
     else:
         logger.info("Realtime WS disabled; poll windows=%s", poll_windows)
     logger.info(
-        "Priority scan: enabled=%s top_n=%s windows=%s min_24h_change=%s coverage_file=%s",
+        "Priority scan: enabled=%s top_n=%s windows=%s min_24h_change=%s backfill_closed_bars=%s coverage_file=%s",
         priority_scan_enabled,
         config.data_feed.get("priority_scan_top_n", 0),
         priority_scan_windows,
         config.data_feed.get("priority_scan_min_24h_change_pct", 0.0),
+        config.data_feed.get("priority_scan_backfill_closed_bars", {}),
         config.data_feed.get("scan_coverage_file", ""),
     )
 
@@ -434,6 +455,7 @@ async def run_alert_monitor(config_path: Optional[str] = None) -> None:
                         priority_batches[window] = 0
                         continue
                     priority_batches[window] = len(batch_symbols)
+                    backfill_closed_bars = _priority_backfill_closed_bars(config, window)
                     sc, ec, ss, cs = await _run_cycle(
                         config=config,
                         feed=feed,
@@ -443,6 +465,7 @@ async def run_alert_monitor(config_path: Optional[str] = None) -> None:
                         symbols=batch_symbols,
                         strategy=strategy,
                         scan_source="priority_poll",
+                        backfill_closed_bars=backfill_closed_bars,
                     )
                     snapshot_count += sc
                     event_count += ec

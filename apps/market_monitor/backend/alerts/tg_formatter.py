@@ -65,9 +65,9 @@ def format_strategy_alert(
         f"**{alert_label} | {token_name}（触发{trigger_count}次）**",
         f"状态：OI {_oi_state_label(derivatives)} | Micro {_micro_state_label(derivatives)} | {direction} {windows}",
         f"价格：{change} | {price} | 评分/风险 {candidate.score:.1f}/{candidate.risk_score:.1f}",
-        f"OI：{_oi_matrix(derivatives)}",
-        f"微结构：{_micro_matrix(derivatives)}",
-        f"资金：主动买 {_fmt_ratio_pct(derivatives.get('taker_buy_ratio'))} | 费率 {_fmt_ratio_pct(derivatives.get('funding_rate'))} | OI {_fmt_compact_usd(derivatives.get('oi_usdt'))}",
+        f"OI: {_oi_matrix(derivatives)}",
+        f"微结构: {_micro_matrix(derivatives)}",
+        f"资金: {_funding_matrix(derivatives)}",
     ]
 
     accumulation_line = _accumulation_line(accumulation)
@@ -98,12 +98,16 @@ def _token_name(symbol: str) -> str:
 
 
 def _oi_state_label(derivatives: Dict[str, Any]) -> str:
+    if not _has_oi_data(derivatives):
+        return "预热中"
     level = str(derivatives.get("oi_signal_level") or "none").upper()
     regime = _oi_regime_short_label(str(derivatives.get("oi_regime") or "unknown"))
     return f"{level} {regime}"
 
 
 def _micro_state_label(derivatives: Dict[str, Any]) -> str:
+    if not _has_micro_data(derivatives):
+        return "预热中"
     level = str(derivatives.get("micro_signal_level") or "L0").upper()
     regime = _micro_regime_short_label(str(derivatives.get("micro_regime") or "unknown"))
     return f"{level} {regime}"
@@ -135,7 +139,7 @@ def _accumulation_status_label(status: Any) -> str:
 
 
 def _oi_matrix(derivatives: Dict[str, Any]) -> str:
-    if not derivatives:
+    if not _has_oi_data(derivatives):
         return "预热中"
     return (
         f"5m {_fmt_ratio_pct(derivatives.get('oi_change_pct_5m'))} | "
@@ -146,7 +150,7 @@ def _oi_matrix(derivatives: Dict[str, Any]) -> str:
 
 
 def _micro_matrix(derivatives: Dict[str, Any]) -> str:
-    if not derivatives:
+    if not _has_micro_data(derivatives):
         return "预热中"
 
     regime = str(derivatives.get("micro_regime") or "unknown")
@@ -170,6 +174,55 @@ def _micro_matrix(derivatives: Dict[str, Any]) -> str:
         f"{_fmt_ratio_pct(derivatives.get('buy_aggressor_ratio_5m'))} | "
         f"强平差 {_fmt_signed_usd(derivatives.get('micro_liq_imbalance_usdt_1m'))}"
     )
+
+
+def _funding_matrix(derivatives: Dict[str, Any]) -> str:
+    if not _has_funding_data(derivatives):
+        return "预热中"
+    return (
+        f"主动买 {_fmt_ratio_pct(derivatives.get('taker_buy_ratio'))} | "
+        f"费率 {_fmt_ratio_pct(derivatives.get('funding_rate'))} | "
+        f"OI {_fmt_compact_usd(derivatives.get('oi_usdt'))}"
+    )
+
+
+def _has_oi_data(derivatives: Dict[str, Any]) -> bool:
+    keys = (
+        "oi_usdt",
+        "oi_change_pct_5m",
+        "oi_change_pct_15m",
+        "oi_change_pct_1h",
+        "oi_change_pct_4h",
+    )
+    return _has_any_value(derivatives, keys)
+
+
+def _has_micro_data(derivatives: Dict[str, Any]) -> bool:
+    keys = (
+        "cvd_usdt_10s",
+        "cvd_usdt_30s",
+        "cvd_usdt_1m",
+        "cvd_usdt_3m",
+        "cvd_usdt_5m",
+        "buy_aggressor_ratio_10s",
+        "buy_aggressor_ratio_30s",
+        "buy_aggressor_ratio_1m",
+        "buy_aggressor_ratio_3m",
+        "buy_aggressor_ratio_5m",
+        "micro_liq_imbalance_usdt_1m",
+    )
+    return _has_any_value(derivatives, keys)
+
+
+def _has_funding_data(derivatives: Dict[str, Any]) -> bool:
+    return _has_any_value(derivatives, ("taker_buy_ratio", "funding_rate", "oi_usdt"))
+
+
+def _has_any_value(payload: Dict[str, Any], keys: tuple[str, ...]) -> bool:
+    for key in keys:
+        if _safe_optional_float(payload.get(key)) is not None:
+            return True
+    return False
 
 
 def _direction_label(value: str) -> str:

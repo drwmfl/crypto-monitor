@@ -82,17 +82,16 @@ class AlertStrategyPipeline:
         self.candidate_engine.save()
 
         if self._is_strong_direct_event(payload):
-            if self.factor_enricher.should_enrich(candidate, base_score=score):
-                candidate = await self.factor_enricher.enrich(candidate)
-                score, score_breakdown, priority = score_candidate(candidate)
-                risk_score_value, risk_level, risk_breakdown = score_risk(candidate)
-                candidate.score = score
-                candidate.score_breakdown = score_breakdown
-                candidate.priority = priority
-                candidate.risk_score = risk_score_value
-                candidate.risk_level = risk_level
-                candidate.risk_breakdown = risk_breakdown
-                self.candidate_engine.save()
+            candidate = await self.factor_enricher.enrich(candidate)
+            score, score_breakdown, priority = score_candidate(candidate)
+            risk_score_value, risk_level, risk_breakdown = score_risk(candidate)
+            candidate.score = score
+            candidate.score_breakdown = score_breakdown
+            candidate.priority = priority
+            candidate.risk_score = risk_score_value
+            candidate.risk_level = risk_level
+            candidate.risk_breakdown = risk_breakdown
+            self.candidate_engine.save()
 
             decision = self.policy.allow_alert_type(
                 candidate.symbol,

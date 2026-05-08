@@ -658,9 +658,10 @@ class AlertNotifier:
         confidence_band = str(event.confidence_band or "").strip().upper() or "N/A"
         token_name = self._token_name(event.symbol)
         direction_badge = f"{event.direction_icon()} {event.direction_label()}"
+        trigger_count = self._display_trigger_count(event)
 
         lines = [
-            f"**{token_name}（今日第{daily_push_count}次推送） | {direction_badge} | {tier_label}**",
+            f"**{token_name}（触发{trigger_count}次） | {direction_badge} | {tier_label}**",
             (
                 f"核心变化：**{event.change_pct:+.2f}%**"
                 f"   现价：**{event.price:.6f}**"
@@ -1246,6 +1247,12 @@ class AlertNotifier:
         if event.merged_count > 0:
             parts.append(f"近期合并 {event.merged_count}次")
         return " | ".join(parts)
+
+    @staticmethod
+    def _display_trigger_count(event: AlertEvent) -> int:
+        repeat_count = max(1, int(event.repeat_count or 0))
+        merged_count = max(0, int(event.merged_count or 0))
+        return max(repeat_count, merged_count + 1)
 
     def _coalesced_change_summary(self, event: AlertEvent) -> str:
         values = dict(event.coalesced_changes or {})

@@ -339,6 +339,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "priority_scan_top_n": 50,
         "priority_scan_windows": ["1m", "5m"],
         "priority_scan_min_24h_change_pct": 0.0,
+        "priority_scan_backfill_closed_bars": {"1m": 3},
         "scan_coverage_file": "scan_coverage.json",
         "scan_coverage_flush_sec": 15,
         "ws_gap_detection_enabled": True,
@@ -691,6 +692,16 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
             os.getenv("ALERT_PRIORITY_SCAN_MIN_24H_CHANGE_PCT"),
             default=0.0,
         )
+    priority_backfill_raw = os.getenv("ALERT_PRIORITY_SCAN_BACKFILL_CLOSED_BARS_JSON")
+    if priority_backfill_raw:
+        try:
+            parsed = json.loads(priority_backfill_raw)
+            if isinstance(parsed, dict):
+                data_feed["priority_scan_backfill_closed_bars"] = parsed
+            else:
+                logger.warning("ALERT_PRIORITY_SCAN_BACKFILL_CLOSED_BARS_JSON must be a JSON object, ignored.")
+        except json.JSONDecodeError:
+            logger.warning("ALERT_PRIORITY_SCAN_BACKFILL_CLOSED_BARS_JSON is not valid JSON, ignored.")
     if os.getenv("ALERT_SCAN_COVERAGE_FILE"):
         data_feed["scan_coverage_file"] = str(os.getenv("ALERT_SCAN_COVERAGE_FILE")).strip()
     if os.getenv("ALERT_SCAN_COVERAGE_FLUSH_SEC"):
@@ -1823,6 +1834,21 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         data_feed.get("priority_scan_min_24h_change_pct"),
         default=0.0,
     )
+    raw_priority_backfill = data_feed.get(
+        "priority_scan_backfill_closed_bars",
+        DEFAULT_CONFIG["data_feed"].get("priority_scan_backfill_closed_bars", {"1m": 3}),
+    )
+    normalized_priority_backfill: Dict[str, int] = {}
+    if isinstance(raw_priority_backfill, dict):
+        for key, value in raw_priority_backfill.items():
+            window_key = str(key).strip()
+            if window_key == "default" or window_key in VALID_WINDOWS:
+                normalized_priority_backfill[window_key] = max(1, _to_int(value, default=1))
+    else:
+        normalized_priority_backfill["default"] = max(1, _to_int(raw_priority_backfill, default=1))
+    if not normalized_priority_backfill:
+        normalized_priority_backfill = {"1m": 3}
+    data_feed["priority_scan_backfill_closed_bars"] = normalized_priority_backfill
     data_feed["scan_coverage_file"] = str(
         data_feed.get(
             "scan_coverage_file",

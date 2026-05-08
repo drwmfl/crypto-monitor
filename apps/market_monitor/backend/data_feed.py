@@ -144,16 +144,29 @@ class BinanceKlineDataFeed:
         windows: Optional[List[str]] = None,
         symbols: Optional[List[str]] = None,
         scan_source: str = "poll",
+        backfill_closed_bars: int = 1,
     ) -> List[MarketSnapshot]:
         target_windows = self.config.windows if windows is None else windows
         target_symbols = symbols if symbols is not None else list(self.symbol_mapping.keys())
         tasks = []
+        backfill_count = max(1, int(backfill_closed_bars or 1))
         for alert_symbol in target_symbols:
             ccxt_symbol = self.symbol_mapping.get(alert_symbol)
             if not ccxt_symbol:
                 continue
             for window in target_windows:
-                tasks.append(self.fetch_snapshot(alert_symbol, ccxt_symbol, window, scan_source=scan_source))
+                if backfill_count > 1:
+                    tasks.append(
+                        self.fetch_recent_closed_snapshots(
+                            alert_symbol,
+                            ccxt_symbol,
+                            window,
+                            backfill_closed_bars=backfill_count,
+                            scan_source=scan_source,
+                        )
+                    )
+                else:
+                    tasks.append(self.fetch_snapshot(alert_symbol, ccxt_symbol, window, scan_source=scan_source))
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
         snapshots: List[MarketSnapshot] = []
@@ -161,7 +174,9 @@ class BinanceKlineDataFeed:
             if isinstance(item, Exception):
                 logger.warning("Snapshot task failed: %s", item)
                 continue
-            if item is not None:
+            if isinstance(item, list):
+                snapshots.extend(snapshot for snapshot in item if snapshot is not None)
+            elif item is not None:
                 snapshots.append(item)
         return snapshots
 
@@ -250,6 +265,55 @@ class BinanceKlineDataFeed:
                 else:
                     logger.warning("fetch_ohlcv failed: symbol=%s window=%s err=%s", alert_symbol, window, exc)
                 return None
+
+    async def fetch_recent_closed_snapshots(
+        self,
+        alert_symbol: str,
+        ccxt_symbol: str,
+        window: str,
+        *,
+        backfill_closed_bars: int,
+        scan_source: str = "priority_poll",
+    ) -> List[MarketSnapshot]:
+        if self._is_temporarily_banned():
+            self.mark_scan_result(alert_symbol, window, scan_source, success=False, error="temporarily_banned")
+            return []
+
+        previous_event_time_ms = self._last_scan_event_time_ms(alert_symbol, window)
+        self.mark_scan_attempt(alert_symbol, window, scan_source)
+        async with self._semaphore:
+            try:
+                snapshots = await asyncio.to_thread(
+                    self._fetch_recent_closed_snapshots_sync,
+                    alert_symbol,
+                    ccxt_symbol,
+                    window,
+                    max(1, int(backfill_closed_bars or 1)),
+                    previous_event_time_ms,
+                )
+                latest_event_time = snapshots[-1].event_time if snapshots else None
+                self.mark_scan_result(
+                    alert_symbol,
+                    window,
+                    scan_source,
+                    success=bool(snapshots),
+                    event_time=latest_event_time,
+                )
+                return snapshots
+            except Exception as exc:
+                message = str(exc)
+                self.mark_scan_result(alert_symbol, window, scan_source, success=False, error=message[:200])
+                if "-1003" in message or "I'm a teapot" in message:
+                    self._update_ban_until_from_error(message)
+                    now = time.time()
+                    if (now - self._last_rate_limit_log_ts) >= self._rate_limit_log_interval_sec:
+                        logger.warning("Binance rate limit triggered, requests are temporarily blocked: %s", message)
+                        self._last_rate_limit_log_ts = now
+                    else:
+                        logger.debug("fetch_ohlcv rate-limited: symbol=%s window=%s", alert_symbol, window)
+                else:
+                    logger.warning("fetch_ohlcv failed: symbol=%s window=%s err=%s", alert_symbol, window, exc)
+                return []
 
     def top_24h_gainer_symbols(self, limit: int, min_change_pct: float = 0.0) -> List[str]:
         ranked: List[Tuple[float, str]] = []
@@ -427,6 +491,58 @@ class BinanceKlineDataFeed:
         if len(closed) < self.volume_lookback + 2:
             return None
 
+        return self._build_snapshot_from_closed_rows(alert_symbol, window, closed)
+
+    def _fetch_recent_closed_snapshots_sync(
+        self,
+        alert_symbol: str,
+        ccxt_symbol: str,
+        window: str,
+        backfill_closed_bars: int,
+        previous_event_time_ms: Optional[int],
+    ) -> List[MarketSnapshot]:
+        candles = self.exchange.fetch_ohlcv(ccxt_symbol, timeframe=window, limit=self.kline_limit)
+        if not candles or len(candles) < max(35, self.volume_lookback + 3):
+            return []
+
+        closed = candles[:-1] if self.close_candle_only and len(candles) >= 2 else candles
+        if len(closed) < self.volume_lookback + 2:
+            return []
+
+        eligible_indexes: List[int] = []
+        for idx, row in enumerate(closed):
+            row_ts = int(row[0])
+            if previous_event_time_ms is not None and row_ts <= previous_event_time_ms:
+                continue
+            eligible_indexes.append(idx)
+
+        if not eligible_indexes and previous_event_time_ms is None:
+            eligible_indexes = list(range(len(closed)))
+        if not eligible_indexes:
+            return []
+
+        backfill_limit = max(1, int(backfill_closed_bars or 1))
+        if previous_event_time_ms is None:
+            selected_indexes = eligible_indexes[-backfill_limit:]
+        else:
+            selected_indexes = eligible_indexes[:backfill_limit]
+        snapshots: List[MarketSnapshot] = []
+        for idx in selected_indexes:
+            history = closed[: idx + 1]
+            snapshot = self._build_snapshot_from_closed_rows(alert_symbol, window, history)
+            if snapshot is not None:
+                snapshots.append(snapshot)
+        return snapshots
+
+    def _build_snapshot_from_closed_rows(
+        self,
+        alert_symbol: str,
+        window: str,
+        closed: List[List[float]],
+    ) -> Optional[MarketSnapshot]:
+        if len(closed) < self.volume_lookback + 2:
+            return None
+
         latest = closed[-1]
         prior = closed[:-1]
         recent_volume_rows = prior[-self.volume_lookback :] if prior else []
@@ -462,6 +578,28 @@ class BinanceKlineDataFeed:
             event_time=event_time,
             indicators=indicators,
         )
+
+    def _last_scan_event_time_ms(self, symbol: str, window: str) -> Optional[int]:
+        normalized = _normalize_raw_symbol(symbol)
+        window_key = str(window or "").strip()
+        item = (
+            self._scan_coverage.get("symbols", {})
+            .get(normalized, {})
+            .get("last_scan_by_window", {})
+            .get(window_key, {})
+        )
+        if not isinstance(item, dict):
+            return None
+        raw_event_time = str(item.get("event_time") or "").strip()
+        if not raw_event_time:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw_event_time)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        except ValueError:
+            return None
 
     def _build_symbol_mapping(self, symbols: List[str]) -> Dict[str, str]:
         mapping: Dict[str, str] = {}
