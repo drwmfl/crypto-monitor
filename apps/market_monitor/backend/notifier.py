@@ -381,6 +381,12 @@ class AlertNotifier:
             logger.error("Telegram token/chat_id missing, cannot send strategy alert.")
             return False
 
+        daily_push_count: Optional[int] = None
+        normalized_symbol = str(symbol or "").strip().upper()
+        if normalized_symbol:
+            daily_push_count = await self._next_daily_push_count(normalized_symbol)
+            message = self._apply_daily_push_title(message, daily_push_count)
+
         if not self.queue_enabled:
             ok = await self._send_now(message)
             if ok:
@@ -658,10 +664,9 @@ class AlertNotifier:
         confidence_band = str(event.confidence_band or "").strip().upper() or "N/A"
         token_name = self._token_name(event.symbol)
         direction_badge = f"{event.direction_icon()} {event.direction_label()}"
-        trigger_count = self._display_trigger_count(event)
 
         lines = [
-            f"**{token_name}（触发{trigger_count}次） | {direction_badge} | {tier_label}**",
+            f"**{token_name}（今日第{daily_push_count}次推送） | {direction_badge} | {tier_label}**",
             (
                 f"核心变化：**{event.change_pct:+.2f}%**"
                 f"   现价：**{event.price:.6f}**"
@@ -1248,12 +1253,6 @@ class AlertNotifier:
             parts.append(f"近期合并 {event.merged_count}次")
         return " | ".join(parts)
 
-    @staticmethod
-    def _display_trigger_count(event: AlertEvent) -> int:
-        repeat_count = max(1, int(event.repeat_count or 0))
-        merged_count = max(0, int(event.merged_count or 0))
-        return max(repeat_count, merged_count + 1)
-
     def _coalesced_change_summary(self, event: AlertEvent) -> str:
         values = dict(event.coalesced_changes or {})
         if not values:
@@ -1403,6 +1402,19 @@ class AlertNotifier:
     @staticmethod
     def _beijing_today() -> str:
         return datetime.now(BEIJING_TZ).strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _apply_daily_push_title(message: str, daily_push_count: Optional[int]) -> str:
+        if not message:
+            return message
+        try:
+            count = max(1, int(daily_push_count or 0))
+        except (TypeError, ValueError):
+            return message
+        pattern = r"（(?:今日第\d+次推送|触发\d+次)）"
+        replacement = f"（今日第{count}次推送）"
+        updated, replaced = re.subn(pattern, replacement, message, count=1)
+        return updated if replaced else message
 
     async def _next_daily_push_count(self, symbol: str) -> int:
         await self._ensure_daily_counts_loaded()
