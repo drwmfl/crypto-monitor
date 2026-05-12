@@ -8,6 +8,7 @@ try:
     from alerts.event_deduper import EventDeduper
     from alerts.alert_policy import AlertDecision, AlertPolicy
     from alerts.tg_formatter import format_strategy_alert
+    from alerts.trade_confirmation import confirmation_count, confirmation_stage, evaluate_trade_confirmation
     from candidates.candidate_engine import CandidateEngine
     from candidates.event_store import RawEventStore
     from candidates.raw_event import RawEvent
@@ -18,6 +19,11 @@ except ModuleNotFoundError:
     from apps.market_monitor.backend.alerts.event_deduper import EventDeduper
     from apps.market_monitor.backend.alerts.alert_policy import AlertDecision, AlertPolicy
     from apps.market_monitor.backend.alerts.tg_formatter import format_strategy_alert
+    from apps.market_monitor.backend.alerts.trade_confirmation import (
+        confirmation_count,
+        confirmation_stage,
+        evaluate_trade_confirmation,
+    )
     from apps.market_monitor.backend.candidates.candidate_engine import CandidateEngine
     from apps.market_monitor.backend.candidates.event_store import RawEventStore
     from apps.market_monitor.backend.candidates.raw_event import RawEvent
@@ -91,27 +97,33 @@ class AlertStrategyPipeline:
             candidate.risk_score = risk_score_value
             candidate.risk_level = risk_level
             candidate.risk_breakdown = risk_breakdown
+            self._apply_trade_confirmation(candidate)
             self.candidate_engine.save()
 
-            decision = self.policy.allow_alert_type(
-                candidate.symbol,
-                "strong_direct_alert",
-                cooldown_minutes=self._strong_direct_cooldown_minutes(),
-            )
+            direct_allowed, direct_reason = self._strong_direct_confirmation_allowed(candidate)
             alert_sent = False
             dedupe_decision = None
-            if decision.should_send:
-                dedupe_decision = self.event_deduper.decide(candidate, alert_type="strong_direct_alert")
-                if dedupe_decision.should_send:
-                    alert_sent = await self._send_strong_direct(notifier=notifier, candidate=candidate)
-                    if alert_sent:
-                        self.event_deduper.mark_sent(candidate, alert_type="strong_direct_alert")
-                        self.policy.mark_sent(candidate.symbol, "strong_direct_alert")
+            decision = AlertDecision(False, alert_type="strong_direct_alert", reason=direct_reason)
+            if direct_allowed:
+                decision = self.policy.allow_alert_type(
+                    candidate.symbol,
+                    "strong_direct_alert",
+                    cooldown_minutes=self._strong_direct_cooldown_minutes(),
+                )
+                if decision.should_send:
+                    dedupe_decision = self.event_deduper.decide(candidate, alert_type="strong_direct_alert")
+                    if dedupe_decision.should_send:
+                        alert_sent = await self._send_strong_direct(notifier=notifier, candidate=candidate)
+                        if alert_sent:
+                            self.event_deduper.mark_sent(candidate, alert_type="strong_direct_alert")
+                            self.policy.mark_sent(candidate.symbol, "strong_direct_alert")
             logger.info(
-                "Strong direct processed: symbol=%s score=%.1f risk=%.1f sent=%s reason=%s dedupe=%s",
+                "Strong direct processed: symbol=%s score=%.1f risk=%.1f confirm=%s stage=%s sent=%s reason=%s dedupe=%s",
                 candidate.symbol,
                 candidate.score,
                 candidate.risk_score,
+                confirmation_count(candidate),
+                confirmation_stage(candidate),
                 alert_sent,
                 decision.reason,
                 dedupe_decision.reason if dedupe_decision else "not_checked",
@@ -136,6 +148,7 @@ class AlertStrategyPipeline:
         candidate.risk_score = risk_score_value
         candidate.risk_level = risk_level
         candidate.risk_breakdown = risk_breakdown
+        self._apply_trade_confirmation(candidate)
         self.candidate_engine.save()
 
         decision = self.policy.decide(candidate)
@@ -150,10 +163,12 @@ class AlertStrategyPipeline:
                     self.policy.mark_sent(candidate.symbol, decision.alert_type)
 
         logger.info(
-            "Strategy processed: symbol=%s score=%.1f risk=%.1f priority=%s decision=%s sent=%s reason=%s dedupe=%s",
+            "Strategy processed: symbol=%s score=%.1f risk=%.1f confirm=%s stage=%s priority=%s decision=%s sent=%s reason=%s dedupe=%s",
             candidate.symbol,
             candidate.score,
             candidate.risk_score,
+            confirmation_count(candidate),
+            confirmation_stage(candidate),
             candidate.priority,
             decision.alert_type,
             alert_sent,
@@ -183,6 +198,8 @@ class AlertStrategyPipeline:
                     "candidate_id": candidate.candidate_id,
                     "candidate_score": candidate.score,
                     "risk_score": candidate.risk_score,
+                    "confirmation_count": confirmation_count(candidate),
+                    "confirmation_stage": confirmation_stage(candidate),
                     "alert_type": decision.alert_type,
                 },
             )
@@ -216,6 +233,34 @@ class AlertStrategyPipeline:
             return False
         return True
 
+    def _apply_trade_confirmation(self, candidate: Any) -> None:
+        confirmation = evaluate_trade_confirmation(candidate, self.settings)
+        candidate.confirmation = confirmation.to_dict()
+
+    def _strong_direct_confirmation_allowed(self, candidate: Any) -> tuple[bool, str]:
+        latest = candidate.latest_features or {}
+        window = str(latest.get("window") or "").strip()
+        direct_windows = self.settings.get("strong_direct_direct_windows", ["1m"])
+        if not isinstance(direct_windows, list):
+            direct_windows = ["1m"]
+        allowed_windows = {str(item).strip() for item in direct_windows if str(item).strip()}
+        if window not in allowed_windows:
+            return False, "strong_direct_candidate_only_window"
+
+        min_score = _to_float(self.settings.get("strong_direct_min_score"), 60.0)
+        if float(candidate.score or 0.0) < min_score:
+            return False, "strong_direct_score_below_confirmed_min"
+
+        max_risk = _to_float(self.settings.get("strong_direct_max_risk"), 70.0)
+        if max_risk > 0 and float(candidate.risk_score or 0.0) > max_risk:
+            return False, "strong_direct_risk_above_confirmed_max"
+
+        required = max(1, _to_int(self.settings.get("trade_confirmation_min_strong_direct_confirmations"), 3))
+        if confirmation_count(candidate) < required:
+            return False, "strong_direct_confirmation_pending"
+
+        return True, "confirmed"
+
     def _strong_direct_cooldown_minutes(self) -> int:
         return max(1, _to_int(self.settings.get("strong_direct_cooldown_minutes"), 12))
 
@@ -233,6 +278,8 @@ class AlertStrategyPipeline:
                     "candidate_id": candidate.candidate_id,
                     "candidate_score": candidate.score,
                     "risk_score": candidate.risk_score,
+                    "confirmation_count": confirmation_count(candidate),
+                    "confirmation_stage": confirmation_stage(candidate),
                     "alert_type": "strong_direct_alert",
                     "strong_direct": True,
                 },

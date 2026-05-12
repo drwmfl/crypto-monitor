@@ -234,14 +234,35 @@
     "min_actionable_oi_signal_level": "L2",
     "strong_direct_enabled": true,
     "strong_direct_windows": [
-      "1m",
-      "5m"
+      "1m"
+    ],
+    "strong_direct_direct_windows": [
+      "1m"
     ],
     "strong_direct_change_pct": {
       "1m": 4.0,
       "5m": 6.0
     },
     "strong_direct_cooldown_minutes": 12,
+    "strong_direct_min_score": 60.0,
+    "strong_direct_max_risk": 70.0,
+    "require_confirmation_for_actionable": true,
+    "min_actionable_confirmations": 3,
+    "trade_confirmation_enabled": true,
+    "trade_confirmation_min_confirmations": 3,
+    "trade_confirmation_min_actionable_confirmations": 3,
+    "trade_confirmation_min_strong_direct_confirmations": 3,
+    "trade_confirmation_min_event_count": 2,
+    "trade_confirmation_min_oi_signal_level": "L1",
+    "trade_confirmation_min_oi_change_pct": 0.015,
+    "trade_confirmation_up_taker_buy_ratio": 0.55,
+    "trade_confirmation_down_taker_buy_ratio": 0.45,
+    "trade_confirmation_up_buy_aggressor_ratio": 0.55,
+    "trade_confirmation_down_buy_aggressor_ratio": 0.45,
+    "trade_confirmation_min_liquidation_usdt": 20000.0,
+    "trade_confirmation_orderbook_imbalance": 0.08,
+    "trade_confirmation_max_spread_bps": 12.0,
+    "trade_confirmation_min_depth_notional": 0.0,
     "event_dedupe_enabled": true,
     "event_dedupe_state_file": "event_dedupe_state.json",
     "event_dedupe_window_minutes": 30,

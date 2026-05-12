@@ -152,12 +152,32 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "require_oi_for_actionable": True,
         "min_actionable_oi_signal_level": "L2",
         "strong_direct_enabled": True,
-        "strong_direct_windows": ["1m", "5m"],
+        "strong_direct_windows": ["1m"],
+        "strong_direct_direct_windows": ["1m"],
         "strong_direct_change_pct": {
             "1m": 4.0,
             "5m": 6.0,
         },
         "strong_direct_cooldown_minutes": 12,
+        "strong_direct_min_score": 60.0,
+        "strong_direct_max_risk": 70.0,
+        "require_confirmation_for_actionable": True,
+        "min_actionable_confirmations": 3,
+        "trade_confirmation_enabled": True,
+        "trade_confirmation_min_confirmations": 3,
+        "trade_confirmation_min_actionable_confirmations": 3,
+        "trade_confirmation_min_strong_direct_confirmations": 3,
+        "trade_confirmation_min_event_count": 2,
+        "trade_confirmation_min_oi_signal_level": "L1",
+        "trade_confirmation_min_oi_change_pct": 0.015,
+        "trade_confirmation_up_taker_buy_ratio": 0.55,
+        "trade_confirmation_down_taker_buy_ratio": 0.45,
+        "trade_confirmation_up_buy_aggressor_ratio": 0.55,
+        "trade_confirmation_down_buy_aggressor_ratio": 0.45,
+        "trade_confirmation_min_liquidation_usdt": 20000.0,
+        "trade_confirmation_orderbook_imbalance": 0.08,
+        "trade_confirmation_max_spread_bps": 12.0,
+        "trade_confirmation_min_depth_notional": 0.0,
         "event_dedupe_enabled": True,
         "event_dedupe_state_file": "event_dedupe_state.json",
         "event_dedupe_window_minutes": 30,
@@ -911,6 +931,10 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
         alert_strategy["strong_direct_windows"] = _parse_csv_list(
             os.getenv("ALERT_STRATEGY_STRONG_DIRECT_WINDOWS", "")
         )
+    if os.getenv("ALERT_STRATEGY_STRONG_DIRECT_DIRECT_WINDOWS"):
+        alert_strategy["strong_direct_direct_windows"] = _parse_csv_list(
+            os.getenv("ALERT_STRATEGY_STRONG_DIRECT_DIRECT_WINDOWS", "")
+        )
     strong_direct_change_raw = os.getenv("ALERT_STRATEGY_STRONG_DIRECT_CHANGE_BY_WINDOW_JSON")
     if strong_direct_change_raw:
         try:
@@ -928,6 +952,56 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
             os.getenv("ALERT_STRATEGY_STRONG_DIRECT_COOLDOWN_MINUTES"),
             default=12,
         )
+    if os.getenv("ALERT_STRATEGY_STRONG_DIRECT_MIN_SCORE"):
+        alert_strategy["strong_direct_min_score"] = _to_float(
+            os.getenv("ALERT_STRATEGY_STRONG_DIRECT_MIN_SCORE"),
+            default=60.0,
+        )
+    if os.getenv("ALERT_STRATEGY_STRONG_DIRECT_MAX_RISK"):
+        alert_strategy["strong_direct_max_risk"] = _to_float(
+            os.getenv("ALERT_STRATEGY_STRONG_DIRECT_MAX_RISK"),
+            default=70.0,
+        )
+    if os.getenv("ALERT_STRATEGY_REQUIRE_CONFIRMATION_FOR_ACTIONABLE") is not None:
+        alert_strategy["require_confirmation_for_actionable"] = _parse_bool(
+            os.getenv("ALERT_STRATEGY_REQUIRE_CONFIRMATION_FOR_ACTIONABLE"),
+            default=True,
+        )
+    if os.getenv("ALERT_STRATEGY_MIN_ACTIONABLE_CONFIRMATIONS"):
+        alert_strategy["min_actionable_confirmations"] = _to_int(
+            os.getenv("ALERT_STRATEGY_MIN_ACTIONABLE_CONFIRMATIONS"),
+            default=3,
+        )
+    if os.getenv("ALERT_TRADE_CONFIRMATION_ENABLED") is not None:
+        alert_strategy["trade_confirmation_enabled"] = _parse_bool(
+            os.getenv("ALERT_TRADE_CONFIRMATION_ENABLED"),
+            default=True,
+        )
+    for env_name, key, default_value in (
+        ("ALERT_TRADE_CONFIRMATION_MIN_CONFIRMATIONS", "trade_confirmation_min_confirmations", 3),
+        ("ALERT_TRADE_CONFIRMATION_MIN_ACTIONABLE_CONFIRMATIONS", "trade_confirmation_min_actionable_confirmations", 3),
+        ("ALERT_TRADE_CONFIRMATION_MIN_STRONG_DIRECT_CONFIRMATIONS", "trade_confirmation_min_strong_direct_confirmations", 3),
+        ("ALERT_TRADE_CONFIRMATION_MIN_EVENT_COUNT", "trade_confirmation_min_event_count", 2),
+    ):
+        if os.getenv(env_name):
+            alert_strategy[key] = _to_int(os.getenv(env_name), default=default_value)
+    if os.getenv("ALERT_TRADE_CONFIRMATION_MIN_OI_SIGNAL_LEVEL"):
+        alert_strategy["trade_confirmation_min_oi_signal_level"] = str(
+            os.getenv("ALERT_TRADE_CONFIRMATION_MIN_OI_SIGNAL_LEVEL")
+        ).strip().upper()
+    for env_name, key, default_value in (
+        ("ALERT_TRADE_CONFIRMATION_MIN_OI_CHANGE_PCT", "trade_confirmation_min_oi_change_pct", 0.015),
+        ("ALERT_TRADE_CONFIRMATION_UP_TAKER_BUY_RATIO", "trade_confirmation_up_taker_buy_ratio", 0.55),
+        ("ALERT_TRADE_CONFIRMATION_DOWN_TAKER_BUY_RATIO", "trade_confirmation_down_taker_buy_ratio", 0.45),
+        ("ALERT_TRADE_CONFIRMATION_UP_BUY_AGGRESSOR_RATIO", "trade_confirmation_up_buy_aggressor_ratio", 0.55),
+        ("ALERT_TRADE_CONFIRMATION_DOWN_BUY_AGGRESSOR_RATIO", "trade_confirmation_down_buy_aggressor_ratio", 0.45),
+        ("ALERT_TRADE_CONFIRMATION_MIN_LIQUIDATION_USDT", "trade_confirmation_min_liquidation_usdt", 20000.0),
+        ("ALERT_TRADE_CONFIRMATION_ORDERBOOK_IMBALANCE", "trade_confirmation_orderbook_imbalance", 0.08),
+        ("ALERT_TRADE_CONFIRMATION_MAX_SPREAD_BPS", "trade_confirmation_max_spread_bps", 12.0),
+        ("ALERT_TRADE_CONFIRMATION_MIN_DEPTH_NOTIONAL", "trade_confirmation_min_depth_notional", 0.0),
+    ):
+        if os.getenv(env_name):
+            alert_strategy[key] = _to_float(os.getenv(env_name), default=default_value)
     if os.getenv("ALERT_EVENT_DEDUPE_ENABLED") is not None:
         alert_strategy["event_dedupe_enabled"] = _parse_bool(
             os.getenv("ALERT_EVENT_DEDUPE_ENABLED"),
@@ -1297,13 +1371,29 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         if str(w).strip() in VALID_WINDOWS
     ]
     if not normalized_strong_windows and alert_strategy["strong_direct_enabled"]:
-        default_strong_windows = strategy_defaults.get("strong_direct_windows", ["1m", "5m"])
+        default_strong_windows = strategy_defaults.get("strong_direct_windows", ["1m"])
         normalized_strong_windows = [
             str(w).strip()
             for w in default_strong_windows
             if str(w).strip() in VALID_WINDOWS
         ]
     alert_strategy["strong_direct_windows"] = normalized_strong_windows
+    strong_direct_direct_windows = alert_strategy.get("strong_direct_direct_windows", [])
+    if not isinstance(strong_direct_direct_windows, list):
+        strong_direct_direct_windows = []
+    normalized_direct_windows = [
+        str(w).strip()
+        for w in strong_direct_direct_windows
+        if str(w).strip() in VALID_WINDOWS
+    ]
+    if not normalized_direct_windows and alert_strategy["strong_direct_enabled"]:
+        default_direct_windows = strategy_defaults.get("strong_direct_direct_windows", ["1m"])
+        normalized_direct_windows = [
+            str(w).strip()
+            for w in default_direct_windows
+            if str(w).strip() in VALID_WINDOWS
+        ]
+    alert_strategy["strong_direct_direct_windows"] = normalized_direct_windows
     strong_change = alert_strategy.get("strong_direct_change_pct", {})
     if not isinstance(strong_change, dict):
         strong_change = {}
@@ -1325,6 +1415,57 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
             default=_to_int(strategy_defaults.get("strong_direct_cooldown_minutes"), default=12),
         ),
     )
+    alert_strategy["strong_direct_min_score"] = max(
+        0.0,
+        min(100.0, _to_float(alert_strategy.get("strong_direct_min_score"), strategy_defaults.get("strong_direct_min_score", 60.0))),
+    )
+    alert_strategy["strong_direct_max_risk"] = max(
+        0.0,
+        min(100.0, _to_float(alert_strategy.get("strong_direct_max_risk"), strategy_defaults.get("strong_direct_max_risk", 70.0))),
+    )
+    alert_strategy["require_confirmation_for_actionable"] = _parse_bool(
+        alert_strategy.get("require_confirmation_for_actionable"),
+        default=bool(strategy_defaults.get("require_confirmation_for_actionable", True)),
+    )
+    alert_strategy["min_actionable_confirmations"] = max(
+        1,
+        _to_int(alert_strategy.get("min_actionable_confirmations"), strategy_defaults.get("min_actionable_confirmations", 3)),
+    )
+    alert_strategy["trade_confirmation_enabled"] = _parse_bool(
+        alert_strategy.get("trade_confirmation_enabled"),
+        default=bool(strategy_defaults.get("trade_confirmation_enabled", True)),
+    )
+    for key, default_value in (
+        ("trade_confirmation_min_confirmations", 3),
+        ("trade_confirmation_min_actionable_confirmations", 3),
+        ("trade_confirmation_min_strong_direct_confirmations", 3),
+        ("trade_confirmation_min_event_count", 2),
+    ):
+        alert_strategy[key] = max(1, _to_int(alert_strategy.get(key), strategy_defaults.get(key, default_value)))
+    min_confirm_oi_level = str(
+        alert_strategy.get(
+            "trade_confirmation_min_oi_signal_level",
+            strategy_defaults.get("trade_confirmation_min_oi_signal_level", "L1"),
+        )
+    ).strip().upper()
+    if min_confirm_oi_level not in {"L0", "L1", "L2", "L3", "NONE"}:
+        min_confirm_oi_level = "L1"
+    alert_strategy["trade_confirmation_min_oi_signal_level"] = min_confirm_oi_level
+    for key, default_value in (
+        ("trade_confirmation_min_oi_change_pct", 0.015),
+        ("trade_confirmation_up_taker_buy_ratio", 0.55),
+        ("trade_confirmation_down_taker_buy_ratio", 0.45),
+        ("trade_confirmation_up_buy_aggressor_ratio", 0.55),
+        ("trade_confirmation_down_buy_aggressor_ratio", 0.45),
+        ("trade_confirmation_min_liquidation_usdt", 20000.0),
+        ("trade_confirmation_orderbook_imbalance", 0.08),
+        ("trade_confirmation_max_spread_bps", 12.0),
+        ("trade_confirmation_min_depth_notional", 0.0),
+    ):
+        alert_strategy[key] = max(
+            0.0,
+            _to_float(alert_strategy.get(key), strategy_defaults.get(key, default_value)),
+        )
     alert_strategy["event_dedupe_enabled"] = _parse_bool(
         alert_strategy.get("event_dedupe_enabled"),
         default=bool(strategy_defaults.get("event_dedupe_enabled", True)),

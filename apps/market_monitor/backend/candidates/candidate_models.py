@@ -39,6 +39,7 @@ class Candidate:
     orderbook: Dict[str, Any] = field(default_factory=dict)
     liquidation: Dict[str, Any] = field(default_factory=dict)
     accumulation: Dict[str, Any] = field(default_factory=dict)
+    confirmation: Dict[str, Any] = field(default_factory=dict)
     factor_snapshot: Dict[str, Any] = field(default_factory=dict)
     factor_updated_at: str = ""
     updated_at: str = ""

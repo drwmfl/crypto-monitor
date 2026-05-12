@@ -6,9 +6,11 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
 try:
+    from alerts.trade_confirmation import confirmation_count
     from candidates.candidate_models import Candidate
     from candidates.storage_paths import resolve_runtime_dir
 except ModuleNotFoundError:
+    from apps.market_monitor.backend.alerts.trade_confirmation import confirmation_count
     from apps.market_monitor.backend.candidates.candidate_models import Candidate
     from apps.market_monitor.backend.candidates.storage_paths import resolve_runtime_dir
 
@@ -28,6 +30,8 @@ DEFAULT_ALERT_POLICY: Dict[str, Any] = {
     "global_max_hour": 20,
     "require_oi_for_actionable": True,
     "min_actionable_oi_signal_level": "L2",
+    "require_confirmation_for_actionable": True,
+    "min_actionable_confirmations": 3,
 }
 
 
@@ -110,6 +114,15 @@ class AlertPolicy:
             if _parse_bool(self.settings.get("require_oi_for_actionable"), True):
                 required_rank = _oi_signal_rank(str(self.settings.get("min_actionable_oi_signal_level") or "L2"))
                 if _candidate_oi_signal_rank(candidate) < required_rank:
+                    if score >= _to_float(self.settings.get("min_watch_score"), 50.0) and risk <= _to_float(
+                        self.settings.get("max_watch_risk"),
+                        60.0,
+                    ):
+                        return "watchlist_alert"
+                    return "none"
+            if _parse_bool(self.settings.get("require_confirmation_for_actionable"), True):
+                required_confirmations = max(1, _to_int(self.settings.get("min_actionable_confirmations"), 3))
+                if confirmation_count(candidate) < required_confirmations:
                     if score >= _to_float(self.settings.get("min_watch_score"), 50.0) and risk <= _to_float(
                         self.settings.get("max_watch_risk"),
                         60.0,
