@@ -509,8 +509,14 @@ class BinanceKlineDataFeed:
         if len(closed) < self.volume_lookback + 2:
             return []
 
+        min_history_len = max(35, self.volume_lookback + 3)
+        oldest_viable_ts: Optional[int] = None
         eligible_indexes: List[int] = []
         for idx, row in enumerate(closed):
+            if idx + 1 < min_history_len:
+                continue
+            if oldest_viable_ts is None:
+                oldest_viable_ts = int(row[0])
             row_ts = int(row[0])
             if previous_event_time_ms is not None and row_ts <= previous_event_time_ms:
                 continue
@@ -524,6 +530,25 @@ class BinanceKlineDataFeed:
         backfill_limit = max(1, int(backfill_closed_bars or 1))
         if previous_event_time_ms is None:
             selected_indexes = eligible_indexes[-backfill_limit:]
+        elif oldest_viable_ts is not None and previous_event_time_ms < oldest_viable_ts:
+            selected_indexes = eligible_indexes[-backfill_limit:]
+            logger.info(
+                "Priority backfill resynced to latest candles: symbol=%s window=%s previous_event_time_ms=%s oldest_viable_ms=%s backfill=%s",
+                alert_symbol,
+                window,
+                previous_event_time_ms,
+                oldest_viable_ts,
+                backfill_limit,
+            )
+        elif len(eligible_indexes) > backfill_limit:
+            selected_indexes = eligible_indexes[-backfill_limit:]
+            logger.info(
+                "Priority backfill skipped stale backlog: symbol=%s window=%s backlog=%s backfill=%s",
+                alert_symbol,
+                window,
+                len(eligible_indexes),
+                backfill_limit,
+            )
         else:
             selected_indexes = eligible_indexes[:backfill_limit]
         snapshots: List[MarketSnapshot] = []

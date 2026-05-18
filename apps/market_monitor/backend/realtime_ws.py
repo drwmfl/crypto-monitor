@@ -107,6 +107,7 @@ class RealtimeKlineWatcher:
         self._request_id = 1
         self._last_sub_refresh_ts = 0.0
         self._last_data_msg_ts = 0.0
+        self._last_valid_kline_msg_ts = 0.0
         self._check_state: Dict[Tuple[str, str], Tuple[int, float]] = {}
         self.high_priority_extra_minutes = config.high_priority_cooldown_extra_minutes()
         self._closed_1m_last_start: Dict[str, int] = {}
@@ -120,8 +121,10 @@ class RealtimeKlineWatcher:
     def is_enabled(self) -> bool:
         return self.enabled and bool(self.windows)
 
-    def poll_windows_to_skip(self) -> Set[str]:
+    def poll_windows_to_skip(self, require_healthy: bool = False) -> Set[str]:
         if not self.is_enabled():
+            return set()
+        if require_healthy and not self.is_data_healthy():
             return set()
 
         skipped: Set[str] = set()
@@ -130,6 +133,24 @@ class RealtimeKlineWatcher:
         if self.local_agg_enabled and self.local_agg_skip_poll_windows:
             skipped.update(self.local_agg_windows)
         return skipped
+
+    def is_data_healthy(self) -> bool:
+        if not self.is_enabled():
+            return False
+        if self._last_valid_kline_msg_ts <= 0:
+            return False
+        max_age = max(10.0, float(self.no_message_reconnect_sec))
+        return (time.time() - self._last_valid_kline_msg_ts) <= max_age
+
+    def data_health_snapshot(self) -> Dict[str, Any]:
+        last_ts = float(self._last_valid_kline_msg_ts or 0.0)
+        return {
+            "enabled": self.is_enabled(),
+            "healthy": self.is_data_healthy(),
+            "last_kline_age_sec": round(time.time() - last_ts, 1) if last_ts > 0 else None,
+            "last_kline_at": datetime.fromtimestamp(last_ts).isoformat() if last_ts > 0 else None,
+            "stale_after_sec": max(10.0, float(self.no_message_reconnect_sec)),
+        }
 
     async def run_forever(self) -> None:
         if not self.is_enabled():
@@ -342,6 +363,7 @@ class RealtimeKlineWatcher:
         window = str(kline.get("i") or "").strip()
         if not symbol or window not in self.windows:
             return
+        self._last_valid_kline_msg_ts = time.time()
 
         open_price = _safe_float(kline.get("o"))
         high_price = _safe_float(kline.get("h"))

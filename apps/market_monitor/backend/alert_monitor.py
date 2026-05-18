@@ -363,8 +363,8 @@ async def run_alert_monitor(config_path: Optional[str] = None) -> None:
         cooldown_mgr=cooldown_mgr,
         strategy=strategy,
     )
-    skip_windows = realtime_watcher.poll_windows_to_skip()
-    poll_windows = [w for w in config.windows if w not in skip_windows]
+    configured_skip_windows = realtime_watcher.poll_windows_to_skip()
+    poll_windows = [w for w in config.windows if w not in configured_skip_windows]
     priority_scan_enabled = bool(config.data_feed.get("priority_scan_enabled", False))
     priority_scan_windows = [
         str(w).strip()
@@ -372,10 +372,15 @@ async def run_alert_monitor(config_path: Optional[str] = None) -> None:
         if str(w).strip() in config.windows
     ]
     realtime_task: Optional[asyncio.Task] = None
+    last_effective_skip_windows: Optional[set[str]] = None
 
     if realtime_watcher.is_enabled():
         realtime_task = asyncio.create_task(realtime_watcher.run_forever(), name="realtime_kline_ws")
-        logger.info("Realtime WS task started; poll-only windows=%s skipped_windows=%s", poll_windows, sorted(skip_windows))
+        logger.info(
+            "Realtime WS task started; poll-only windows=%s configured_skipped_windows=%s",
+            poll_windows,
+            sorted(configured_skip_windows),
+        )
     else:
         logger.info("Realtime WS disabled; poll windows=%s", poll_windows)
     logger.info(
@@ -393,6 +398,20 @@ async def run_alert_monitor(config_path: Optional[str] = None) -> None:
             cycle_start = time.monotonic()
             now = time.time()
             await feed.refresh_universe_if_due(force=False)
+            effective_skip_windows = realtime_watcher.poll_windows_to_skip(require_healthy=True)
+            if effective_skip_windows != last_effective_skip_windows:
+                health = realtime_watcher.data_health_snapshot()
+                effective_poll_windows = [w for w in config.windows if w not in effective_skip_windows]
+                log_fn = logger.info if health.get("healthy") else logger.warning
+                log_fn(
+                    "Realtime WS scan routing: healthy=%s skipped_windows=%s poll_windows=%s last_kline_age=%s",
+                    health.get("healthy"),
+                    sorted(effective_skip_windows),
+                    effective_poll_windows,
+                    health.get("last_kline_age_sec"),
+                )
+                last_effective_skip_windows = set(effective_skip_windows)
+            poll_windows = [w for w in config.windows if w not in effective_skip_windows]
             due_windows = _compute_due_windows(
                 windows=poll_windows,
                 schedule_state=schedule_state,
