@@ -30,8 +30,23 @@ READY_STATUSES = {"ready", "warming"}
 STATUS_LABELS = {
     "ready": "放量",
     "warming": "升温",
-    "dormant": "沉睡",
+    "dormant": "沉淀",
 }
+FOCUS_DISPLAY_LIMIT = 10
+RISK_DISPLAY_LIMIT = 5
+MIN_FOCUS_SIDEWAYS_DAYS = 80
+MAX_FOCUS_VOL_RATIO = 5.0
+MAX_FOCUS_RANGE_POSITION = 1.0
+
+
+def _configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8")
+            except (OSError, ValueError):
+                pass
 
 
 def _env_int(name: str, default: int) -> int:
@@ -72,6 +87,7 @@ def parse_args() -> argparse.Namespace:
 
 
 async def main_async() -> int:
+    _configure_stdio()
     args = parse_args()
     logging.basicConfig(
         level=getattr(logging, str(args.log_level or "INFO").upper(), logging.INFO),
@@ -234,21 +250,40 @@ def _build_summary_message(payload: Dict[str, Any], pool_path: Path, limit: int)
     if not isinstance(symbols, dict):
         symbols = {}
 
+    display_cap = max(1, int(limit))
     items = [item for item in symbols.values() if _status(item) in READY_STATUSES]
-    items.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
+    items.sort(key=_summary_sort_key)
     status_counts = _status_counts(symbols.values())
+
+    focus_candidates = [item for item in items if _is_focus_observation(item)]
+    risk_candidates = [item for item in items if _is_risk_observation(item)]
+    focus_symbols = {_symbol_key(item) for item in focus_candidates}
+    risk_symbols = {_symbol_key(item) for item in risk_candidates}
+    backup_candidates = [
+        item
+        for item in items
+        if _symbol_key(item) not in focus_symbols and _symbol_key(item) not in risk_symbols
+    ]
+
+    focus_items = focus_candidates[: min(FOCUS_DISPLAY_LIMIT, display_cap)]
+    remaining_cap = max(0, display_cap - len(focus_items))
+    risk_cap = min(RISK_DISPLAY_LIMIT, len(risk_candidates), remaining_cap)
+    backup_cap = max(0, remaining_cap - risk_cap)
+    backup_items = backup_candidates[:backup_cap]
+    risk_items = risk_candidates[:risk_cap]
 
     generated_at = _format_beijing_time(str(payload.get("generated_at") or ""))
     total_count = int(payload.get("count") or len(symbols))
     lines = [
-        f"<b>吸筹池日报 | 放量/升温 Top{limit}</b>",
+        f"<b>吸筹池日报 | 重点观察 Top{len(focus_items)}</b>",
         f"时间：{_html(generated_at)}",
         (
-            f"概览：入池 <b>{total_count}</b> ｜ "
-            f"放量 <b>{status_counts.get('ready', 0)}</b> ｜ "
-            f"升温 <b>{status_counts.get('warming', 0)}</b> ｜ "
-            f"沉睡 <b>{status_counts.get('dormant', 0)}</b>"
+            f"概览：入池 <b>{total_count}</b> | "
+            f"放量 <b>{status_counts.get('ready', 0)}</b> | "
+            f"升温 <b>{status_counts.get('warming', 0)}</b> | "
+            f"沉淀 <b>{status_counts.get('dormant', 0)}</b>"
         ),
+        "筛选：区间内、量能不过热、横盘>=80天优先；突破/爆量只列风险观察",
         f"文件：<code>{_html(pool_path.name)}</code>",
         "",
     ]
@@ -257,28 +292,130 @@ def _build_summary_message(payload: Dict[str, Any], pool_path: Path, limit: int)
         lines.append("暂无放量/升温标的。")
         return "\n".join(lines)
 
-    for idx, item in enumerate(items[:limit], start=1):
-        symbol = str(item.get("symbol") or "").upper()
-        base = str(item.get("base_asset") or _base_from_symbol(symbol) or symbol).upper()
-        status = _status(item)
-        status_label = _status_label(status)
-        score = _safe_float(item.get("score"))
-        sideways_days = _safe_int(item.get("sideways_days"))
-        range_pct = _safe_float(item.get("range_pct"))
-        vol_ratio = _safe_float(item.get("recent_vol_ratio_7d"))
-        range_position = _safe_float(item.get("range_position")) * 100.0
-        market_cap = _fmt_usd(item.get("market_cap"))
-        if idx > 1:
-            lines.append("")
-        symbol_label = _symbol_link(symbol=symbol, label=base)
-        lines.extend(
-            [
-                f"{idx}. {symbol_label}  {status_label}  评分 <b>{score:.1f}</b>",
-                f"   横盘：{sideways_days}天 ｜ 区间：{range_pct:.1f}% ｜ 位置：{range_position:.0f}%",
-                f"   量能：Vol {vol_ratio:.1f}x ｜ 市值：{_html(market_cap)}",
-            ]
-        )
+    lines.append("<b>重点观察</b>")
+    if focus_items:
+        for idx, item in enumerate(focus_items, start=1):
+            if idx > 1:
+                lines.append("")
+            _append_focus_item(lines, idx, item)
+    else:
+        lines.append("暂无符合重点条件，今日只保留备选/风险观察。")
+
+    if backup_items:
+        lines.extend(["", "<b>备选观察</b>"])
+        for idx, item in enumerate(backup_items, start=1):
+            lines.append(_compact_item_line(idx, item, include_flags=False))
+
+    if risk_items:
+        lines.extend(["", "<b>风险观察</b>"])
+        for idx, item in enumerate(risk_items, start=1):
+            lines.append(_compact_item_line(idx, item, include_flags=True))
+
+    hidden_count = max(0, len(items) - len(focus_items) - len(backup_items) - len(risk_items))
+    if hidden_count:
+        lines.extend(["", f"其余 {hidden_count} 个放量/升温标的已收起，避免日报噪音过多。"])
     return "\n".join(lines)
+
+
+def _summary_sort_key(item: Any) -> tuple[float, float, float, str]:
+    if not isinstance(item, dict):
+        return (1.0, 0.0, 0.0, "")
+    status_priority = 0.0 if _status(item) == "ready" else 0.2
+    return (
+        -_safe_float(item.get("score")),
+        status_priority,
+        -_safe_float(item.get("sideways_days")),
+        _symbol_key(item),
+    )
+
+
+def _symbol_key(item: Any) -> str:
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("symbol") or "").upper()
+
+
+def _is_focus_observation(item: Dict[str, Any]) -> bool:
+    if _status(item) not in READY_STATUSES:
+        return False
+    range_position = _safe_float(item.get("range_position"))
+    vol_ratio = _safe_float(item.get("recent_vol_ratio_7d"))
+    sideways_days = _safe_int(item.get("sideways_days"))
+    return (
+        0.0 <= range_position <= MAX_FOCUS_RANGE_POSITION
+        and vol_ratio <= MAX_FOCUS_VOL_RATIO
+        and sideways_days >= MIN_FOCUS_SIDEWAYS_DAYS
+    )
+
+
+def _is_risk_observation(item: Dict[str, Any]) -> bool:
+    flags = _observation_flags(item)
+    return any(flag in flags for flag in ("已突破", "位置过高", "跌破区间", "爆量过热", "量能过热"))
+
+
+def _observation_flags(item: Dict[str, Any]) -> List[str]:
+    flags: List[str] = []
+    range_position = _safe_float(item.get("range_position"))
+    vol_ratio = _safe_float(item.get("recent_vol_ratio_7d"))
+    sideways_days = _safe_int(item.get("sideways_days"))
+    data_quality = str(item.get("data_quality") or "").strip().lower()
+
+    if range_position > 1.2:
+        flags.append("位置过高")
+    elif range_position > 1.0:
+        flags.append("已突破")
+    elif range_position < 0.0:
+        flags.append("跌破区间")
+    if vol_ratio > 8.0:
+        flags.append("爆量过热")
+    elif vol_ratio > MAX_FOCUS_VOL_RATIO:
+        flags.append("量能过热")
+    if 0 < sideways_days < MIN_FOCUS_SIDEWAYS_DAYS:
+        flags.append("横盘不足")
+    if data_quality == "estimated":
+        flags.append("市值估算")
+    return flags
+
+
+def _append_focus_item(lines: List[str], idx: int, item: Dict[str, Any]) -> None:
+    symbol = str(item.get("symbol") or "").upper()
+    base = str(item.get("base_asset") or _base_from_symbol(symbol) or symbol).upper()
+    symbol_label = _symbol_link(symbol=symbol, label=base)
+    status_label = _status_label(_status(item))
+    score = _safe_float(item.get("score"))
+    sideways_days = _safe_int(item.get("sideways_days"))
+    range_pct = _safe_float(item.get("range_pct"))
+    range_position = _safe_float(item.get("range_position")) * 100.0
+    vol_ratio = _safe_float(item.get("recent_vol_ratio_7d"))
+    market_cap = _fmt_usd(item.get("market_cap"))
+    flags = [flag for flag in _observation_flags(item) if flag == "市值估算"]
+    suffix = f" | {'/'.join(flags)}" if flags else ""
+    lines.extend(
+        [
+            f"{idx}. {symbol_label}  {status_label}  评分 <b>{score:.1f}</b>{_html(suffix)}",
+            f"   横盘：{sideways_days}天 | 区间：{range_pct:.1f}% | 位置：{range_position:.0f}%",
+            f"   量能：Vol {vol_ratio:.1f}x | 市值：{_html(market_cap)}",
+        ]
+    )
+
+
+def _compact_item_line(idx: int, item: Dict[str, Any], *, include_flags: bool) -> str:
+    symbol = str(item.get("symbol") or "").upper()
+    base = str(item.get("base_asset") or _base_from_symbol(symbol) or symbol).upper()
+    symbol_label = _symbol_link(symbol=symbol, label=base)
+    status_label = _status_label(_status(item))
+    score = _safe_float(item.get("score"))
+    range_position = _safe_float(item.get("range_position")) * 100.0
+    vol_ratio = _safe_float(item.get("recent_vol_ratio_7d"))
+    text = (
+        f"{idx}. {symbol_label} {status_label} | 评 {score:.1f} | "
+        f"位 {range_position:.0f}% | Vol {vol_ratio:.1f}x"
+    )
+    if include_flags:
+        flags = _observation_flags(item)
+        if flags:
+            text += f" | {'/'.join(flags)}"
+    return text
 
 
 def _build_failure_message(max_attempts: int, last_error: str) -> str:
