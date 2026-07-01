@@ -247,6 +247,7 @@
     "raw_event_file": "raw_events.jsonl",
     "candidate_file": "candidates.json",
     "policy_state_file": "alert_policy_state.json",
+    "factor_quality_file": "factor_quality.jsonl",
     "candidate_ttl_minutes": 120,
     "min_watch_score": 50.0,
     "min_actionable_score": 75.0,

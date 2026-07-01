@@ -129,6 +129,8 @@ def _annotate_factor_completeness(snapshot: Dict[str, Any]) -> None:
     derivatives = snapshot.get("derivatives") if isinstance(snapshot.get("derivatives"), dict) else {}
     orderbook = snapshot.get("orderbook") if isinstance(snapshot.get("orderbook"), dict) else {}
     liquidation = snapshot.get("liquidation") if isinstance(snapshot.get("liquidation"), dict) else {}
+    source_health = snapshot.get("source_health") if isinstance(snapshot.get("source_health"), dict) else {}
+    liquidation_available, liquidation_status = _liquidation_data_state(liquidation, source_health)
 
     groups = {
         "oi": _has_any_number(
@@ -149,10 +151,13 @@ def _annotate_factor_completeness(snapshot: Dict[str, Any]) -> None:
         or _safe_float(derivatives.get("trade_notional_usdt_1m"), 0.0) > 0,
         "orderbook": _safe_float(orderbook.get("bid_notional"), 0.0) > 0
         and _safe_float(orderbook.get("ask_notional"), 0.0) > 0,
-        "liquidation": bool(liquidation.get("source"))
-        or "order_count" in liquidation
-        or _safe_float(liquidation.get("micro_last_liq_ts"), 0.0) > 0,
+        "liquidation": liquidation_available,
     }
+    statuses = {
+        name: "available" if value else "missing"
+        for name, value in groups.items()
+    }
+    statuses["liquidation"] = liquidation_status
     total = len(groups)
     available = sum(1 for value in groups.values() if value)
     missing = [name for name, value in groups.items() if not value]
@@ -161,6 +166,7 @@ def _annotate_factor_completeness(snapshot: Dict[str, Any]) -> None:
         "total": total,
         "pct": round((available / total * 100.0) if total else 0.0, 2),
         "groups": groups,
+        "statuses": statuses,
         "missing": missing,
     }
 
@@ -182,6 +188,52 @@ def _has_any_number(payload: Dict[str, Any], keys: tuple[str, ...]) -> bool:
         if _safe_float(payload.get(key), 0.0) != 0.0 or key in payload and payload.get(key) is not None:
             return True
     return False
+
+
+def _liquidation_data_state(liquidation: Dict[str, Any], source_health: Dict[str, Any]) -> tuple[bool, str]:
+    if _has_nonzero_liquidation(liquidation):
+        return True, "active"
+
+    if bool(liquidation.get("source")) or "order_count" in liquidation:
+        return True, "none_recent"
+
+    has_micro_liq_fields = any(str(key).startswith("micro_liq_") for key in liquidation.keys())
+    has_micro_timestamp = "micro_updated_at_ms" in liquidation or "micro_last_liq_ts" in liquidation
+    if _microstructure_tracking(source_health) and (has_micro_liq_fields or has_micro_timestamp):
+        return True, "none_recent"
+
+    return False, "missing"
+
+
+def _has_nonzero_liquidation(liquidation: Dict[str, Any]) -> bool:
+    numeric_keys = (
+        "order_count",
+        "total_qty",
+        "total_usdt",
+        "long_liq_usdt",
+        "short_liq_usdt",
+        "micro_last_liq_ts",
+        "micro_liq_count_1m",
+        "micro_liq_count_3m",
+        "micro_liq_count_5m",
+        "micro_liq_long_usdt_1m",
+        "micro_liq_long_usdt_3m",
+        "micro_liq_long_usdt_5m",
+        "micro_liq_short_usdt_1m",
+        "micro_liq_short_usdt_3m",
+        "micro_liq_short_usdt_5m",
+    )
+    return any(_safe_float(liquidation.get(key), 0.0) > 0.0 for key in numeric_keys)
+
+
+def _microstructure_tracking(source_health: Dict[str, Any]) -> bool:
+    health = source_health.get("microstructure")
+    if not isinstance(health, dict):
+        return False
+    if health.get("ok") is False:
+        return False
+    message = str(health.get("message") or "").strip().lower()
+    return message in {"tracking", "ok", "connected", "subscribed"} or bool(health.get("ok"))
 
 
 def _candidate_context(candidate: Candidate) -> Dict[str, Any]:

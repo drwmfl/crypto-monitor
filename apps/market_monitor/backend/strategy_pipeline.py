@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 try:
@@ -57,6 +59,8 @@ class AlertStrategyPipeline:
         if self.settings.get("runtime_dir") and not factor_settings.get("runtime_dir"):
             factor_settings["runtime_dir"] = self.settings.get("runtime_dir")
         self.factor_enricher = FactorEnricher(factor_settings)
+        factor_quality_file = str(self.settings.get("factor_quality_file") or "factor_quality.jsonl").strip()
+        self.factor_quality_path = self.event_store.runtime_dir / (factor_quality_file or "factor_quality.jsonl")
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "AlertStrategyPipeline":
@@ -257,7 +261,7 @@ class AlertStrategyPipeline:
         message = format_strategy_alert(candidate, decision, detail_level=detail_level)
         level = "high" if decision.alert_type in {"actionable_alert", "risk_alert"} else "medium"
         if hasattr(notifier, "notify_text"):
-            return await notifier.notify_text(
+            sent = await notifier.notify_text(
                 message,
                 symbol=candidate.symbol,
                 rule_name=f"strategy_{decision.alert_type}",
@@ -271,6 +275,9 @@ class AlertStrategyPipeline:
                     "alert_type": decision.alert_type,
                 },
             )
+            if sent:
+                self._record_factor_quality(candidate, decision.alert_type, decision.reason)
+            return sent
         logger.warning("Notifier does not support notify_text; strategy alert dropped: %s", candidate.symbol)
         return False
 
@@ -334,6 +341,47 @@ class AlertStrategyPipeline:
         if not isinstance(completeness, dict):
             return 0.0
         return max(0.0, min(100.0, _to_float(completeness.get("pct"), 0.0)))
+
+    def _record_factor_quality(self, candidate: Any, alert_type: str, reason: str = "") -> None:
+        try:
+            snapshot = candidate.factor_snapshot or {}
+            if not isinstance(snapshot, dict):
+                snapshot = {}
+            latest = candidate.latest_features or {}
+            if not isinstance(latest, dict):
+                latest = {}
+            recent_events = candidate.recent_events if isinstance(candidate.recent_events, list) else []
+            last_event = recent_events[-1] if recent_events and isinstance(recent_events[-1], dict) else {}
+            row = {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "symbol": candidate.symbol,
+                "base_asset": getattr(candidate, "base_asset", ""),
+                "candidate_id": candidate.candidate_id,
+                "alert_type": alert_type,
+                "reason": reason,
+                "score": float(candidate.score or 0.0),
+                "risk_score": float(candidate.risk_score or 0.0),
+                "priority": getattr(candidate, "priority", ""),
+                "confirmation_count": confirmation_count(candidate),
+                "confirmation_stage": confirmation_stage(candidate),
+                "event_count": int(candidate.event_count or 0),
+                "latest_event": {
+                    "event_type": latest.get("event_type") or last_event.get("event_type"),
+                    "window": latest.get("window") or last_event.get("window"),
+                    "direction": latest.get("direction") or last_event.get("direction"),
+                    "event_time": latest.get("event_time") or last_event.get("event_time"),
+                    "change_pct": latest.get("change_pct") if "change_pct" in latest else last_event.get("change_pct"),
+                    "rvol": latest.get("rvol") if "rvol" in latest else last_event.get("rvol"),
+                },
+                "factor_updated_at": getattr(candidate, "factor_updated_at", "") or snapshot.get("updated_at"),
+                "factor_completeness": snapshot.get("factor_completeness") if isinstance(snapshot.get("factor_completeness"), dict) else {},
+                "source_health": snapshot.get("source_health") if isinstance(snapshot.get("source_health"), dict) else {},
+            }
+            self.factor_quality_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.factor_quality_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        except Exception as exc:
+            logger.debug("Failed to record factor quality: symbol=%s alert_type=%s err=%s", candidate.symbol, alert_type, exc)
 
     def _is_startup_event(self, payload: Dict[str, Any]) -> bool:
         if not _parse_bool(self.settings.get("startup_alert_enabled"), True):
@@ -506,7 +554,7 @@ class AlertStrategyPipeline:
         decision = AlertDecision(True, alert_type="strong_direct_alert", reason="strong_direct")
         message = format_strategy_alert(candidate, decision, detail_level=detail_level)
         if hasattr(notifier, "notify_text"):
-            return await notifier.notify_text(
+            sent = await notifier.notify_text(
                 message,
                 symbol=candidate.symbol,
                 rule_name="strategy_strong_direct_alert",
@@ -521,6 +569,9 @@ class AlertStrategyPipeline:
                     "strong_direct": True,
                 },
             )
+            if sent:
+                self._record_factor_quality(candidate, "strong_direct_alert", "strong_direct")
+            return sent
         logger.warning("Notifier does not support notify_text; strong direct alert dropped: %s", candidate.symbol)
         return False
 

@@ -162,6 +162,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "raw_event_file": "raw_events.jsonl",
         "candidate_file": "candidates.json",
         "policy_state_file": "alert_policy_state.json",
+        "factor_quality_file": "factor_quality.jsonl",
         "candidate_ttl_minutes": 120,
         "min_watch_score": 50.0,
         "min_actionable_score": 75.0,
@@ -1009,6 +1010,8 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
         alert_strategy["actionable_required_factor_groups_any"] = _parse_csv_list(
             os.getenv("ALERT_STRATEGY_ACTIONABLE_REQUIRED_FACTOR_GROUPS_ANY", "")
         )
+    if os.getenv("ALERT_STRATEGY_FACTOR_QUALITY_FILE"):
+        alert_strategy["factor_quality_file"] = str(os.getenv("ALERT_STRATEGY_FACTOR_QUALITY_FILE")).strip()
     if os.getenv("ALERT_STRATEGY_FACTOR_RETRY_ENABLED") is not None:
         alert_strategy["factor_retry_enabled"] = _parse_bool(
             os.getenv("ALERT_STRATEGY_FACTOR_RETRY_ENABLED"),
@@ -1458,6 +1461,9 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     alert_strategy["policy_state_file"] = str(
         alert_strategy.get("policy_state_file", strategy_defaults["policy_state_file"])
     ).strip() or strategy_defaults["policy_state_file"]
+    alert_strategy["factor_quality_file"] = str(
+        alert_strategy.get("factor_quality_file", strategy_defaults["factor_quality_file"])
+    ).strip() or strategy_defaults["factor_quality_file"]
     alert_strategy["candidate_ttl_minutes"] = max(
         1,
         _to_int(alert_strategy.get("candidate_ttl_minutes"), strategy_defaults["candidate_ttl_minutes"]),

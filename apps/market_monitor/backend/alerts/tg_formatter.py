@@ -263,13 +263,18 @@ def _factor_completeness_line(snapshot: Dict[str, Any]) -> str:
     pct = _safe_optional_float(completeness.get("pct"))
     if total <= 0 or pct is None:
         return ""
+    statuses = completeness.get("statuses")
+    liquidation_status = ""
+    if isinstance(statuses, dict):
+        liquidation_status = str(statuses.get("liquidation") or "").strip().lower()
+    status_suffix = " | 爆仓近5m无强平" if liquidation_status == "none_recent" else ""
     if available >= total:
-        return f"数据：衍生品完整 {available}/{total}"
+        return f"数据：衍生品完整 {available}/{total}{status_suffix}"
     missing = completeness.get("missing")
     missing_labels = _factor_group_labels(missing if isinstance(missing, list) else [])
     prefix = "数据：衍生品不足" if pct < 50.0 else "数据：衍生品"
-    suffix = f" | 缺 {missing_labels}" if missing_labels else ""
-    return f"{prefix} {available}/{total} {pct:.0f}%{suffix}"
+    missing_suffix = f" | 缺 {missing_labels}" if missing_labels else ""
+    return f"{prefix} {available}/{total} {pct:.0f}%{missing_suffix}{status_suffix}"
 
 
 def _factor_group_labels(groups: list[Any]) -> str:
