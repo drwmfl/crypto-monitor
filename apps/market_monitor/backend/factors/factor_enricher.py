@@ -51,7 +51,7 @@ class FactorEnricher:
             return True
         return int(candidate.event_count or 0) >= self.min_event_count and len(candidate.windows) >= 2
 
-    async def enrich(self, candidate: Candidate) -> Candidate:
+    async def enrich(self, candidate: Candidate, *, force_refresh: bool = False) -> Candidate:
         if not self.enabled:
             return candidate
 
@@ -59,7 +59,7 @@ class FactorEnricher:
         now = time.time()
         cached = self._cache.get(cache_key)
         snapshot_dict: Dict[str, Any]
-        if cached and (now - cached[0]) < self.cache_ttl_sec:
+        if not force_refresh and cached and (now - cached[0]) < self.cache_ttl_sec:
             snapshot_dict = copy.deepcopy(cached[1])
         else:
             price = _safe_float((candidate.latest_features or {}).get("price"), 0.0)
@@ -101,6 +101,7 @@ class FactorEnricher:
                 snapshot_dict["source_health"] = current_health
 
         _derive_factor_changes(candidate, snapshot_dict)
+        _annotate_factor_completeness(snapshot_dict)
         candidate.factor_snapshot = snapshot_dict
         candidate.factor_updated_at = str(snapshot_dict.get("updated_at") or "")
         _apply_factor_sections(candidate, snapshot_dict)
@@ -124,6 +125,46 @@ def _apply_factor_sections(candidate: Candidate, snapshot: Dict[str, Any]) -> No
     candidate.accumulation = dict(snapshot.get("accumulation") or {})
 
 
+def _annotate_factor_completeness(snapshot: Dict[str, Any]) -> None:
+    derivatives = snapshot.get("derivatives") if isinstance(snapshot.get("derivatives"), dict) else {}
+    orderbook = snapshot.get("orderbook") if isinstance(snapshot.get("orderbook"), dict) else {}
+    liquidation = snapshot.get("liquidation") if isinstance(snapshot.get("liquidation"), dict) else {}
+
+    groups = {
+        "oi": _has_any_number(
+            derivatives,
+            (
+                "oi_amount",
+                "oi_usdt",
+                "oi_change_pct",
+                "oi_change_pct_5m",
+                "oi_change_pct_15m",
+                "oi_change_pct_1h",
+                "oi_change_pct_4h",
+            ),
+        ),
+        "funding": _has_any_number(derivatives, ("funding_rate", "mark_price")),
+        "taker_flow": _has_any_number(derivatives, ("taker_buy_ratio", "taker_buy_vol", "taker_sell_vol")),
+        "micro": _safe_float(derivatives.get("micro_last_trade_ts"), 0.0) > 0
+        or _safe_float(derivatives.get("trade_notional_usdt_1m"), 0.0) > 0,
+        "orderbook": _safe_float(orderbook.get("bid_notional"), 0.0) > 0
+        and _safe_float(orderbook.get("ask_notional"), 0.0) > 0,
+        "liquidation": bool(liquidation.get("source"))
+        or "order_count" in liquidation
+        or _safe_float(liquidation.get("micro_last_liq_ts"), 0.0) > 0,
+    }
+    total = len(groups)
+    available = sum(1 for value in groups.values() if value)
+    missing = [name for name, value in groups.items() if not value]
+    snapshot["factor_completeness"] = {
+        "available": available,
+        "total": total,
+        "pct": round((available / total * 100.0) if total else 0.0, 2),
+        "groups": groups,
+        "missing": missing,
+    }
+
+
 def _derive_factor_changes(candidate: Candidate, snapshot: Dict[str, Any]) -> None:
     derivatives = snapshot.get("derivatives")
     if not isinstance(derivatives, dict):
@@ -134,6 +175,13 @@ def _derive_factor_changes(candidate: Candidate, snapshot: Dict[str, Any]) -> No
     if curr_oi > 0 and prev_oi > 0 and "oi_change_pct" not in derivatives:
         derivatives["oi_change_pct"] = (curr_oi - prev_oi) / prev_oi
         derivatives["oi_change_usdt"] = curr_oi - prev_oi
+
+
+def _has_any_number(payload: Dict[str, Any], keys: tuple[str, ...]) -> bool:
+    for key in keys:
+        if _safe_float(payload.get(key), 0.0) != 0.0 or key in payload and payload.get(key) is not None:
+            return True
+    return False
 
 
 def _candidate_context(candidate: Candidate) -> Dict[str, Any]:

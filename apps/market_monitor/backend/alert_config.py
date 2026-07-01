@@ -177,6 +177,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "global_max_hour": 20,
         "require_oi_for_actionable": True,
         "min_actionable_oi_signal_level": "L2",
+        "actionable_require_factor_completeness": True,
+        "actionable_min_factor_completeness_pct": 50.0,
+        "actionable_required_factor_groups_any": ["oi", "micro"],
+        "factor_retry_enabled": True,
+        "factor_retry_delay_sec": 4.0,
+        "factor_retry_min_completeness_pct": 80.0,
+        "factor_retry_alert_types": ["startup_alert", "strong_direct_alert", "risk_alert", "actionable_alert"],
         "strong_direct_enabled": True,
         "strong_direct_windows": ["1m"],
         "strong_direct_direct_windows": ["1m"],
@@ -548,6 +555,27 @@ def _to_float(value: Any, default: float) -> float:
 
 def _parse_csv_list(value: str) -> List[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _normalize_factor_group_list(raw: Any, default: Any) -> List[str]:
+    if isinstance(raw, str):
+        items = _parse_csv_list(raw)
+    elif isinstance(raw, list):
+        items = raw
+    elif isinstance(default, str):
+        items = _parse_csv_list(default)
+    elif isinstance(default, list):
+        items = default
+    else:
+        items = ["oi", "micro"]
+
+    allowed = {"oi", "funding", "taker_flow", "micro", "orderbook", "liquidation"}
+    normalized: List[str] = []
+    for item in items:
+        name = str(item or "").strip()
+        if name in allowed and name not in normalized:
+            normalized.append(name)
+    return normalized or ["oi", "micro"]
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -967,6 +995,39 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
         alert_strategy["min_actionable_oi_signal_level"] = str(
             os.getenv("ALERT_STRATEGY_MIN_ACTIONABLE_OI_SIGNAL_LEVEL")
         ).strip().upper()
+    if os.getenv("ALERT_STRATEGY_ACTIONABLE_REQUIRE_FACTOR_COMPLETENESS") is not None:
+        alert_strategy["actionable_require_factor_completeness"] = _parse_bool(
+            os.getenv("ALERT_STRATEGY_ACTIONABLE_REQUIRE_FACTOR_COMPLETENESS"),
+            default=True,
+        )
+    if os.getenv("ALERT_STRATEGY_ACTIONABLE_MIN_FACTOR_COMPLETENESS_PCT"):
+        alert_strategy["actionable_min_factor_completeness_pct"] = _to_float(
+            os.getenv("ALERT_STRATEGY_ACTIONABLE_MIN_FACTOR_COMPLETENESS_PCT"),
+            default=50.0,
+        )
+    if os.getenv("ALERT_STRATEGY_ACTIONABLE_REQUIRED_FACTOR_GROUPS_ANY"):
+        alert_strategy["actionable_required_factor_groups_any"] = _parse_csv_list(
+            os.getenv("ALERT_STRATEGY_ACTIONABLE_REQUIRED_FACTOR_GROUPS_ANY", "")
+        )
+    if os.getenv("ALERT_STRATEGY_FACTOR_RETRY_ENABLED") is not None:
+        alert_strategy["factor_retry_enabled"] = _parse_bool(
+            os.getenv("ALERT_STRATEGY_FACTOR_RETRY_ENABLED"),
+            default=True,
+        )
+    if os.getenv("ALERT_STRATEGY_FACTOR_RETRY_DELAY_SEC"):
+        alert_strategy["factor_retry_delay_sec"] = _to_float(
+            os.getenv("ALERT_STRATEGY_FACTOR_RETRY_DELAY_SEC"),
+            default=4.0,
+        )
+    if os.getenv("ALERT_STRATEGY_FACTOR_RETRY_MIN_COMPLETENESS_PCT"):
+        alert_strategy["factor_retry_min_completeness_pct"] = _to_float(
+            os.getenv("ALERT_STRATEGY_FACTOR_RETRY_MIN_COMPLETENESS_PCT"),
+            default=80.0,
+        )
+    if os.getenv("ALERT_STRATEGY_FACTOR_RETRY_ALERT_TYPES"):
+        alert_strategy["factor_retry_alert_types"] = _parse_csv_list(
+            os.getenv("ALERT_STRATEGY_FACTOR_RETRY_ALERT_TYPES", "")
+        )
     if os.getenv("ALERT_STRATEGY_STRONG_DIRECT_ENABLED") is not None:
         alert_strategy["strong_direct_enabled"] = _parse_bool(
             os.getenv("ALERT_STRATEGY_STRONG_DIRECT_ENABLED"),
@@ -1474,6 +1535,59 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if min_oi_level not in {"L0", "L1", "L2", "L3", "NONE"}:
         min_oi_level = "L2"
     alert_strategy["min_actionable_oi_signal_level"] = min_oi_level
+    alert_strategy["actionable_require_factor_completeness"] = _parse_bool(
+        alert_strategy.get("actionable_require_factor_completeness"),
+        default=bool(strategy_defaults.get("actionable_require_factor_completeness", True)),
+    )
+    alert_strategy["actionable_min_factor_completeness_pct"] = max(
+        0.0,
+        min(
+            100.0,
+            _to_float(
+                alert_strategy.get("actionable_min_factor_completeness_pct"),
+                strategy_defaults.get("actionable_min_factor_completeness_pct", 50.0),
+            ),
+        ),
+    )
+    alert_strategy["actionable_required_factor_groups_any"] = _normalize_factor_group_list(
+        alert_strategy.get("actionable_required_factor_groups_any"),
+        strategy_defaults.get("actionable_required_factor_groups_any", ["oi", "micro"]),
+    )
+    alert_strategy["factor_retry_enabled"] = _parse_bool(
+        alert_strategy.get("factor_retry_enabled"),
+        default=bool(strategy_defaults.get("factor_retry_enabled", True)),
+    )
+    alert_strategy["factor_retry_delay_sec"] = max(
+        0.0,
+        min(
+            10.0,
+            _to_float(alert_strategy.get("factor_retry_delay_sec"), strategy_defaults.get("factor_retry_delay_sec", 4.0)),
+        ),
+    )
+    alert_strategy["factor_retry_min_completeness_pct"] = max(
+        0.0,
+        min(
+            100.0,
+            _to_float(
+                alert_strategy.get("factor_retry_min_completeness_pct"),
+                strategy_defaults.get("factor_retry_min_completeness_pct", 80.0),
+            ),
+        ),
+    )
+    retry_types = alert_strategy.get("factor_retry_alert_types")
+    if isinstance(retry_types, str):
+        retry_types = _parse_csv_list(retry_types)
+    if not isinstance(retry_types, list):
+        retry_types = strategy_defaults.get("factor_retry_alert_types", [])
+    allowed_retry_types = {"startup_alert", "strong_direct_alert", "risk_alert", "actionable_alert"}
+    normalized_retry_types: List[str] = []
+    for item in retry_types:
+        alert_type = str(item or "").strip()
+        if alert_type in allowed_retry_types and alert_type not in normalized_retry_types:
+            normalized_retry_types.append(alert_type)
+    if not normalized_retry_types:
+        normalized_retry_types = list(strategy_defaults.get("factor_retry_alert_types", []))
+    alert_strategy["factor_retry_alert_types"] = normalized_retry_types
     alert_strategy["strong_direct_enabled"] = _parse_bool(
         alert_strategy.get("strong_direct_enabled"),
         default=bool(strategy_defaults.get("strong_direct_enabled", True)),

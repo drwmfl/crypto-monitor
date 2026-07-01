@@ -262,6 +262,21 @@
     "global_max_hour": 20,
     "require_oi_for_actionable": true,
     "min_actionable_oi_signal_level": "L2",
+    "actionable_require_factor_completeness": true,
+    "actionable_min_factor_completeness_pct": 50.0,
+    "actionable_required_factor_groups_any": [
+      "oi",
+      "micro"
+    ],
+    "factor_retry_enabled": true,
+    "factor_retry_delay_sec": 4.0,
+    "factor_retry_min_completeness_pct": 80.0,
+    "factor_retry_alert_types": [
+      "startup_alert",
+      "strong_direct_alert",
+      "risk_alert",
+      "actionable_alert"
+    ],
     "strong_direct_enabled": true,
     "strong_direct_windows": [
       "1m"

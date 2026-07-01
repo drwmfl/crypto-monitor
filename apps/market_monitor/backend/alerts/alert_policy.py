@@ -32,6 +32,9 @@ DEFAULT_ALERT_POLICY: Dict[str, Any] = {
     "global_max_hour": 20,
     "require_oi_for_actionable": True,
     "min_actionable_oi_signal_level": "L2",
+    "actionable_require_factor_completeness": True,
+    "actionable_min_factor_completeness_pct": 50.0,
+    "actionable_required_factor_groups_any": ["oi", "micro"],
     "require_confirmation_for_actionable": True,
     "min_actionable_confirmations": 3,
 }
@@ -70,6 +73,8 @@ class AlertPolicy:
             return AlertDecision(False, reason="below_threshold")
         if alert_type == "watchlist_alert" and not _parse_bool(self.settings.get("watchlist_tg_enabled"), False):
             return AlertDecision(False, alert_type=alert_type, reason="watchlist_tg_disabled")
+        if alert_type == "actionable_alert" and not self._actionable_factor_complete(candidate):
+            return AlertDecision(False, alert_type=alert_type, reason="actionable_factor_incomplete")
 
         now_ts = time.time()
         if not self._global_rate_allowed(now_ts):
@@ -79,6 +84,26 @@ class AlertPolicy:
             return AlertDecision(False, alert_type=alert_type, reason="symbol_cooldown")
 
         return AlertDecision(True, alert_type=alert_type, reason="accepted")
+
+    def _actionable_factor_complete(self, candidate: Candidate) -> bool:
+        if not _parse_bool(self.settings.get("actionable_require_factor_completeness"), True):
+            return True
+
+        completeness = candidate.factor_snapshot.get("factor_completeness") if isinstance(candidate.factor_snapshot, dict) else {}
+        if not isinstance(completeness, dict):
+            return False
+        pct = _to_float(completeness.get("pct"), 0.0)
+        min_pct = max(0.0, _to_float(self.settings.get("actionable_min_factor_completeness_pct"), 50.0))
+        if pct < min_pct:
+            return False
+
+        required_any = self.settings.get("actionable_required_factor_groups_any", ["oi", "micro"])
+        if isinstance(required_any, str):
+            required_any = [item.strip() for item in required_any.split(",")]
+        if not isinstance(required_any, list):
+            required_any = ["oi", "micro"]
+        groups = completeness.get("groups") if isinstance(completeness.get("groups"), dict) else {}
+        return any(bool(groups.get(str(group).strip())) for group in required_any if str(group).strip())
 
     def mark_sent(self, symbol: str, alert_type: str) -> None:
         self._mark_sent(symbol=symbol, alert_type=alert_type, now_ts=time.time())

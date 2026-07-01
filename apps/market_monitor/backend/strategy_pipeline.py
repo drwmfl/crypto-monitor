@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -90,14 +91,7 @@ class AlertStrategyPipeline:
         if self._is_startup_event(payload):
             if self.factor_enricher.should_enrich(candidate, base_score=score):
                 candidate = await self.factor_enricher.enrich(candidate)
-                score, score_breakdown, priority = score_candidate(candidate)
-                risk_score_value, risk_level, risk_breakdown = score_risk(candidate)
-                candidate.score = score
-                candidate.score_breakdown = score_breakdown
-                candidate.priority = priority
-                candidate.risk_score = risk_score_value
-                candidate.risk_level = risk_level
-                candidate.risk_breakdown = risk_breakdown
+                self._recalculate_candidate(candidate)
             self._apply_trade_confirmation(candidate)
             self.candidate_engine.save()
 
@@ -115,6 +109,18 @@ class AlertStrategyPipeline:
                         "startup_alert",
                         cooldown_minutes=self._startup_cooldown_minutes(),
                     )
+                    if decision.should_send:
+                        candidate = await self._retry_factor_fill_if_needed(candidate, "startup_alert")
+                        startup_allowed, startup_reason = self._startup_allowed(candidate)
+                        if not startup_allowed:
+                            decision = AlertDecision(False, alert_type="startup_alert", reason=startup_reason)
+                            dedupe_decision = None
+                        else:
+                            decision = self.policy.allow_alert_type(
+                                candidate.symbol,
+                                "startup_alert",
+                                cooldown_minutes=self._startup_cooldown_minutes(),
+                            )
                     if decision.should_send:
                         dedupe_decision = self.event_deduper.decide(candidate, alert_type="startup_alert")
                         if dedupe_decision.should_send:
@@ -144,14 +150,7 @@ class AlertStrategyPipeline:
 
         if self._is_strong_direct_event(payload):
             candidate = await self.factor_enricher.enrich(candidate)
-            score, score_breakdown, priority = score_candidate(candidate)
-            risk_score_value, risk_level, risk_breakdown = score_risk(candidate)
-            candidate.score = score
-            candidate.score_breakdown = score_breakdown
-            candidate.priority = priority
-            candidate.risk_score = risk_score_value
-            candidate.risk_level = risk_level
-            candidate.risk_breakdown = risk_breakdown
+            self._recalculate_candidate(candidate)
             self._apply_trade_confirmation(candidate)
             self.candidate_engine.save()
 
@@ -165,6 +164,18 @@ class AlertStrategyPipeline:
                     "strong_direct_alert",
                     cooldown_minutes=self._strong_direct_cooldown_minutes(),
                 )
+                if decision.should_send:
+                    candidate = await self._retry_factor_fill_if_needed(candidate, "strong_direct_alert")
+                    direct_allowed, direct_reason = self._strong_direct_confirmation_allowed(candidate)
+                    if not direct_allowed:
+                        decision = AlertDecision(False, alert_type="strong_direct_alert", reason=direct_reason)
+                        dedupe_decision = None
+                    else:
+                        decision = self.policy.allow_alert_type(
+                            candidate.symbol,
+                            "strong_direct_alert",
+                            cooldown_minutes=self._strong_direct_cooldown_minutes(),
+                        )
                 if decision.should_send:
                     dedupe_decision = self.event_deduper.decide(candidate, alert_type="strong_direct_alert")
                     if dedupe_decision.should_send:
@@ -194,21 +205,23 @@ class AlertStrategyPipeline:
 
         if self.factor_enricher.should_enrich(candidate, base_score=score):
             candidate = await self.factor_enricher.enrich(candidate)
-            score, score_breakdown, priority = score_candidate(candidate)
-            risk_score_value, risk_level, risk_breakdown = score_risk(candidate)
-
-        candidate.score = score
-        candidate.score_breakdown = score_breakdown
-        candidate.priority = priority
-        candidate.risk_score = risk_score_value
-        candidate.risk_level = risk_level
-        candidate.risk_breakdown = risk_breakdown
+            self._recalculate_candidate(candidate)
+        else:
+            candidate.score = score
+            candidate.score_breakdown = score_breakdown
+            candidate.priority = priority
+            candidate.risk_score = risk_score_value
+            candidate.risk_level = risk_level
+            candidate.risk_breakdown = risk_breakdown
         self._apply_trade_confirmation(candidate)
         self.candidate_engine.save()
 
         decision = self.policy.decide(candidate)
         alert_sent = False
         dedupe_decision = None
+        if decision.should_send:
+            candidate = await self._retry_factor_fill_if_needed(candidate, decision.alert_type)
+            decision = self.policy.decide(candidate)
         if decision.should_send:
             dedupe_decision = self.event_deduper.decide(candidate, alert_type=decision.alert_type)
             if dedupe_decision.should_send:
@@ -260,6 +273,67 @@ class AlertStrategyPipeline:
             )
         logger.warning("Notifier does not support notify_text; strategy alert dropped: %s", candidate.symbol)
         return False
+
+    def _recalculate_candidate(self, candidate: Any) -> None:
+        score, score_breakdown, priority = score_candidate(candidate)
+        risk_score_value, risk_level, risk_breakdown = score_risk(candidate)
+        candidate.score = score
+        candidate.score_breakdown = score_breakdown
+        candidate.priority = priority
+        candidate.risk_score = risk_score_value
+        candidate.risk_level = risk_level
+        candidate.risk_breakdown = risk_breakdown
+
+    async def _retry_factor_fill_if_needed(self, candidate: Any, alert_type: str) -> Any:
+        if not _parse_bool(self.settings.get("factor_retry_enabled"), True):
+            return candidate
+        retry_types = self._factor_retry_alert_types()
+        if alert_type not in retry_types:
+            return candidate
+        if self._factor_completeness_pct(candidate) >= self._factor_retry_min_completeness_pct():
+            return candidate
+
+        delay_sec = max(0.0, min(10.0, _to_float(self.settings.get("factor_retry_delay_sec"), 4.0)))
+        if delay_sec > 0:
+            await asyncio.sleep(delay_sec)
+
+        before_pct = self._factor_completeness_pct(candidate)
+        candidate = await self.factor_enricher.enrich(candidate, force_refresh=True)
+        self._recalculate_candidate(candidate)
+        self._apply_trade_confirmation(candidate)
+        self.candidate_engine.save()
+        logger.info(
+            "Factor retry completed: symbol=%s alert_type=%s completeness=%.1f->%.1f",
+            candidate.symbol,
+            alert_type,
+            before_pct,
+            self._factor_completeness_pct(candidate),
+        )
+        return candidate
+
+    def _factor_retry_alert_types(self) -> set[str]:
+        raw_types = self.settings.get(
+            "factor_retry_alert_types",
+            ["startup_alert", "strong_direct_alert", "risk_alert", "actionable_alert"],
+        )
+        if isinstance(raw_types, str):
+            items = raw_types.split(",")
+        elif isinstance(raw_types, list):
+            items = raw_types
+        else:
+            items = ["startup_alert", "strong_direct_alert", "risk_alert", "actionable_alert"]
+        allowed = {"startup_alert", "strong_direct_alert", "risk_alert", "actionable_alert"}
+        return {str(item).strip() for item in items if str(item).strip() in allowed} or allowed
+
+    def _factor_retry_min_completeness_pct(self) -> float:
+        return max(0.0, min(100.0, _to_float(self.settings.get("factor_retry_min_completeness_pct"), 80.0)))
+
+    def _factor_completeness_pct(self, candidate: Any) -> float:
+        snapshot = candidate.factor_snapshot or {}
+        completeness = snapshot.get("factor_completeness") if isinstance(snapshot, dict) else {}
+        if not isinstance(completeness, dict):
+            return 0.0
+        return max(0.0, min(100.0, _to_float(completeness.get("pct"), 0.0)))
 
     def _is_startup_event(self, payload: Dict[str, Any]) -> bool:
         if not _parse_bool(self.settings.get("startup_alert_enabled"), True):

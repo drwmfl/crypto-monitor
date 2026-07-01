@@ -66,10 +66,17 @@ def format_strategy_alert(
         f"**{alert_label} | {token_name}（触发{trigger_count}次）**",
         f"状态：OI {_oi_state_label(derivatives)} | Micro {_micro_state_label(derivatives)} | {direction} {windows}",
         f"价格：{change} | {price} | 评分/风险 {candidate.score:.1f}/{candidate.risk_score:.1f}",
-        f"OI: {_oi_matrix(derivatives)}",
-        f"微结构: {_micro_matrix(derivatives)}",
-        f"资金: {_funding_matrix(derivatives)}",
     ]
+    completeness_line = _factor_completeness_line(candidate.factor_snapshot or {})
+    if completeness_line:
+        lines.append(completeness_line)
+    lines.extend(
+        [
+            f"OI: {_oi_matrix(derivatives)}",
+            f"微结构: {_micro_matrix(derivatives)}",
+            f"资金: {_funding_matrix(derivatives)}",
+        ]
+    )
     strong_direct_line = _strong_direct_line(latest, decision.alert_type)
     if strong_direct_line:
         lines.append(strong_direct_line)
@@ -245,6 +252,37 @@ def _has_micro_data(derivatives: Dict[str, Any]) -> bool:
 
 def _has_funding_data(derivatives: Dict[str, Any]) -> bool:
     return _has_any_value(derivatives, ("taker_buy_ratio", "funding_rate", "oi_usdt"))
+
+
+def _factor_completeness_line(snapshot: Dict[str, Any]) -> str:
+    completeness = snapshot.get("factor_completeness") if isinstance(snapshot, dict) else {}
+    if not isinstance(completeness, dict):
+        return ""
+    available = int(_safe_float(completeness.get("available"), 0.0))
+    total = int(_safe_float(completeness.get("total"), 0.0))
+    pct = _safe_optional_float(completeness.get("pct"))
+    if total <= 0 or pct is None:
+        return ""
+    if available >= total:
+        return f"数据：衍生品完整 {available}/{total}"
+    missing = completeness.get("missing")
+    missing_labels = _factor_group_labels(missing if isinstance(missing, list) else [])
+    prefix = "数据：衍生品不足" if pct < 50.0 else "数据：衍生品"
+    suffix = f" | 缺 {missing_labels}" if missing_labels else ""
+    return f"{prefix} {available}/{total} {pct:.0f}%{suffix}"
+
+
+def _factor_group_labels(groups: list[Any]) -> str:
+    labels = {
+        "oi": "OI",
+        "funding": "费率",
+        "taker_flow": "主动流",
+        "micro": "微结构",
+        "orderbook": "盘口",
+        "liquidation": "爆仓",
+    }
+    result = [labels.get(str(item), str(item)) for item in groups if str(item)]
+    return "/".join(result[:4])
 
 
 def _has_any_value(payload: Dict[str, Any], keys: tuple[str, ...]) -> bool:
