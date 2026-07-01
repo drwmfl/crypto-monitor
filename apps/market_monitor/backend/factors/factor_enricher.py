@@ -107,6 +107,20 @@ class FactorEnricher:
         _apply_factor_sections(candidate, snapshot_dict)
         return candidate
 
+    async def prewarm_microstructure(self, candidate: Candidate) -> bool:
+        if not self.enabled or not self.microstructure_provider.enabled:
+            return False
+        try:
+            await self.microstructure_provider.fetch(
+                candidate.symbol,
+                candidate.base_asset,
+                context=_micro_context(candidate, candidate.factor_snapshot or {}),
+            )
+            return True
+        except Exception as exc:
+            logger.debug("Microstructure prewarm failed: symbol=%s err=%s", candidate.symbol, exc)
+            return False
+
 
 def _merge_snapshots(left: FactorSnapshot, right: FactorSnapshot) -> FactorSnapshot:
     left.derivatives.update(right.derivatives or {})

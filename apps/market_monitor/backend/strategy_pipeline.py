@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -61,6 +62,8 @@ class AlertStrategyPipeline:
         self.factor_enricher = FactorEnricher(factor_settings)
         factor_quality_file = str(self.settings.get("factor_quality_file") or "factor_quality.jsonl").strip()
         self.factor_quality_path = self.event_store.runtime_dir / (factor_quality_file or "factor_quality.jsonl")
+        self._prewarm_last_ts: Dict[str, float] = {}
+        self._prewarm_tasks: set[asyncio.Task] = set()
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "AlertStrategyPipeline":
@@ -91,6 +94,7 @@ class AlertStrategyPipeline:
         candidate.risk_level = risk_level
         candidate.risk_breakdown = risk_breakdown
         self.candidate_engine.save()
+        self._schedule_hot_pool_prewarm(candidate, base_score=score)
 
         if self._is_startup_event(payload):
             if self.factor_enricher.should_enrich(candidate, base_score=score):
@@ -383,6 +387,114 @@ class AlertStrategyPipeline:
         except Exception as exc:
             logger.debug("Failed to record factor quality: symbol=%s alert_type=%s err=%s", candidate.symbol, alert_type, exc)
 
+    def _schedule_hot_pool_prewarm(self, candidate: Any, *, base_score: float) -> None:
+        if not _parse_bool(self.settings.get("factor_prewarm_enabled"), True):
+            return
+        if not getattr(getattr(self.factor_enricher, "microstructure_provider", None), "enabled", False):
+            return
+
+        max_pending = max(1, _to_int(self.settings.get("factor_prewarm_max_pending"), 6))
+        self._prune_done_prewarm_tasks()
+        if len(self._prewarm_tasks) >= max_pending:
+            return
+
+        candidates = self._hot_prewarm_candidates(candidate, base_score=base_score)
+        if not candidates:
+            return
+
+        for item in candidates:
+            if len(self._prewarm_tasks) >= max_pending:
+                break
+            symbol = str(getattr(item, "symbol", "") or "").upper().strip()
+            if not symbol or not self._prewarm_due(symbol):
+                continue
+            self._prewarm_last_ts[symbol] = time.time()
+            task = asyncio.create_task(self._run_hot_prewarm(item), name=f"factor_prewarm_{symbol}")
+            self._prewarm_tasks.add(task)
+            task.add_done_callback(lambda done: self._prewarm_tasks.discard(done))
+
+    def _hot_prewarm_candidates(self, current: Any, *, base_score: float) -> list[Any]:
+        max_items = max(1, _to_int(self.settings.get("factor_prewarm_batch_size"), 3))
+        min_score = _to_float(self.settings.get("factor_prewarm_min_score"), 30.0)
+        min_event_count = max(1, _to_int(self.settings.get("factor_prewarm_min_event_count"), 1))
+        min_abs_change = max(0.0, _to_float(self.settings.get("factor_prewarm_min_abs_change_pct"), 1.0))
+        min_rvol = max(0.0, _to_float(self.settings.get("factor_prewarm_min_rvol"), 1.2))
+        max_age_minutes = max(1.0, _to_float(self.settings.get("factor_prewarm_candidate_age_minutes"), 60.0))
+
+        pool: Dict[str, Any] = {}
+        if current is not None:
+            pool[str(getattr(current, "symbol", "") or "").upper()] = current
+        for symbol, candidate in self.candidate_engine.all_candidates().items():
+            pool[str(symbol or getattr(candidate, "symbol", "") or "").upper()] = candidate
+
+        now = datetime.now(timezone.utc)
+        rows: list[tuple[float, Any]] = []
+        for item in pool.values():
+            symbol = str(getattr(item, "symbol", "") or "").upper().strip()
+            if not symbol:
+                continue
+            if item is current and self._will_enrich_current_candidate(item, base_score=base_score):
+                continue
+            last_seen = _parse_iso_time(getattr(item, "last_seen", ""))
+            age_minutes = ((now - last_seen).total_seconds() / 60.0) if last_seen is not None else 0.0
+            if last_seen is not None and age_minutes > max_age_minutes:
+                continue
+            score_value = float(getattr(item, "score", 0.0) or 0.0)
+            if item is current:
+                score_value = max(score_value, float(base_score or 0.0))
+            event_count = int(getattr(item, "event_count", 0) or 0)
+            abs_change = abs(float(getattr(item, "max_abs_change_pct", 0.0) or 0.0))
+            rvol = float(getattr(item, "max_rvol", 0.0) or 0.0)
+            if (
+                score_value < min_score
+                and event_count < min_event_count
+                and abs_change < min_abs_change
+                and rvol < min_rvol
+            ):
+                continue
+            hot_score = (
+                score_value
+                + min(20.0, event_count * 2.0)
+                + min(20.0, abs_change * 2.0)
+                + min(15.0, rvol * 3.0)
+                - min(20.0, age_minutes / 3.0)
+            )
+            if item is current:
+                hot_score += 10.0
+            rows.append((hot_score, item))
+
+        rows.sort(key=lambda row: row[0], reverse=True)
+        return [item for _, item in rows[:max_items]]
+
+    def _will_enrich_current_candidate(self, candidate: Any, *, base_score: float) -> bool:
+        should_enrich = getattr(self.factor_enricher, "should_enrich", None)
+        if not callable(should_enrich):
+            return False
+        try:
+            return bool(should_enrich(candidate, base_score=base_score))
+        except Exception:
+            return False
+
+    def _prewarm_due(self, symbol: str) -> bool:
+        cooldown = max(10.0, _to_float(self.settings.get("factor_prewarm_cooldown_sec"), 180.0))
+        last_ts = float(self._prewarm_last_ts.get(symbol, 0.0))
+        return (time.time() - last_ts) >= cooldown
+
+    def _prune_done_prewarm_tasks(self) -> None:
+        if not self._prewarm_tasks:
+            return
+        self._prewarm_tasks = {task for task in self._prewarm_tasks if not task.done()}
+
+    async def _run_hot_prewarm(self, candidate: Any) -> None:
+        symbol = str(getattr(candidate, "symbol", "") or "").upper().strip()
+        try:
+            ok = await self.factor_enricher.prewarm_microstructure(candidate)
+            logger.debug("Factor prewarm completed: symbol=%s ok=%s", symbol, ok)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("Factor prewarm failed: symbol=%s err=%s", symbol, exc)
+
     def _is_startup_event(self, payload: Dict[str, Any]) -> bool:
         if not _parse_bool(self.settings.get("startup_alert_enabled"), True):
             return False
@@ -605,3 +717,18 @@ def _to_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _parse_iso_time(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)

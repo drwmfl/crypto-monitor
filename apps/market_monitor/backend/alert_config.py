@@ -185,6 +185,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "factor_retry_delay_sec": 4.0,
         "factor_retry_min_completeness_pct": 80.0,
         "factor_retry_alert_types": ["startup_alert", "strong_direct_alert", "risk_alert", "actionable_alert"],
+        "factor_prewarm_enabled": True,
+        "factor_prewarm_min_score": 30.0,
+        "factor_prewarm_min_event_count": 1,
+        "factor_prewarm_min_abs_change_pct": 1.0,
+        "factor_prewarm_min_rvol": 1.2,
+        "factor_prewarm_batch_size": 3,
+        "factor_prewarm_max_pending": 6,
+        "factor_prewarm_cooldown_sec": 180.0,
+        "factor_prewarm_candidate_age_minutes": 60.0,
         "strong_direct_enabled": True,
         "strong_direct_windows": ["1m"],
         "strong_direct_direct_windows": ["1m"],
@@ -1033,6 +1042,51 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
         alert_strategy["factor_retry_alert_types"] = _parse_csv_list(
             os.getenv("ALERT_STRATEGY_FACTOR_RETRY_ALERT_TYPES", "")
         )
+    if os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_ENABLED") is not None:
+        alert_strategy["factor_prewarm_enabled"] = _parse_bool(
+            os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_ENABLED"),
+            default=True,
+        )
+    if os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_MIN_SCORE"):
+        alert_strategy["factor_prewarm_min_score"] = _to_float(
+            os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_MIN_SCORE"),
+            default=30.0,
+        )
+    if os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_MIN_EVENT_COUNT"):
+        alert_strategy["factor_prewarm_min_event_count"] = _to_int(
+            os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_MIN_EVENT_COUNT"),
+            default=1,
+        )
+    if os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_MIN_ABS_CHANGE_PCT"):
+        alert_strategy["factor_prewarm_min_abs_change_pct"] = _to_float(
+            os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_MIN_ABS_CHANGE_PCT"),
+            default=1.0,
+        )
+    if os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_MIN_RVOL"):
+        alert_strategy["factor_prewarm_min_rvol"] = _to_float(
+            os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_MIN_RVOL"),
+            default=1.2,
+        )
+    if os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_BATCH_SIZE"):
+        alert_strategy["factor_prewarm_batch_size"] = _to_int(
+            os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_BATCH_SIZE"),
+            default=3,
+        )
+    if os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_MAX_PENDING"):
+        alert_strategy["factor_prewarm_max_pending"] = _to_int(
+            os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_MAX_PENDING"),
+            default=6,
+        )
+    if os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_COOLDOWN_SEC"):
+        alert_strategy["factor_prewarm_cooldown_sec"] = _to_float(
+            os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_COOLDOWN_SEC"),
+            default=180.0,
+        )
+    if os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_CANDIDATE_AGE_MINUTES"):
+        alert_strategy["factor_prewarm_candidate_age_minutes"] = _to_float(
+            os.getenv("ALERT_STRATEGY_FACTOR_PREWARM_CANDIDATE_AGE_MINUTES"),
+            default=60.0,
+        )
     if os.getenv("ALERT_STRATEGY_STRONG_DIRECT_ENABLED") is not None:
         alert_strategy["strong_direct_enabled"] = _parse_bool(
             os.getenv("ALERT_STRATEGY_STRONG_DIRECT_ENABLED"),
@@ -1603,6 +1657,48 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if not normalized_retry_types:
         normalized_retry_types = list(strategy_defaults.get("factor_retry_alert_types", []))
     alert_strategy["factor_retry_alert_types"] = normalized_retry_types
+    alert_strategy["factor_prewarm_enabled"] = _parse_bool(
+        alert_strategy.get("factor_prewarm_enabled"),
+        default=bool(strategy_defaults.get("factor_prewarm_enabled", True)),
+    )
+    alert_strategy["factor_prewarm_min_score"] = max(
+        0.0,
+        min(100.0, _to_float(alert_strategy.get("factor_prewarm_min_score"), strategy_defaults.get("factor_prewarm_min_score", 30.0))),
+    )
+    alert_strategy["factor_prewarm_min_event_count"] = max(
+        1,
+        _to_int(alert_strategy.get("factor_prewarm_min_event_count"), strategy_defaults.get("factor_prewarm_min_event_count", 1)),
+    )
+    alert_strategy["factor_prewarm_min_abs_change_pct"] = max(
+        0.0,
+        _to_float(
+            alert_strategy.get("factor_prewarm_min_abs_change_pct"),
+            strategy_defaults.get("factor_prewarm_min_abs_change_pct", 1.0),
+        ),
+    )
+    alert_strategy["factor_prewarm_min_rvol"] = max(
+        0.0,
+        _to_float(alert_strategy.get("factor_prewarm_min_rvol"), strategy_defaults.get("factor_prewarm_min_rvol", 1.2)),
+    )
+    alert_strategy["factor_prewarm_batch_size"] = max(
+        1,
+        min(10, _to_int(alert_strategy.get("factor_prewarm_batch_size"), strategy_defaults.get("factor_prewarm_batch_size", 3))),
+    )
+    alert_strategy["factor_prewarm_max_pending"] = max(
+        1,
+        min(20, _to_int(alert_strategy.get("factor_prewarm_max_pending"), strategy_defaults.get("factor_prewarm_max_pending", 6))),
+    )
+    alert_strategy["factor_prewarm_cooldown_sec"] = max(
+        10.0,
+        _to_float(alert_strategy.get("factor_prewarm_cooldown_sec"), strategy_defaults.get("factor_prewarm_cooldown_sec", 180.0)),
+    )
+    alert_strategy["factor_prewarm_candidate_age_minutes"] = max(
+        1.0,
+        _to_float(
+            alert_strategy.get("factor_prewarm_candidate_age_minutes"),
+            strategy_defaults.get("factor_prewarm_candidate_age_minutes", 60.0),
+        ),
+    )
     alert_strategy["strong_direct_enabled"] = _parse_bool(
         alert_strategy.get("strong_direct_enabled"),
         default=bool(strategy_defaults.get("strong_direct_enabled", True)),

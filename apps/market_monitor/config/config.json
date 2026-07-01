@@ -278,6 +278,15 @@
       "risk_alert",
       "actionable_alert"
     ],
+    "factor_prewarm_enabled": true,
+    "factor_prewarm_min_score": 30.0,
+    "factor_prewarm_min_event_count": 1,
+    "factor_prewarm_min_abs_change_pct": 1.0,
+    "factor_prewarm_min_rvol": 1.2,
+    "factor_prewarm_batch_size": 3,
+    "factor_prewarm_max_pending": 6,
+    "factor_prewarm_cooldown_sec": 180.0,
+    "factor_prewarm_candidate_age_minutes": 60.0,
     "strong_direct_enabled": true,
     "strong_direct_windows": [
       "1m"
