@@ -84,6 +84,34 @@
       "use_macd_confirm": true,
       "severity": "high"
     },
+    "early_start": {
+      "enabled": true,
+      "windows": [
+        "5m",
+        "15m",
+        "30m"
+      ],
+      "price_change_pct": {
+        "5m": 0.0,
+        "15m": 0.0,
+        "30m": 0.0
+      },
+      "min_change_pct": {
+        "5m": 0.0,
+        "15m": 0.0,
+        "30m": 0.0
+      },
+      "rolling_change_pct": {
+        "15m": 6.0,
+        "30m": 10.0
+      },
+      "rolling_rvol_min": 1.8,
+      "breakout_lookback_minutes": 60,
+      "breakout_tolerance_pct": 0.15,
+      "min_latest_change_pct": 0.0,
+      "max_24h_change_pct": 0.0,
+      "severity": "medium"
+    },
     "long_anomaly": {
       "enabled": true,
       "windows": [
@@ -228,6 +256,7 @@
     "watch_cooldown_minutes": 30,
     "actionable_cooldown_minutes": 60,
     "risk_cooldown_minutes": 60,
+    "startup_cooldown_minutes": 45,
     "global_max_10m": 5,
     "global_max_hour": 20,
     "require_oi_for_actionable": true,
@@ -246,6 +275,8 @@
     "strong_direct_cooldown_minutes": 12,
     "strong_direct_min_score": 60.0,
     "strong_direct_max_risk": 70.0,
+    "startup_alert_enabled": true,
+    "startup_alert_min_score": 45.0,
     "require_confirmation_for_actionable": true,
     "min_actionable_confirmations": 3,
     "trade_confirmation_enabled": true,

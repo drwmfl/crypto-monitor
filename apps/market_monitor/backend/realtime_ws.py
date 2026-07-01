@@ -682,6 +682,13 @@ class RealtimeKlineWatcher:
             std_period=std_period,
             volume_lookback=int(self.feed.volume_lookback),
         )
+        indicators.update(
+            _rolling_startup_metrics(
+                history,
+                window=window,
+                volume_lookback=int(self.feed.volume_lookback),
+            )
+        )
 
         event_time = datetime.fromtimestamp(int(latest[0]) / 1000.0)
         return MarketSnapshot(
@@ -828,6 +835,68 @@ def _chunked(items: List[str], size: int) -> List[List[str]]:
     if size <= 0:
         return [items]
     return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+def _rolling_startup_metrics(
+    rows: List[List[float]],
+    *,
+    window: str,
+    volume_lookback: int,
+) -> Dict[str, float]:
+    window_minutes = _window_minutes(window)
+    if window_minutes <= 0 or not rows:
+        return {}
+
+    metrics: Dict[str, float] = {}
+    for minutes in (15, 30):
+        if minutes < window_minutes:
+            continue
+        candle_count = max(1, int(round(minutes / window_minutes)))
+        if len(rows) < candle_count:
+            continue
+
+        recent = rows[-candle_count:]
+        open_price = _safe_float(recent[0][1], 0.0)
+        close_price = _safe_float(recent[-1][4], 0.0)
+        if open_price <= 0 or close_price <= 0:
+            continue
+
+        volume_sum = sum(_safe_float(row[5], 0.0) for row in recent)
+        previous = rows[: -candle_count]
+        sample_count = max(1, int(volume_lookback or 1))
+        baseline_rows = previous[-sample_count * candle_count :]
+        baseline_sums: List[float] = []
+        for start in range(0, len(baseline_rows), candle_count):
+            chunk = baseline_rows[start : start + candle_count]
+            if len(chunk) == candle_count:
+                baseline_sums.append(sum(_safe_float(row[5], 0.0) for row in chunk))
+        avg_volume_sum = sum(baseline_sums) / len(baseline_sums) if baseline_sums else 0.0
+
+        metrics[f"rolling_{minutes}m_change_pct"] = (close_price - open_price) / open_price * 100.0
+        metrics[f"rolling_{minutes}m_volume"] = volume_sum
+        if avg_volume_sum > 0:
+            metrics[f"rolling_{minutes}m_rvol"] = volume_sum / avg_volume_sum
+
+    lookback_count = max(1, int(round(60 / window_minutes)))
+    previous_rows = rows[-(lookback_count + 1) : -1]
+    if previous_rows:
+        prior_high = max(_safe_float(row[2], 0.0) for row in previous_rows)
+        latest_close = _safe_float(rows[-1][4], 0.0)
+        latest_high = _safe_float(rows[-1][2], 0.0)
+        if prior_high > 0:
+            metrics["breakout_60m_high"] = prior_high
+            metrics["breakout_60m_close_distance_pct"] = (latest_close - prior_high) / prior_high * 100.0
+            metrics["breakout_60m_high_distance_pct"] = (latest_high - prior_high) / prior_high * 100.0
+    return metrics
+
+
+def _window_minutes(window: str) -> int:
+    text = str(window or "").strip().lower()
+    if text.endswith("m"):
+        return int(_safe_float(text[:-1], 0.0))
+    if text.endswith("h"):
+        return int(_safe_float(text[:-1], 0.0) * 60)
+    return 0
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:

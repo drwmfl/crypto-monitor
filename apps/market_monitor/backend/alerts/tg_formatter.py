@@ -15,6 +15,7 @@ ALERT_TYPE_LABELS = {
     "actionable_alert": "高价值候选",
     "risk_alert": "高风险提醒",
     "strong_direct_alert": "急速异动",
+    "startup_alert": "启动预警",
 }
 
 DETAIL_LEVELS = {"compact", "full", "verbose"}
@@ -69,6 +70,9 @@ def format_strategy_alert(
         f"微结构: {_micro_matrix(derivatives)}",
         f"资金: {_funding_matrix(derivatives)}",
     ]
+    startup_line = _startup_line(latest, decision.alert_type)
+    if startup_line:
+        lines.append(startup_line)
 
     accumulation_line = _accumulation_line(accumulation)
     if accumulation_line:
@@ -131,6 +135,16 @@ def _accumulation_line(accumulation: Dict[str, Any]) -> str:
     vol_ratio = _fmt_x(accumulation.get("recent_vol_ratio_7d"))
     market_cap = _fmt_compact_usd(accumulation.get("market_cap"))
     return f"收筹：{status} {score} | 横盘 {days}天 | 区间 {range_pct} | Vol {vol_ratio} | 市值 {market_cap}"
+
+
+def _startup_line(latest: Dict[str, Any], alert_type: str) -> str:
+    if alert_type != "startup_alert":
+        return ""
+    window = str(latest.get("startup_window") or "").strip() or "N/A"
+    change = _fmt_pct(latest.get("startup_change_pct"))
+    rvol = _fmt_x(latest.get("startup_rvol"))
+    breakout = _fmt_pct(latest.get("startup_breakout_distance_pct"))
+    return f"启动: {window}累计 {change} | RVOL {rvol} | 距60m高点 {breakout} | 高波动仅观察"
 
 
 def _accumulation_status_label(status: Any) -> str:

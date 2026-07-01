@@ -59,6 +59,7 @@ def check_rules(snapshot: MarketSnapshot, config: AlertConfig) -> List[Dict[str,
 
     events: List[Dict[str, Any]] = []
     events.extend(_eval_short_breakout(snapshot, config))
+    events.extend(_eval_early_start(snapshot, config))
     events.extend(_eval_trend_acceleration(snapshot, config))
     events.extend(_eval_long_anomaly(snapshot, config))
     return events
@@ -184,6 +185,76 @@ def _eval_trend_acceleration(snapshot: MarketSnapshot, config: AlertConfig) -> L
         rule_cfg=rule_cfg,
     )
     return [_build_event(rule_name, snapshot, reasons, str(rule_cfg.get("severity", "medium")), confidence=confidence)]
+
+
+def _eval_early_start(snapshot: MarketSnapshot, config: AlertConfig) -> List[Dict[str, Any]]:
+    rule_name = "early_start"
+    rule_cfg = config.rule(rule_name)
+    if not _rule_enabled_for_window(rule_cfg, snapshot.window):
+        return []
+    if snapshot.direction != "up":
+        return []
+
+    min_latest_change = _safe_float(rule_cfg.get("min_latest_change_pct"), 0.0) or 0.0
+    if min_latest_change > 0 and snapshot.change_pct < min_latest_change:
+        return []
+
+    rolling_map = rule_cfg.get("rolling_change_pct", {})
+    if not isinstance(rolling_map, dict):
+        rolling_map = {}
+    rvol_min = _safe_float(rule_cfg.get("rolling_rvol_min"), 1.8) or 1.8
+
+    matched: List[Tuple[int, float, float, float]] = []
+    for minutes in (15, 30):
+        change = _safe_float(snapshot.indicators.get(f"rolling_{minutes}m_change_pct"))
+        rvol = _safe_float(snapshot.indicators.get(f"rolling_{minutes}m_rvol"))
+        threshold = _safe_float(rolling_map.get(f"{minutes}m"), 0.0) or 0.0
+        if threshold <= 0 or change is None or rvol is None:
+            continue
+        if change >= threshold and rvol >= rvol_min:
+            matched.append((minutes, change, rvol, threshold))
+
+    if not matched:
+        return []
+
+    tolerance = max(0.0, _safe_float(rule_cfg.get("breakout_tolerance_pct"), 0.15) or 0.0)
+    prior_high = _safe_float(snapshot.indicators.get("breakout_60m_high"))
+    close_distance = _safe_float(snapshot.indicators.get("breakout_60m_close_distance_pct"))
+    high_distance = _safe_float(snapshot.indicators.get("breakout_60m_high_distance_pct"))
+    if prior_high is None or prior_high <= 0:
+        return []
+    if close_distance is None or high_distance is None:
+        return []
+    if close_distance < -tolerance and high_distance < 0:
+        return []
+
+    best = max(matched, key=lambda item: (item[1] / max(item[3], 0.01), item[2]))
+    minutes, change, rvol, threshold = best
+    reasons = [
+        f"{minutes}m累计涨幅 {change:.2f}% >= 启动阈值 {threshold:.2f}%",
+        f"{minutes}m累计RVOL {rvol:.2f}x >= {rvol_min:.2f}x",
+        f"价格接近/突破60m高点 {prior_high:.8f}，收盘距离 {close_distance:+.2f}%",
+    ]
+    confidence = _estimate_early_start_confidence(
+        rolling_change=change,
+        threshold=threshold,
+        rolling_rvol=rvol,
+        close_distance=close_distance,
+        latest_change=snapshot.change_pct,
+    )
+    event = _build_event(
+        rule_name,
+        snapshot,
+        reasons,
+        str(rule_cfg.get("severity", "medium")),
+        confidence=confidence,
+    )
+    event["startup_window"] = f"{minutes}m"
+    event["startup_change_pct"] = change
+    event["startup_rvol"] = rvol
+    event["startup_breakout_high"] = prior_high
+    event["startup_breakout_distance_pct"] = close_distance
+    return [event]
 
 
 def _eval_long_anomaly(snapshot: MarketSnapshot, config: AlertConfig) -> List[Dict[str, Any]]:
@@ -466,12 +537,30 @@ def _build_event(
         "direction": snapshot.direction,
         "change_pct": snapshot.change_pct,
         "price": snapshot.close_price,
+        "rvol": snapshot.indicators.get("rvol"),
         "rule_name": rule_name,
         "reasons": reasons,
         "level": normalized_level,
         "confidence": confidence,
         "event_time": snapshot.event_time or datetime.now(),
     }
+
+
+def _estimate_early_start_confidence(
+    *,
+    rolling_change: float,
+    threshold: float,
+    rolling_rvol: float,
+    close_distance: float,
+    latest_change: float,
+) -> float:
+    score = 58.0
+    if threshold > 0:
+        score += min(14.0, max(0.0, rolling_change / threshold - 1.0) * 18.0)
+    score += min(12.0, max(0.0, rolling_rvol - 1.0) * 4.0)
+    score += min(8.0, max(0.0, close_distance + 0.15) * 5.0)
+    score += min(5.0, max(0.0, latest_change) * 1.5)
+    return round(max(40.0, min(96.0, score)), 1)
 
 
 def _estimate_confidence(

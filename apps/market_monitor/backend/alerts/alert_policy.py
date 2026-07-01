@@ -26,6 +26,7 @@ DEFAULT_ALERT_POLICY: Dict[str, Any] = {
     "watch_cooldown_minutes": 30,
     "actionable_cooldown_minutes": 60,
     "risk_cooldown_minutes": 60,
+    "startup_cooldown_minutes": 45,
     "global_max_10m": 5,
     "global_max_hour": 20,
     "require_oi_for_actionable": True,
@@ -170,6 +171,8 @@ class AlertPolicy:
             return max(1, _to_int(self.settings.get("actionable_cooldown_minutes"), 60))
         if alert_type == "risk_alert":
             return max(1, _to_int(self.settings.get("risk_cooldown_minutes"), 60))
+        if alert_type == "startup_alert":
+            return max(1, _to_int(self.settings.get("startup_cooldown_minutes"), 45))
         return max(1, _to_int(self.settings.get("watch_cooldown_minutes"), 30))
 
     def _mark_sent(self, symbol: str, alert_type: str, now_ts: float) -> None:

@@ -87,6 +87,57 @@ class AlertStrategyPipeline:
         candidate.risk_breakdown = risk_breakdown
         self.candidate_engine.save()
 
+        if self._is_startup_event(payload):
+            if self.factor_enricher.should_enrich(candidate, base_score=score):
+                candidate = await self.factor_enricher.enrich(candidate)
+                score, score_breakdown, priority = score_candidate(candidate)
+                risk_score_value, risk_level, risk_breakdown = score_risk(candidate)
+                candidate.score = score
+                candidate.score_breakdown = score_breakdown
+                candidate.priority = priority
+                candidate.risk_score = risk_score_value
+                candidate.risk_level = risk_level
+                candidate.risk_breakdown = risk_breakdown
+            self._apply_trade_confirmation(candidate)
+            self.candidate_engine.save()
+
+            startup_allowed, startup_reason = self._startup_allowed(candidate)
+            alert_sent = False
+            dedupe_decision = None
+            decision = AlertDecision(False, alert_type="startup_alert", reason=startup_reason)
+            if startup_allowed:
+                decision = self.policy.allow_alert_type(
+                    candidate.symbol,
+                    "startup_alert",
+                    cooldown_minutes=self._startup_cooldown_minutes(),
+                )
+                if decision.should_send:
+                    dedupe_decision = self.event_deduper.decide(candidate, alert_type="startup_alert")
+                    if dedupe_decision.should_send:
+                        alert_sent = await self._send_decision(notifier=notifier, candidate=candidate, decision=decision)
+                        if alert_sent:
+                            self.event_deduper.mark_sent(candidate, alert_type="startup_alert")
+                            self.policy.mark_sent(candidate.symbol, "startup_alert")
+            logger.info(
+                "Startup alert processed: symbol=%s score=%.1f risk=%.1f confirm=%s stage=%s sent=%s reason=%s dedupe=%s",
+                candidate.symbol,
+                candidate.score,
+                candidate.risk_score,
+                confirmation_count(candidate),
+                confirmation_stage(candidate),
+                alert_sent,
+                decision.reason,
+                dedupe_decision.reason if dedupe_decision else "not_checked",
+            )
+            return StrategyProcessResult(
+                candidate_id=candidate.candidate_id,
+                alert_sent=alert_sent,
+                alert_type="startup_alert",
+                reason=dedupe_decision.reason if dedupe_decision and not dedupe_decision.should_send else decision.reason,
+                candidate_score=candidate.score,
+                risk_score=candidate.risk_score,
+            )
+
         if self._is_strong_direct_event(payload):
             candidate = await self.factor_enricher.enrich(candidate)
             score, score_breakdown, priority = score_candidate(candidate)
@@ -205,6 +256,22 @@ class AlertStrategyPipeline:
             )
         logger.warning("Notifier does not support notify_text; strategy alert dropped: %s", candidate.symbol)
         return False
+
+    def _is_startup_event(self, payload: Dict[str, Any]) -> bool:
+        if not _parse_bool(self.settings.get("startup_alert_enabled"), True):
+            return False
+        if str(payload.get("rule_name") or "").strip() != "early_start":
+            return False
+        return str(payload.get("direction") or "").strip().lower() == "up"
+
+    def _startup_allowed(self, candidate: Any) -> tuple[bool, str]:
+        min_score = _to_float(self.settings.get("startup_alert_min_score"), 45.0)
+        if float(candidate.score or 0.0) < min_score:
+            return False, "startup_score_below_min"
+        return True, "accepted"
+
+    def _startup_cooldown_minutes(self) -> int:
+        return max(1, _to_int(self.settings.get("startup_cooldown_minutes"), 45))
 
     def _is_strong_direct_event(self, payload: Dict[str, Any]) -> bool:
         if not _parse_bool(self.settings.get("strong_direct_enabled"), True):

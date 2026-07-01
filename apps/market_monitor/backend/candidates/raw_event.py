@@ -70,6 +70,11 @@ class RawEvent:
             "ws_gap_window": payload.get("ws_gap_window"),
             "ws_gap_age_sec": _safe_float(payload.get("ws_gap_age_sec")),
             "ws_gap_reason": payload.get("ws_gap_reason"),
+            "startup_window": payload.get("startup_window"),
+            "startup_change_pct": _safe_float(payload.get("startup_change_pct")),
+            "startup_rvol": _safe_float(payload.get("startup_rvol")),
+            "startup_breakout_high": _safe_float(payload.get("startup_breakout_high")),
+            "startup_breakout_distance_pct": _safe_float(payload.get("startup_breakout_distance_pct")),
             "reasons": [str(item) for item in (payload.get("reasons") or [])],
         }
 

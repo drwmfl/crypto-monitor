@@ -93,6 +93,30 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "use_macd_confirm": True,
             "severity": "high",
         },
+        "early_start": {
+            "enabled": True,
+            "windows": ["5m", "15m", "30m"],
+            "price_change_pct": {
+                "5m": 0.0,
+                "15m": 0.0,
+                "30m": 0.0,
+            },
+            "min_change_pct": {
+                "5m": 0.0,
+                "15m": 0.0,
+                "30m": 0.0,
+            },
+            "rolling_change_pct": {
+                "15m": 6.0,
+                "30m": 10.0,
+            },
+            "rolling_rvol_min": 1.8,
+            "breakout_lookback_minutes": 60,
+            "breakout_tolerance_pct": 0.15,
+            "min_latest_change_pct": 0.0,
+            "max_24h_change_pct": 0.0,
+            "severity": "medium",
+        },
         "long_anomaly": {
             "enabled": True,
             "windows": ["1h"],
@@ -147,6 +171,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "watch_cooldown_minutes": 30,
         "actionable_cooldown_minutes": 60,
         "risk_cooldown_minutes": 60,
+        "startup_cooldown_minutes": 45,
         "global_max_10m": 5,
         "global_max_hour": 20,
         "require_oi_for_actionable": True,
@@ -161,6 +186,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "strong_direct_cooldown_minutes": 12,
         "strong_direct_min_score": 60.0,
         "strong_direct_max_risk": 70.0,
+        "startup_alert_enabled": True,
+        "startup_alert_min_score": 45.0,
         "require_confirmation_for_actionable": True,
         "min_actionable_confirmations": 3,
         "trade_confirmation_enabled": True,
@@ -962,6 +989,21 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
             os.getenv("ALERT_STRATEGY_STRONG_DIRECT_MAX_RISK"),
             default=70.0,
         )
+    if os.getenv("ALERT_STRATEGY_STARTUP_ALERT_ENABLED") is not None:
+        alert_strategy["startup_alert_enabled"] = _parse_bool(
+            os.getenv("ALERT_STRATEGY_STARTUP_ALERT_ENABLED"),
+            default=True,
+        )
+    if os.getenv("ALERT_STRATEGY_STARTUP_ALERT_MIN_SCORE"):
+        alert_strategy["startup_alert_min_score"] = _to_float(
+            os.getenv("ALERT_STRATEGY_STARTUP_ALERT_MIN_SCORE"),
+            default=45.0,
+        )
+    if os.getenv("ALERT_STRATEGY_STARTUP_COOLDOWN_MINUTES"):
+        alert_strategy["startup_cooldown_minutes"] = _to_int(
+            os.getenv("ALERT_STRATEGY_STARTUP_COOLDOWN_MINUTES"),
+            default=45,
+        )
     if os.getenv("ALERT_STRATEGY_REQUIRE_CONFIRMATION_FOR_ACTIONABLE") is not None:
         alert_strategy["require_confirmation_for_actionable"] = _parse_bool(
             os.getenv("ALERT_STRATEGY_REQUIRE_CONFIRMATION_FOR_ACTIONABLE"),
@@ -1337,6 +1379,13 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         1,
         _to_int(alert_strategy.get("risk_cooldown_minutes"), strategy_defaults["risk_cooldown_minutes"]),
     )
+    alert_strategy["startup_cooldown_minutes"] = max(
+        1,
+        _to_int(
+            alert_strategy.get("startup_cooldown_minutes"),
+            strategy_defaults.get("startup_cooldown_minutes", 45),
+        ),
+    )
     alert_strategy["global_max_10m"] = max(
         1,
         _to_int(alert_strategy.get("global_max_10m"), strategy_defaults["global_max_10m"]),
@@ -1422,6 +1471,20 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     alert_strategy["strong_direct_max_risk"] = max(
         0.0,
         min(100.0, _to_float(alert_strategy.get("strong_direct_max_risk"), strategy_defaults.get("strong_direct_max_risk", 70.0))),
+    )
+    alert_strategy["startup_alert_enabled"] = _parse_bool(
+        alert_strategy.get("startup_alert_enabled"),
+        default=bool(strategy_defaults.get("startup_alert_enabled", True)),
+    )
+    alert_strategy["startup_alert_min_score"] = max(
+        0.0,
+        min(
+            100.0,
+            _to_float(
+                alert_strategy.get("startup_alert_min_score"),
+                strategy_defaults.get("startup_alert_min_score", 45.0),
+            ),
+        ),
     )
     alert_strategy["require_confirmation_for_actionable"] = _parse_bool(
         alert_strategy.get("require_confirmation_for_actionable"),
