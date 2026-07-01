@@ -23,6 +23,7 @@ DEFAULT_ALERT_POLICY: Dict[str, Any] = {
     "max_watch_risk": 60.0,
     "max_actionable_risk": 45.0,
     "risk_alert_score": 70.0,
+    "watchlist_tg_enabled": False,
     "watch_cooldown_minutes": 30,
     "actionable_cooldown_minutes": 60,
     "risk_cooldown_minutes": 60,
@@ -67,6 +68,8 @@ class AlertPolicy:
         alert_type = self._classify(candidate)
         if alert_type == "none":
             return AlertDecision(False, reason="below_threshold")
+        if alert_type == "watchlist_alert" and not _parse_bool(self.settings.get("watchlist_tg_enabled"), False):
+            return AlertDecision(False, alert_type=alert_type, reason="watchlist_tg_disabled")
 
         now_ts = time.time()
         if not self._global_rate_allowed(now_ts):

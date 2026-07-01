@@ -253,6 +253,7 @@
     "max_watch_risk": 60.0,
     "max_actionable_risk": 45.0,
     "risk_alert_score": 70.0,
+    "watchlist_tg_enabled": false,
     "watch_cooldown_minutes": 30,
     "actionable_cooldown_minutes": 60,
     "risk_cooldown_minutes": 60,

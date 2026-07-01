@@ -168,6 +168,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_watch_risk": 60.0,
         "max_actionable_risk": 45.0,
         "risk_alert_score": 70.0,
+        "watchlist_tg_enabled": False,
         "watch_cooldown_minutes": 30,
         "actionable_cooldown_minutes": 60,
         "risk_cooldown_minutes": 60,
@@ -943,6 +944,11 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
         )
     if os.getenv("ALERT_STRATEGY_RISK_ALERT_SCORE"):
         alert_strategy["risk_alert_score"] = _to_float(os.getenv("ALERT_STRATEGY_RISK_ALERT_SCORE"), default=70.0)
+    if os.getenv("ALERT_STRATEGY_WATCHLIST_TG_ENABLED") is not None:
+        alert_strategy["watchlist_tg_enabled"] = _parse_bool(
+            os.getenv("ALERT_STRATEGY_WATCHLIST_TG_ENABLED"),
+            default=False,
+        )
     if os.getenv("ALERT_STRATEGY_CANDIDATE_TTL_MINUTES"):
         alert_strategy["candidate_ttl_minutes"] = _to_int(
             os.getenv("ALERT_STRATEGY_CANDIDATE_TTL_MINUTES"),
@@ -1420,6 +1426,10 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     alert_strategy["risk_alert_score"] = max(
         0.0,
         min(100.0, _to_float(alert_strategy.get("risk_alert_score"), strategy_defaults["risk_alert_score"])),
+    )
+    alert_strategy["watchlist_tg_enabled"] = _parse_bool(
+        alert_strategy.get("watchlist_tg_enabled"),
+        default=bool(strategy_defaults.get("watchlist_tg_enabled", False)),
     )
     alert_strategy["watch_cooldown_minutes"] = max(
         1,
