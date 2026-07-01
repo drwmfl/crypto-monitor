@@ -106,18 +106,22 @@ class AlertStrategyPipeline:
             dedupe_decision = None
             decision = AlertDecision(False, alert_type="startup_alert", reason=startup_reason)
             if startup_allowed:
-                decision = self.policy.allow_alert_type(
-                    candidate.symbol,
-                    "startup_alert",
-                    cooldown_minutes=self._startup_cooldown_minutes(),
-                )
-                if decision.should_send:
-                    dedupe_decision = self.event_deduper.decide(candidate, alert_type="startup_alert")
-                    if dedupe_decision.should_send:
-                        alert_sent = await self._send_decision(notifier=notifier, candidate=candidate, decision=decision)
-                        if alert_sent:
-                            self.event_deduper.mark_sent(candidate, alert_type="startup_alert")
-                            self.policy.mark_sent(candidate.symbol, "startup_alert")
+                suppressed, suppress_reason = self._startup_suppressed_by_primary_alert(candidate)
+                if suppressed:
+                    decision = AlertDecision(False, alert_type="startup_alert", reason=suppress_reason)
+                else:
+                    decision = self.policy.allow_alert_type(
+                        candidate.symbol,
+                        "startup_alert",
+                        cooldown_minutes=self._startup_cooldown_minutes(),
+                    )
+                    if decision.should_send:
+                        dedupe_decision = self.event_deduper.decide(candidate, alert_type="startup_alert")
+                        if dedupe_decision.should_send:
+                            alert_sent = await self._send_decision(notifier=notifier, candidate=candidate, decision=decision)
+                            if alert_sent:
+                                self.event_deduper.mark_sent(candidate, alert_type="startup_alert")
+                                self.policy.mark_sent(candidate.symbol, "startup_alert")
             logger.info(
                 "Startup alert processed: symbol=%s score=%.1f risk=%.1f confirm=%s stage=%s sent=%s reason=%s dedupe=%s",
                 candidate.symbol,
@@ -272,6 +276,40 @@ class AlertStrategyPipeline:
 
     def _startup_cooldown_minutes(self) -> int:
         return max(1, _to_int(self.settings.get("startup_cooldown_minutes"), 45))
+
+    def _startup_suppressed_by_primary_alert(self, candidate: Any) -> tuple[bool, str]:
+        if not _parse_bool(self.settings.get("startup_suppress_after_primary_alert_enabled"), True):
+            return False, "accepted"
+
+        within_minutes = max(
+            1.0,
+            _to_float(self.settings.get("startup_suppress_after_primary_alert_minutes"), 15.0),
+        )
+        primary_types = self._startup_primary_alert_types()
+        recent_type = self.policy.recently_sent_any(
+            candidate.symbol,
+            primary_types,
+            within_minutes=within_minutes,
+        )
+        if recent_type:
+            return True, f"startup_suppressed_by_primary_alert:{recent_type}"
+        return False, "accepted"
+
+    def _startup_primary_alert_types(self) -> list[str]:
+        raw_types = self.settings.get("startup_suppress_after_primary_alert_types", ["actionable_alert", "risk_alert"])
+        if isinstance(raw_types, str):
+            items = raw_types.split(",")
+        elif isinstance(raw_types, list):
+            items = raw_types
+        else:
+            items = ["actionable_alert", "risk_alert"]
+
+        normalized: list[str] = []
+        for item in items:
+            alert_type = str(item or "").strip()
+            if alert_type in {"actionable_alert", "risk_alert"} and alert_type not in normalized:
+                normalized.append(alert_type)
+        return normalized or ["actionable_alert", "risk_alert"]
 
     def _is_strong_direct_event(self, payload: Dict[str, Any]) -> bool:
         if not _parse_bool(self.settings.get("strong_direct_enabled"), True):

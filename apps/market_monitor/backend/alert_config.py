@@ -197,6 +197,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "strong_direct_down_min_confirmations": 3,
         "startup_alert_enabled": True,
         "startup_alert_min_score": 45.0,
+        "startup_suppress_after_primary_alert_enabled": True,
+        "startup_suppress_after_primary_alert_minutes": 15,
+        "startup_suppress_after_primary_alert_types": ["actionable_alert", "risk_alert"],
         "require_confirmation_for_actionable": True,
         "min_actionable_confirmations": 3,
         "trade_confirmation_enabled": True,
@@ -1044,6 +1047,20 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
             os.getenv("ALERT_STRATEGY_STARTUP_COOLDOWN_MINUTES"),
             default=45,
         )
+    if os.getenv("ALERT_STRATEGY_STARTUP_SUPPRESS_AFTER_PRIMARY_ALERT_ENABLED") is not None:
+        alert_strategy["startup_suppress_after_primary_alert_enabled"] = _parse_bool(
+            os.getenv("ALERT_STRATEGY_STARTUP_SUPPRESS_AFTER_PRIMARY_ALERT_ENABLED"),
+            default=True,
+        )
+    if os.getenv("ALERT_STRATEGY_STARTUP_SUPPRESS_AFTER_PRIMARY_ALERT_MINUTES"):
+        alert_strategy["startup_suppress_after_primary_alert_minutes"] = _to_int(
+            os.getenv("ALERT_STRATEGY_STARTUP_SUPPRESS_AFTER_PRIMARY_ALERT_MINUTES"),
+            default=15,
+        )
+    if os.getenv("ALERT_STRATEGY_STARTUP_SUPPRESS_AFTER_PRIMARY_ALERT_TYPES"):
+        alert_strategy["startup_suppress_after_primary_alert_types"] = _parse_csv_list(
+            os.getenv("ALERT_STRATEGY_STARTUP_SUPPRESS_AFTER_PRIMARY_ALERT_TYPES", "")
+        )
     if os.getenv("ALERT_STRATEGY_REQUIRE_CONFIRMATION_FOR_ACTIONABLE") is not None:
         alert_strategy["require_confirmation_for_actionable"] = _parse_bool(
             os.getenv("ALERT_STRATEGY_REQUIRE_CONFIRMATION_FOR_ACTIONABLE"),
@@ -1566,6 +1583,30 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
             ),
         ),
     )
+    alert_strategy["startup_suppress_after_primary_alert_enabled"] = _parse_bool(
+        alert_strategy.get("startup_suppress_after_primary_alert_enabled"),
+        default=bool(strategy_defaults.get("startup_suppress_after_primary_alert_enabled", True)),
+    )
+    alert_strategy["startup_suppress_after_primary_alert_minutes"] = max(
+        1,
+        _to_int(
+            alert_strategy.get("startup_suppress_after_primary_alert_minutes"),
+            strategy_defaults.get("startup_suppress_after_primary_alert_minutes", 15),
+        ),
+    )
+    primary_types = alert_strategy.get("startup_suppress_after_primary_alert_types")
+    if isinstance(primary_types, str):
+        primary_types = _parse_csv_list(primary_types)
+    if not isinstance(primary_types, list):
+        primary_types = strategy_defaults.get("startup_suppress_after_primary_alert_types", [])
+    normalized_primary_types: List[str] = []
+    for item in primary_types:
+        alert_type = str(item or "").strip()
+        if alert_type in {"actionable_alert", "risk_alert"} and alert_type not in normalized_primary_types:
+            normalized_primary_types.append(alert_type)
+    if not normalized_primary_types:
+        normalized_primary_types = list(strategy_defaults.get("startup_suppress_after_primary_alert_types", []))
+    alert_strategy["startup_suppress_after_primary_alert_types"] = normalized_primary_types
     alert_strategy["require_confirmation_for_actionable"] = _parse_bool(
         alert_strategy.get("require_confirmation_for_actionable"),
         default=bool(strategy_defaults.get("require_confirmation_for_actionable", True)),

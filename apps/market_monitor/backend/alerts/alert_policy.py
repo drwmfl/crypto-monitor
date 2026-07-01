@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Iterable, Optional
 
 try:
     from alerts.trade_confirmation import confirmation_count
@@ -80,6 +80,27 @@ class AlertPolicy:
     def mark_sent(self, symbol: str, alert_type: str) -> None:
         self._mark_sent(symbol=symbol, alert_type=alert_type, now_ts=time.time())
         self._save_state()
+
+    def recently_sent_any(self, symbol: str, alert_types: Iterable[str], *, within_minutes: float) -> Optional[str]:
+        window_sec = max(0.0, _to_float(within_minutes, 0.0) * 60.0)
+        if window_sec <= 0:
+            return None
+
+        now_ts = time.time()
+        last_sent = self._state.get("last_sent", {})
+        if not isinstance(last_sent, dict):
+            return None
+
+        symbol_key = str(symbol or "").strip().upper()
+        for alert_type in alert_types:
+            type_key = str(alert_type or "").strip()
+            if not type_key:
+                continue
+            key = f"{symbol_key}:{type_key}"
+            sent_ts = _to_float(last_sent.get(key), 0.0)
+            if sent_ts > 0 and now_ts - sent_ts <= window_sec:
+                return type_key
+        return None
 
     def allow_alert_type(
         self,

@@ -286,6 +286,12 @@
     "strong_direct_down_min_confirmations": 3,
     "startup_alert_enabled": true,
     "startup_alert_min_score": 45.0,
+    "startup_suppress_after_primary_alert_enabled": true,
+    "startup_suppress_after_primary_alert_minutes": 15,
+    "startup_suppress_after_primary_alert_types": [
+      "actionable_alert",
+      "risk_alert"
+    ],
     "require_confirmation_for_actionable": true,
     "min_actionable_confirmations": 3,
     "trade_confirmation_enabled": true,
