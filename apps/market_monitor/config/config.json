@@ -359,6 +359,8 @@
         "open_interest_hist_period": "5m",
         "open_interest_hist_limit": 576,
         "taker_buy_sell_period": "5m",
+        "request_diagnostics_enabled": true,
+        "request_error_file": "factor_source_errors.jsonl",
         "oi_history": {
           "enabled": true,
           "history_file": "oi_history.json",

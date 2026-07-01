@@ -259,6 +259,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "open_interest_hist_period": "5m",
                 "open_interest_hist_limit": 576,
                 "taker_buy_sell_period": "5m",
+                "request_diagnostics_enabled": True,
+                "request_error_file": "factor_source_errors.jsonl",
                 "oi_history": {
                     "enabled": True,
                     "history_file": "oi_history.json",
@@ -1250,6 +1252,13 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
             os.getenv("ALERT_BINANCE_FETCH_TAKER_BUY_SELL"),
             default=True,
         )
+    if os.getenv("ALERT_BINANCE_REQUEST_DIAGNOSTICS_ENABLED") is not None:
+        binance_factors["request_diagnostics_enabled"] = _parse_bool(
+            os.getenv("ALERT_BINANCE_REQUEST_DIAGNOSTICS_ENABLED"),
+            default=True,
+        )
+    if os.getenv("ALERT_BINANCE_REQUEST_ERROR_FILE"):
+        binance_factors["request_error_file"] = str(os.getenv("ALERT_BINANCE_REQUEST_ERROR_FILE")).strip()
     return config
 
 
@@ -1897,6 +1906,13 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     binance_factors["taker_buy_sell_period"] = str(
         binance_factors.get("taker_buy_sell_period", binance_defaults.get("taker_buy_sell_period", "5m"))
     ).strip() or "5m"
+    binance_factors["request_diagnostics_enabled"] = _parse_bool(
+        binance_factors.get("request_diagnostics_enabled"),
+        default=bool(binance_defaults.get("request_diagnostics_enabled", True)),
+    )
+    binance_factors["request_error_file"] = str(
+        binance_factors.get("request_error_file", binance_defaults.get("request_error_file", "factor_source_errors.jsonl"))
+    ).strip() or "factor_source_errors.jsonl"
     oi_history = binance_factors.setdefault("oi_history", {})
     if not isinstance(oi_history, dict):
         oi_history = {}
