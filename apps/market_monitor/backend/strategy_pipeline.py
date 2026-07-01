@@ -314,22 +314,80 @@ class AlertStrategyPipeline:
         if window not in allowed_windows:
             return False, "strong_direct_candidate_only_window"
 
-        min_score = _to_float(self.settings.get("strong_direct_min_score"), 60.0)
+        direction = str(latest.get("direction") or "").strip().lower()
+        if direction not in {"up", "down"}:
+            return False, "strong_direct_unknown_direction"
+
+        min_score = self._strong_direct_direction_float(
+            direction,
+            suffix="min_score",
+            fallback_key="strong_direct_min_score",
+            default=60.0,
+        )
         if float(candidate.score or 0.0) < min_score:
             return False, "strong_direct_score_below_confirmed_min"
 
-        max_risk = _to_float(self.settings.get("strong_direct_max_risk"), 70.0)
+        max_risk = self._strong_direct_direction_float(
+            direction,
+            suffix="max_risk",
+            fallback_key="strong_direct_max_risk",
+            default=70.0,
+        )
         if max_risk > 0 and float(candidate.risk_score or 0.0) > max_risk:
             return False, "strong_direct_risk_above_confirmed_max"
 
-        required = max(1, _to_int(self.settings.get("trade_confirmation_min_strong_direct_confirmations"), 3))
+        max_change = self._strong_direct_direction_float(
+            direction,
+            suffix="max_change_pct",
+            fallback_key="strong_direct_max_change_pct",
+            default=0.0,
+        )
+        change_pct = abs(_to_float(latest.get("change_pct"), 0.0))
+        if max_change > 0 and change_pct >= max_change:
+            return False, "strong_direct_change_above_direction_max"
+
+        required = max(
+            1,
+            self._strong_direct_direction_int(
+                direction,
+                suffix="min_confirmations",
+                fallback_key="trade_confirmation_min_strong_direct_confirmations",
+                default=3,
+            ),
+        )
         if confirmation_count(candidate) < required:
             return False, "strong_direct_confirmation_pending"
 
         return True, "confirmed"
 
     def _strong_direct_cooldown_minutes(self) -> int:
-        return max(1, _to_int(self.settings.get("strong_direct_cooldown_minutes"), 12))
+        return max(1, _to_int(self.settings.get("strong_direct_cooldown_minutes"), 20))
+
+    def _strong_direct_direction_float(
+        self,
+        direction: str,
+        *,
+        suffix: str,
+        fallback_key: str,
+        default: float,
+    ) -> float:
+        directional_key = f"strong_direct_{direction}_{suffix}"
+        if directional_key in self.settings:
+            return _to_float(self.settings.get(directional_key), default)
+        return _to_float(self.settings.get(fallback_key), default)
+
+    def _strong_direct_direction_int(
+        self,
+        direction: str,
+        *,
+        suffix: str,
+        fallback_key: str,
+        default: int,
+    ) -> int:
+        directional_key = f"strong_direct_{direction}_{suffix}"
+        if directional_key in self.settings:
+            return _to_int(self.settings.get(directional_key), default)
+        return _to_int(self.settings.get(fallback_key), default)
 
     async def _send_strong_direct(self, *, notifier: Any, candidate: Any) -> bool:
         detail_level = str(self.settings.get("telegram_detail_level") or "compact")

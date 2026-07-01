@@ -70,6 +70,10 @@ def format_strategy_alert(
         f"微结构: {_micro_matrix(derivatives)}",
         f"资金: {_funding_matrix(derivatives)}",
     ]
+    strong_direct_line = _strong_direct_line(latest, decision.alert_type)
+    if strong_direct_line:
+        lines.append(strong_direct_line)
+
     startup_line = _startup_line(latest, decision.alert_type)
     if startup_line:
         lines.append(startup_line)
@@ -145,6 +149,17 @@ def _startup_line(latest: Dict[str, Any], alert_type: str) -> str:
     rvol = _fmt_x(latest.get("startup_rvol"))
     breakout = _fmt_pct(latest.get("startup_breakout_distance_pct"))
     return f"启动: {window}累计 {change} | RVOL {rvol} | 距60m高点 {breakout} | 高波动仅观察"
+
+
+def _strong_direct_line(latest: Dict[str, Any], alert_type: str) -> str:
+    if alert_type != "strong_direct_alert":
+        return ""
+    direction = str(latest.get("direction") or "").strip().lower()
+    if direction == "down":
+        return "提示: 急速下杀/风险释放，偏短线观察；非做多入场信号"
+    if direction == "up":
+        return "提示: 急速拉升已过滤过热，仍属短线波动雷达；不建议无脑追涨"
+    return "提示: 急速波动，仅观察，不代表入场"
 
 
 def _accumulation_status_label(status: Any) -> str:

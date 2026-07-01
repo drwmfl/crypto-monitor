@@ -183,9 +183,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "1m": 4.0,
             "5m": 6.0,
         },
-        "strong_direct_cooldown_minutes": 12,
+        "strong_direct_cooldown_minutes": 20,
         "strong_direct_min_score": 60.0,
         "strong_direct_max_risk": 70.0,
+        "strong_direct_max_change_pct": 0.0,
+        "strong_direct_up_min_score": 65.0,
+        "strong_direct_up_max_risk": 65.0,
+        "strong_direct_up_max_change_pct": 8.0,
+        "strong_direct_up_min_confirmations": 4,
+        "strong_direct_down_min_score": 60.0,
+        "strong_direct_down_max_risk": 70.0,
+        "strong_direct_down_max_change_pct": 8.0,
+        "strong_direct_down_min_confirmations": 3,
         "startup_alert_enabled": True,
         "startup_alert_min_score": 45.0,
         "require_confirmation_for_actionable": True,
@@ -977,7 +986,7 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
     if os.getenv("ALERT_STRATEGY_STRONG_DIRECT_COOLDOWN_MINUTES"):
         alert_strategy["strong_direct_cooldown_minutes"] = _to_int(
             os.getenv("ALERT_STRATEGY_STRONG_DIRECT_COOLDOWN_MINUTES"),
-            default=12,
+            default=20,
         )
     if os.getenv("ALERT_STRATEGY_STRONG_DIRECT_MIN_SCORE"):
         alert_strategy["strong_direct_min_score"] = _to_float(
@@ -989,6 +998,37 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
             os.getenv("ALERT_STRATEGY_STRONG_DIRECT_MAX_RISK"),
             default=70.0,
         )
+    if os.getenv("ALERT_STRATEGY_STRONG_DIRECT_MAX_CHANGE_PCT"):
+        alert_strategy["strong_direct_max_change_pct"] = _to_float(
+            os.getenv("ALERT_STRATEGY_STRONG_DIRECT_MAX_CHANGE_PCT"),
+            default=0.0,
+        )
+    for direction, default_min_score, default_max_risk, default_max_change, default_confirmations in (
+        ("UP", 65.0, 65.0, 8.0, 4),
+        ("DOWN", 60.0, 70.0, 8.0, 3),
+    ):
+        key_prefix = f"ALERT_STRATEGY_STRONG_DIRECT_{direction}"
+        setting_prefix = f"strong_direct_{direction.lower()}"
+        if os.getenv(f"{key_prefix}_MIN_SCORE"):
+            alert_strategy[f"{setting_prefix}_min_score"] = _to_float(
+                os.getenv(f"{key_prefix}_MIN_SCORE"),
+                default=default_min_score,
+            )
+        if os.getenv(f"{key_prefix}_MAX_RISK"):
+            alert_strategy[f"{setting_prefix}_max_risk"] = _to_float(
+                os.getenv(f"{key_prefix}_MAX_RISK"),
+                default=default_max_risk,
+            )
+        if os.getenv(f"{key_prefix}_MAX_CHANGE_PCT"):
+            alert_strategy[f"{setting_prefix}_max_change_pct"] = _to_float(
+                os.getenv(f"{key_prefix}_MAX_CHANGE_PCT"),
+                default=default_max_change,
+            )
+        if os.getenv(f"{key_prefix}_MIN_CONFIRMATIONS"):
+            alert_strategy[f"{setting_prefix}_min_confirmations"] = _to_int(
+                os.getenv(f"{key_prefix}_MIN_CONFIRMATIONS"),
+                default=default_confirmations,
+            )
     if os.getenv("ALERT_STRATEGY_STARTUP_ALERT_ENABLED") is not None:
         alert_strategy["startup_alert_enabled"] = _parse_bool(
             os.getenv("ALERT_STRATEGY_STARTUP_ALERT_ENABLED"),
@@ -1461,7 +1501,7 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         1,
         _to_int(
             alert_strategy.get("strong_direct_cooldown_minutes"),
-            default=_to_int(strategy_defaults.get("strong_direct_cooldown_minutes"), default=12),
+            default=_to_int(strategy_defaults.get("strong_direct_cooldown_minutes"), default=20),
         ),
     )
     alert_strategy["strong_direct_min_score"] = max(
@@ -1472,6 +1512,46 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         0.0,
         min(100.0, _to_float(alert_strategy.get("strong_direct_max_risk"), strategy_defaults.get("strong_direct_max_risk", 70.0))),
     )
+    alert_strategy["strong_direct_max_change_pct"] = max(
+        0.0,
+        _to_float(
+            alert_strategy.get("strong_direct_max_change_pct"),
+            strategy_defaults.get("strong_direct_max_change_pct", 0.0),
+        ),
+    )
+    for direction in ("up", "down"):
+        default_min_score = strategy_defaults.get(f"strong_direct_{direction}_min_score", alert_strategy["strong_direct_min_score"])
+        default_max_risk = strategy_defaults.get(f"strong_direct_{direction}_max_risk", alert_strategy["strong_direct_max_risk"])
+        default_max_change = strategy_defaults.get(
+            f"strong_direct_{direction}_max_change_pct",
+            alert_strategy["strong_direct_max_change_pct"],
+        )
+        default_min_confirmations = strategy_defaults.get(
+            f"strong_direct_{direction}_min_confirmations",
+            strategy_defaults.get("trade_confirmation_min_strong_direct_confirmations", 3),
+        )
+        alert_strategy[f"strong_direct_{direction}_min_score"] = max(
+            0.0,
+            min(
+                100.0,
+                _to_float(alert_strategy.get(f"strong_direct_{direction}_min_score"), default_min_score),
+            ),
+        )
+        alert_strategy[f"strong_direct_{direction}_max_risk"] = max(
+            0.0,
+            min(
+                100.0,
+                _to_float(alert_strategy.get(f"strong_direct_{direction}_max_risk"), default_max_risk),
+            ),
+        )
+        alert_strategy[f"strong_direct_{direction}_max_change_pct"] = max(
+            0.0,
+            _to_float(alert_strategy.get(f"strong_direct_{direction}_max_change_pct"), default_max_change),
+        )
+        alert_strategy[f"strong_direct_{direction}_min_confirmations"] = max(
+            1,
+            _to_int(alert_strategy.get(f"strong_direct_{direction}_min_confirmations"), default_min_confirmations),
+        )
     alert_strategy["startup_alert_enabled"] = _parse_bool(
         alert_strategy.get("startup_alert_enabled"),
         default=bool(strategy_defaults.get("startup_alert_enabled", True)),
