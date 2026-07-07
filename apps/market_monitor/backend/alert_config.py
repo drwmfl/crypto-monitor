@@ -181,6 +181,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "actionable_require_factor_completeness": True,
         "actionable_min_factor_completeness_pct": 50.0,
         "actionable_required_factor_groups_any": ["oi", "micro"],
+        "actionable_edge_filter_enabled": True,
+        "actionable_strong_score": 85.0,
+        "actionable_edge_min_confirmations": 4,
+        "actionable_edge_min_factor_completeness_pct": 80.0,
+        "actionable_edge_required_factor_groups_all": ["oi", "micro"],
+        "actionable_edge_min_micro_signal_level": "L1",
+        "actionable_edge_reject_micro_regimes": ["churn"],
+        "actionable_edge_required_confirmation_keys_any": ["flow", "orderbook"],
         "factor_retry_enabled": True,
         "factor_retry_delay_sec": 4.0,
         "factor_retry_min_completeness_pct": 80.0,
@@ -1021,6 +1029,42 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
         alert_strategy["actionable_required_factor_groups_any"] = _parse_csv_list(
             os.getenv("ALERT_STRATEGY_ACTIONABLE_REQUIRED_FACTOR_GROUPS_ANY", "")
         )
+    if os.getenv("ALERT_STRATEGY_ACTIONABLE_EDGE_FILTER_ENABLED") is not None:
+        alert_strategy["actionable_edge_filter_enabled"] = _parse_bool(
+            os.getenv("ALERT_STRATEGY_ACTIONABLE_EDGE_FILTER_ENABLED"),
+            default=True,
+        )
+    if os.getenv("ALERT_STRATEGY_ACTIONABLE_STRONG_SCORE"):
+        alert_strategy["actionable_strong_score"] = _to_float(
+            os.getenv("ALERT_STRATEGY_ACTIONABLE_STRONG_SCORE"),
+            default=85.0,
+        )
+    if os.getenv("ALERT_STRATEGY_ACTIONABLE_EDGE_MIN_CONFIRMATIONS"):
+        alert_strategy["actionable_edge_min_confirmations"] = _to_int(
+            os.getenv("ALERT_STRATEGY_ACTIONABLE_EDGE_MIN_CONFIRMATIONS"),
+            default=4,
+        )
+    if os.getenv("ALERT_STRATEGY_ACTIONABLE_EDGE_MIN_FACTOR_COMPLETENESS_PCT"):
+        alert_strategy["actionable_edge_min_factor_completeness_pct"] = _to_float(
+            os.getenv("ALERT_STRATEGY_ACTIONABLE_EDGE_MIN_FACTOR_COMPLETENESS_PCT"),
+            default=80.0,
+        )
+    if os.getenv("ALERT_STRATEGY_ACTIONABLE_EDGE_REQUIRED_FACTOR_GROUPS_ALL"):
+        alert_strategy["actionable_edge_required_factor_groups_all"] = _parse_csv_list(
+            os.getenv("ALERT_STRATEGY_ACTIONABLE_EDGE_REQUIRED_FACTOR_GROUPS_ALL", "")
+        )
+    if os.getenv("ALERT_STRATEGY_ACTIONABLE_EDGE_MIN_MICRO_SIGNAL_LEVEL"):
+        alert_strategy["actionable_edge_min_micro_signal_level"] = str(
+            os.getenv("ALERT_STRATEGY_ACTIONABLE_EDGE_MIN_MICRO_SIGNAL_LEVEL")
+        ).strip().upper()
+    if os.getenv("ALERT_STRATEGY_ACTIONABLE_EDGE_REJECT_MICRO_REGIMES"):
+        alert_strategy["actionable_edge_reject_micro_regimes"] = _parse_csv_list(
+            os.getenv("ALERT_STRATEGY_ACTIONABLE_EDGE_REJECT_MICRO_REGIMES", "")
+        )
+    if os.getenv("ALERT_STRATEGY_ACTIONABLE_EDGE_REQUIRED_CONFIRMATION_KEYS_ANY"):
+        alert_strategy["actionable_edge_required_confirmation_keys_any"] = _parse_csv_list(
+            os.getenv("ALERT_STRATEGY_ACTIONABLE_EDGE_REQUIRED_CONFIRMATION_KEYS_ANY", "")
+        )
     if os.getenv("ALERT_STRATEGY_FACTOR_QUALITY_FILE"):
         alert_strategy["factor_quality_file"] = str(os.getenv("ALERT_STRATEGY_FACTOR_QUALITY_FILE")).strip()
     if os.getenv("ALERT_STRATEGY_FACTOR_RETRY_ENABLED") is not None:
@@ -1622,6 +1666,74 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         alert_strategy.get("actionable_required_factor_groups_any"),
         strategy_defaults.get("actionable_required_factor_groups_any", ["oi", "micro"]),
     )
+    alert_strategy["actionable_edge_filter_enabled"] = _parse_bool(
+        alert_strategy.get("actionable_edge_filter_enabled"),
+        default=bool(strategy_defaults.get("actionable_edge_filter_enabled", True)),
+    )
+    alert_strategy["actionable_strong_score"] = max(
+        alert_strategy["min_actionable_score"],
+        min(
+            100.0,
+            _to_float(
+                alert_strategy.get("actionable_strong_score"),
+                strategy_defaults.get("actionable_strong_score", 85.0),
+            ),
+        ),
+    )
+    alert_strategy["actionable_edge_min_confirmations"] = max(
+        _to_int(
+            alert_strategy.get("min_actionable_confirmations"),
+            strategy_defaults.get("min_actionable_confirmations", 3),
+        ),
+        _to_int(
+            alert_strategy.get("actionable_edge_min_confirmations"),
+            strategy_defaults.get("actionable_edge_min_confirmations", 4),
+        ),
+    )
+    alert_strategy["actionable_edge_min_factor_completeness_pct"] = max(
+        alert_strategy["actionable_min_factor_completeness_pct"],
+        min(
+            100.0,
+            _to_float(
+                alert_strategy.get("actionable_edge_min_factor_completeness_pct"),
+                strategy_defaults.get("actionable_edge_min_factor_completeness_pct", 80.0),
+            ),
+        ),
+    )
+    alert_strategy["actionable_edge_required_factor_groups_all"] = _normalize_factor_group_list(
+        alert_strategy.get("actionable_edge_required_factor_groups_all"),
+        strategy_defaults.get("actionable_edge_required_factor_groups_all", ["oi", "micro"]),
+    )
+    edge_micro_level = str(
+        alert_strategy.get(
+            "actionable_edge_min_micro_signal_level",
+            strategy_defaults.get("actionable_edge_min_micro_signal_level", "L1"),
+        )
+    ).strip().upper()
+    if edge_micro_level not in {"L0", "L1", "L2", "L3", "NONE"}:
+        edge_micro_level = "L1"
+    alert_strategy["actionable_edge_min_micro_signal_level"] = edge_micro_level
+    edge_reject_regimes = alert_strategy.get("actionable_edge_reject_micro_regimes")
+    if isinstance(edge_reject_regimes, str):
+        edge_reject_regimes = _parse_csv_list(edge_reject_regimes)
+    if not isinstance(edge_reject_regimes, list):
+        edge_reject_regimes = strategy_defaults.get("actionable_edge_reject_micro_regimes", ["churn"])
+    alert_strategy["actionable_edge_reject_micro_regimes"] = [
+        str(item).strip().lower()
+        for item in edge_reject_regimes
+        if str(item).strip()
+    ]
+    edge_required_checks = alert_strategy.get("actionable_edge_required_confirmation_keys_any")
+    if isinstance(edge_required_checks, str):
+        edge_required_checks = _parse_csv_list(edge_required_checks)
+    if not isinstance(edge_required_checks, list):
+        edge_required_checks = strategy_defaults.get("actionable_edge_required_confirmation_keys_any", ["flow", "orderbook"])
+    allowed_confirmation_keys = {"price_persistence", "oi", "flow", "orderbook", "liquidation"}
+    alert_strategy["actionable_edge_required_confirmation_keys_any"] = [
+        str(item).strip()
+        for item in edge_required_checks
+        if str(item).strip() in allowed_confirmation_keys
+    ]
     alert_strategy["factor_retry_enabled"] = _parse_bool(
         alert_strategy.get("factor_retry_enabled"),
         default=bool(strategy_defaults.get("factor_retry_enabled", True)),

@@ -269,6 +269,22 @@
       "oi",
       "micro"
     ],
+    "actionable_edge_filter_enabled": true,
+    "actionable_strong_score": 85.0,
+    "actionable_edge_min_confirmations": 4,
+    "actionable_edge_min_factor_completeness_pct": 80.0,
+    "actionable_edge_required_factor_groups_all": [
+      "oi",
+      "micro"
+    ],
+    "actionable_edge_min_micro_signal_level": "L1",
+    "actionable_edge_reject_micro_regimes": [
+      "churn"
+    ],
+    "actionable_edge_required_confirmation_keys_any": [
+      "flow",
+      "orderbook"
+    ],
     "factor_retry_enabled": true,
     "factor_retry_delay_sec": 4.0,
     "factor_retry_min_completeness_pct": 80.0,
