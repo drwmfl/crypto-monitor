@@ -248,6 +248,7 @@
     "candidate_file": "candidates.json",
     "policy_state_file": "alert_policy_state.json",
     "factor_quality_file": "factor_quality.jsonl",
+    "actionable_policy_shadow_file": "actionable_policy_shadow.jsonl",
     "candidate_ttl_minutes": 120,
     "min_watch_score": 50.0,
     "min_actionable_score": 75.0,
@@ -271,7 +272,7 @@
     ],
     "actionable_edge_filter_enabled": true,
     "actionable_strong_score": 85.0,
-    "actionable_edge_min_confirmations": 4,
+    "actionable_edge_min_confirmations": 3,
     "actionable_edge_min_factor_completeness_pct": 80.0,
     "actionable_edge_required_factor_groups_all": [
       "oi",
@@ -285,6 +286,9 @@
       "flow",
       "orderbook"
     ],
+    "actionable_policy_shadow_enabled": true,
+    "actionable_policy_version": "edge3-shadow-v1",
+    "actionable_shadow_legacy_edge_min_confirmations": 4,
     "factor_retry_enabled": true,
     "factor_retry_delay_sec": 4.0,
     "factor_retry_min_completeness_pct": 80.0,

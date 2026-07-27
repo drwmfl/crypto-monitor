@@ -37,12 +37,14 @@ DEFAULT_ALERT_POLICY: Dict[str, Any] = {
     "actionable_required_factor_groups_any": ["oi", "micro"],
     "actionable_edge_filter_enabled": True,
     "actionable_strong_score": 85.0,
-    "actionable_edge_min_confirmations": 4,
+    "actionable_edge_min_confirmations": 3,
     "actionable_edge_min_factor_completeness_pct": 80.0,
     "actionable_edge_required_factor_groups_all": ["oi", "micro"],
     "actionable_edge_min_micro_signal_level": "L1",
     "actionable_edge_reject_micro_regimes": ["churn"],
     "actionable_edge_required_confirmation_keys_any": ["flow", "orderbook"],
+    "actionable_policy_version": "edge3-shadow-v1",
+    "actionable_shadow_legacy_edge_min_confirmations": 4,
     "require_confirmation_for_actionable": True,
     "min_actionable_confirmations": 3,
 }
@@ -203,8 +205,84 @@ class AlertPolicy:
         return "none"
 
     def _actionable_edge_filter_passed(self, candidate: Candidate) -> bool:
+        return not self._actionable_edge_filter_failures(candidate)
+
+    def evaluate_actionable_shadow(self, candidate: Candidate) -> Dict[str, Any]:
+        score = float(candidate.score or 0.0)
+        risk = float(candidate.risk_score or 0.0)
+        min_score = _to_float(self.settings.get("min_actionable_score"), 75.0)
+        max_risk = _to_float(self.settings.get("max_actionable_risk"), 45.0)
+        tracked = score >= min_score and risk <= max_risk
+
+        base_failures = self._actionable_base_failures(candidate)
+        current_edge_min = max(1, _to_int(self.settings.get("actionable_edge_min_confirmations"), 3))
+        legacy_edge_min = max(
+            current_edge_min,
+            _to_int(self.settings.get("actionable_shadow_legacy_edge_min_confirmations"), 4),
+        )
+        current_failures = base_failures + self._actionable_edge_filter_failures(
+            candidate,
+            min_confirmations=current_edge_min,
+        )
+        legacy_failures = base_failures + self._actionable_edge_filter_failures(
+            candidate,
+            min_confirmations=legacy_edge_min,
+        )
+        current_passed = not current_failures
+        legacy_passed = not legacy_failures
+
+        if not tracked:
+            cohort = "out_of_scope"
+        elif current_passed and legacy_passed:
+            cohort = "core"
+        elif current_passed:
+            cohort = "expanded"
+        else:
+            cohort = "rejected"
+
+        return {
+            "tracked": tracked,
+            "policy_version": str(self.settings.get("actionable_policy_version") or "edge3-shadow-v1"),
+            "cohort": cohort,
+            "current_passed": current_passed,
+            "legacy_passed": legacy_passed,
+            "current_failures": _dedupe_strings(current_failures),
+            "legacy_failures": _dedupe_strings(legacy_failures),
+            "current_edge_min_confirmations": current_edge_min,
+            "legacy_edge_min_confirmations": legacy_edge_min,
+        }
+
+    def _actionable_base_failures(self, candidate: Candidate) -> list[str]:
+        failures: list[str] = []
+        score = float(candidate.score or 0.0)
+        risk = float(candidate.risk_score or 0.0)
+        if score < _to_float(self.settings.get("min_actionable_score"), 75.0):
+            failures.append("score_below_actionable_min")
+        if risk > _to_float(self.settings.get("max_actionable_risk"), 45.0):
+            failures.append("risk_above_actionable_max")
+
+        if _parse_bool(self.settings.get("require_oi_for_actionable"), True):
+            required_rank = _oi_signal_rank(str(self.settings.get("min_actionable_oi_signal_level") or "L2"))
+            if _candidate_oi_signal_rank(candidate) < required_rank:
+                failures.append("oi_signal_below_actionable_min")
+
+        if _parse_bool(self.settings.get("require_confirmation_for_actionable"), True):
+            required = max(1, _to_int(self.settings.get("min_actionable_confirmations"), 3))
+            if confirmation_count(candidate) < required:
+                failures.append("confirmation_below_actionable_min")
+
+        if not self._actionable_factor_complete(candidate):
+            failures.append("actionable_factor_incomplete")
+        return failures
+
+    def _actionable_edge_filter_failures(
+        self,
+        candidate: Candidate,
+        *,
+        min_confirmations: Optional[int] = None,
+    ) -> list[str]:
         if not _parse_bool(self.settings.get("actionable_edge_filter_enabled"), True):
-            return True
+            return []
 
         score = float(candidate.score or 0.0)
         strong_score = max(
@@ -212,41 +290,47 @@ class AlertPolicy:
             _to_float(self.settings.get("actionable_strong_score"), 85.0),
         )
         if score >= strong_score:
-            return True
+            return []
 
-        min_confirmations = max(1, _to_int(self.settings.get("actionable_edge_min_confirmations"), 4))
-        if confirmation_count(candidate) < min_confirmations:
-            return False
+        required_confirmations = max(
+            1,
+            min_confirmations
+            if min_confirmations is not None
+            else _to_int(self.settings.get("actionable_edge_min_confirmations"), 3),
+        )
+        failures: list[str] = []
+        if confirmation_count(candidate) < required_confirmations:
+            failures.append("confirmation_below_edge_min")
 
         if self._factor_completeness_pct(candidate) < _to_float(
             self.settings.get("actionable_edge_min_factor_completeness_pct"),
             80.0,
         ):
-            return False
+            failures.append("factor_completeness_below_edge_min")
 
         if not self._factor_groups_all_available(
             candidate,
             self.settings.get("actionable_edge_required_factor_groups_all", ["oi", "micro"]),
         ):
-            return False
+            failures.append("required_edge_factor_group_missing")
 
         min_micro_rank = _micro_signal_rank(str(self.settings.get("actionable_edge_min_micro_signal_level") or "L1"))
         derivatives = candidate.derivatives or {}
         if _micro_signal_rank(str(derivatives.get("micro_signal_level") or "none")) < min_micro_rank:
-            return False
+            failures.append("micro_signal_below_edge_min")
 
         rejected_regimes = self._csv_or_list(self.settings.get("actionable_edge_reject_micro_regimes", ["churn"]))
         micro_regime = str(derivatives.get("micro_regime") or "").strip().lower()
         if micro_regime and micro_regime in {item.lower() for item in rejected_regimes}:
-            return False
+            failures.append("micro_regime_rejected")
 
         required_any = self._csv_or_list(
             self.settings.get("actionable_edge_required_confirmation_keys_any", ["flow", "orderbook"])
         )
         if required_any and not any(self._confirmation_check_passed(candidate, key) for key in required_any):
-            return False
+            failures.append("edge_flow_or_orderbook_not_confirmed")
 
-        return True
+        return failures
 
     def _factor_completeness_pct(self, candidate: Candidate) -> float:
         completeness = candidate.factor_snapshot.get("factor_completeness") if isinstance(candidate.factor_snapshot, dict) else {}
@@ -390,3 +474,12 @@ def _oi_signal_rank(level: str) -> int:
 def _micro_signal_rank(level: str) -> int:
     text = str(level or "").strip().upper()
     return {"L0": 0, "L1": 1, "L2": 2, "L3": 3}.get(text, -1)
+
+
+def _dedupe_strings(items: Iterable[str]) -> list[str]:
+    result: list[str] = []
+    for item in items:
+        text = str(item or "").strip()
+        if text and text not in result:
+            result.append(text)
+    return result

@@ -62,6 +62,12 @@ class AlertStrategyPipeline:
         self.factor_enricher = FactorEnricher(factor_settings)
         factor_quality_file = str(self.settings.get("factor_quality_file") or "factor_quality.jsonl").strip()
         self.factor_quality_path = self.event_store.runtime_dir / (factor_quality_file or "factor_quality.jsonl")
+        shadow_file = str(
+            self.settings.get("actionable_policy_shadow_file") or "actionable_policy_shadow.jsonl"
+        ).strip()
+        self.actionable_policy_shadow_path = self.event_store.runtime_dir / (
+            shadow_file or "actionable_policy_shadow.jsonl"
+        )
         self._prewarm_last_ts: Dict[str, float] = {}
         self._prewarm_tasks: set[asyncio.Task] = set()
 
@@ -238,6 +244,13 @@ class AlertStrategyPipeline:
                     self.event_deduper.mark_sent(candidate, alert_type=decision.alert_type)
                     self.policy.mark_sent(candidate.symbol, decision.alert_type)
 
+        self._record_actionable_policy_shadow(
+            candidate,
+            decision=decision,
+            alert_sent=alert_sent,
+            dedupe_reason=dedupe_decision.reason if dedupe_decision else "not_checked",
+        )
+
         logger.info(
             "Strategy processed: symbol=%s score=%.1f risk=%.1f confirm=%s stage=%s priority=%s decision=%s sent=%s reason=%s dedupe=%s",
             candidate.symbol,
@@ -386,6 +399,91 @@ class AlertStrategyPipeline:
                 f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
         except Exception as exc:
             logger.debug("Failed to record factor quality: symbol=%s alert_type=%s err=%s", candidate.symbol, alert_type, exc)
+
+    def _record_actionable_policy_shadow(
+        self,
+        candidate: Any,
+        *,
+        decision: AlertDecision,
+        alert_sent: bool,
+        dedupe_reason: str,
+    ) -> None:
+        if not _parse_bool(self.settings.get("actionable_policy_shadow_enabled"), True):
+            return
+
+        try:
+            shadow = self.policy.evaluate_actionable_shadow(candidate)
+            if not bool(shadow.get("tracked")):
+                return
+
+            snapshot = candidate.factor_snapshot if isinstance(candidate.factor_snapshot, dict) else {}
+            latest = candidate.latest_features if isinstance(candidate.latest_features, dict) else {}
+            derivatives = candidate.derivatives if isinstance(candidate.derivatives, dict) else {}
+            orderbook = candidate.orderbook if isinstance(candidate.orderbook, dict) else {}
+            confirmation = candidate.confirmation if isinstance(candidate.confirmation, dict) else {}
+            recent_events = candidate.recent_events if isinstance(candidate.recent_events, list) else []
+            last_event = recent_events[-1] if recent_events and isinstance(recent_events[-1], dict) else {}
+            row = {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "policy_version": shadow.get("policy_version"),
+                "symbol": candidate.symbol,
+                "base_asset": getattr(candidate, "base_asset", ""),
+                "candidate_id": candidate.candidate_id,
+                "cohort": shadow.get("cohort"),
+                "current_passed": bool(shadow.get("current_passed")),
+                "legacy_passed": bool(shadow.get("legacy_passed")),
+                "current_failures": list(shadow.get("current_failures") or []),
+                "legacy_failures": list(shadow.get("legacy_failures") or []),
+                "current_edge_min_confirmations": shadow.get("current_edge_min_confirmations"),
+                "legacy_edge_min_confirmations": shadow.get("legacy_edge_min_confirmations"),
+                "actual_decision": {
+                    "alert_type": decision.alert_type,
+                    "should_send": bool(decision.should_send),
+                    "reason": decision.reason,
+                    "dedupe_reason": dedupe_reason,
+                    "alert_sent": bool(alert_sent),
+                },
+                "score": float(candidate.score or 0.0),
+                "risk_score": float(candidate.risk_score or 0.0),
+                "priority": getattr(candidate, "priority", ""),
+                "event_count": int(candidate.event_count or 0),
+                "latest_event": {
+                    "event_id": latest.get("event_id") or last_event.get("event_id"),
+                    "event_type": latest.get("event_type") or last_event.get("event_type"),
+                    "window": latest.get("window") or last_event.get("window"),
+                    "direction": latest.get("direction") or last_event.get("direction"),
+                    "event_time": latest.get("event_time") or last_event.get("event_time"),
+                    "price": latest.get("price"),
+                    "change_pct": latest.get("change_pct") if "change_pct" in latest else last_event.get("change_pct"),
+                    "rvol": latest.get("rvol") if "rvol" in latest else last_event.get("rvol"),
+                },
+                "confirmation": {
+                    "passed_count": confirmation_count(candidate),
+                    "stage": confirmation_stage(candidate),
+                    "checks": confirmation.get("checks") if isinstance(confirmation.get("checks"), list) else [],
+                },
+                "factor_completeness": (
+                    snapshot.get("factor_completeness")
+                    if isinstance(snapshot.get("factor_completeness"), dict)
+                    else {}
+                ),
+                "factor_state": {
+                    "oi_signal_level": derivatives.get("oi_signal_level"),
+                    "oi_regime": derivatives.get("oi_regime"),
+                    "micro_signal_level": derivatives.get("micro_signal_level"),
+                    "micro_regime": derivatives.get("micro_regime"),
+                    "taker_buy_ratio": derivatives.get("taker_buy_ratio"),
+                    "buy_aggressor_ratio_1m": derivatives.get("buy_aggressor_ratio_1m"),
+                    "cvd_usdt_1m": derivatives.get("cvd_usdt_1m"),
+                    "orderbook_imbalance": orderbook.get("imbalance"),
+                    "orderbook_spread_bps": orderbook.get("spread_bps"),
+                },
+            }
+            self.actionable_policy_shadow_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.actionable_policy_shadow_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+        except Exception as exc:
+            logger.debug("Failed to record actionable policy shadow: symbol=%s err=%s", candidate.symbol, exc)
 
     def _schedule_hot_pool_prewarm(self, candidate: Any, *, base_score: float) -> None:
         if not _parse_bool(self.settings.get("factor_prewarm_enabled"), True):

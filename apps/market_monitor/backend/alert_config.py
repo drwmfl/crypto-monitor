@@ -163,6 +163,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "candidate_file": "candidates.json",
         "policy_state_file": "alert_policy_state.json",
         "factor_quality_file": "factor_quality.jsonl",
+        "actionable_policy_shadow_file": "actionable_policy_shadow.jsonl",
         "candidate_ttl_minutes": 120,
         "min_watch_score": 50.0,
         "min_actionable_score": 75.0,
@@ -183,12 +184,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "actionable_required_factor_groups_any": ["oi", "micro"],
         "actionable_edge_filter_enabled": True,
         "actionable_strong_score": 85.0,
-        "actionable_edge_min_confirmations": 4,
+        "actionable_edge_min_confirmations": 3,
         "actionable_edge_min_factor_completeness_pct": 80.0,
         "actionable_edge_required_factor_groups_all": ["oi", "micro"],
         "actionable_edge_min_micro_signal_level": "L1",
         "actionable_edge_reject_micro_regimes": ["churn"],
         "actionable_edge_required_confirmation_keys_any": ["flow", "orderbook"],
+        "actionable_policy_shadow_enabled": True,
+        "actionable_policy_version": "edge3-shadow-v1",
+        "actionable_shadow_legacy_edge_min_confirmations": 4,
         "factor_retry_enabled": True,
         "factor_retry_delay_sec": 4.0,
         "factor_retry_min_completeness_pct": 80.0,
@@ -1065,6 +1069,24 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
         alert_strategy["actionable_edge_required_confirmation_keys_any"] = _parse_csv_list(
             os.getenv("ALERT_STRATEGY_ACTIONABLE_EDGE_REQUIRED_CONFIRMATION_KEYS_ANY", "")
         )
+    if os.getenv("ALERT_STRATEGY_ACTIONABLE_POLICY_SHADOW_ENABLED") is not None:
+        alert_strategy["actionable_policy_shadow_enabled"] = _parse_bool(
+            os.getenv("ALERT_STRATEGY_ACTIONABLE_POLICY_SHADOW_ENABLED"),
+            default=True,
+        )
+    if os.getenv("ALERT_STRATEGY_ACTIONABLE_POLICY_SHADOW_FILE"):
+        alert_strategy["actionable_policy_shadow_file"] = str(
+            os.getenv("ALERT_STRATEGY_ACTIONABLE_POLICY_SHADOW_FILE")
+        ).strip()
+    if os.getenv("ALERT_STRATEGY_ACTIONABLE_POLICY_VERSION"):
+        alert_strategy["actionable_policy_version"] = str(
+            os.getenv("ALERT_STRATEGY_ACTIONABLE_POLICY_VERSION")
+        ).strip()
+    if os.getenv("ALERT_STRATEGY_ACTIONABLE_SHADOW_LEGACY_EDGE_MIN_CONFIRMATIONS"):
+        alert_strategy["actionable_shadow_legacy_edge_min_confirmations"] = _to_int(
+            os.getenv("ALERT_STRATEGY_ACTIONABLE_SHADOW_LEGACY_EDGE_MIN_CONFIRMATIONS"),
+            default=4,
+        )
     if os.getenv("ALERT_STRATEGY_FACTOR_QUALITY_FILE"):
         alert_strategy["factor_quality_file"] = str(os.getenv("ALERT_STRATEGY_FACTOR_QUALITY_FILE")).strip()
     if os.getenv("ALERT_STRATEGY_FACTOR_RETRY_ENABLED") is not None:
@@ -1571,6 +1593,12 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     alert_strategy["factor_quality_file"] = str(
         alert_strategy.get("factor_quality_file", strategy_defaults["factor_quality_file"])
     ).strip() or strategy_defaults["factor_quality_file"]
+    alert_strategy["actionable_policy_shadow_file"] = str(
+        alert_strategy.get(
+            "actionable_policy_shadow_file",
+            strategy_defaults.get("actionable_policy_shadow_file", "actionable_policy_shadow.jsonl"),
+        )
+    ).strip() or "actionable_policy_shadow.jsonl"
     alert_strategy["candidate_ttl_minutes"] = max(
         1,
         _to_int(alert_strategy.get("candidate_ttl_minutes"), strategy_defaults["candidate_ttl_minutes"]),
@@ -1687,7 +1715,7 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         ),
         _to_int(
             alert_strategy.get("actionable_edge_min_confirmations"),
-            strategy_defaults.get("actionable_edge_min_confirmations", 4),
+            strategy_defaults.get("actionable_edge_min_confirmations", 3),
         ),
     )
     alert_strategy["actionable_edge_min_factor_completeness_pct"] = max(
@@ -1734,6 +1762,23 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         for item in edge_required_checks
         if str(item).strip() in allowed_confirmation_keys
     ]
+    alert_strategy["actionable_policy_shadow_enabled"] = _parse_bool(
+        alert_strategy.get("actionable_policy_shadow_enabled"),
+        default=bool(strategy_defaults.get("actionable_policy_shadow_enabled", True)),
+    )
+    alert_strategy["actionable_policy_version"] = str(
+        alert_strategy.get(
+            "actionable_policy_version",
+            strategy_defaults.get("actionable_policy_version", "edge3-shadow-v1"),
+        )
+    ).strip() or "edge3-shadow-v1"
+    alert_strategy["actionable_shadow_legacy_edge_min_confirmations"] = max(
+        alert_strategy["actionable_edge_min_confirmations"],
+        _to_int(
+            alert_strategy.get("actionable_shadow_legacy_edge_min_confirmations"),
+            strategy_defaults.get("actionable_shadow_legacy_edge_min_confirmations", 4),
+        ),
+    )
     alert_strategy["factor_retry_enabled"] = _parse_bool(
         alert_strategy.get("factor_retry_enabled"),
         default=bool(strategy_defaults.get("factor_retry_enabled", True)),
