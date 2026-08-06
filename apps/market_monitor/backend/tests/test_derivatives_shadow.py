@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 try:
     from alert_config import load_config
@@ -27,7 +29,10 @@ except ModuleNotFoundError:
 
 class OIShadowTests(unittest.TestCase):
     def test_amount_change_is_not_polluted_by_price_notional(self) -> None:
-        with tempfile.TemporaryDirectory() as runtime_dir:
+        with tempfile.TemporaryDirectory() as runtime_dir, patch.dict(
+            os.environ,
+            {"ALERT_STRATEGY_RUNTIME_DIR": runtime_dir},
+        ):
             store = OIHistoryStore(
                 {
                     "runtime_dir": runtime_dir,
@@ -47,7 +52,10 @@ class OIShadowTests(unittest.TestCase):
             self.assertAlmostEqual(metrics["oi_amount_change_pct_5m"], 0.0)
 
     def test_turn_up_and_aligned_regime_are_detected(self) -> None:
-        with tempfile.TemporaryDirectory() as runtime_dir:
+        with tempfile.TemporaryDirectory() as runtime_dir, patch.dict(
+            os.environ,
+            {"ALERT_STRATEGY_RUNTIME_DIR": runtime_dir},
+        ):
             store = OIHistoryStore(
                 {
                     "runtime_dir": runtime_dir,
@@ -76,7 +84,10 @@ class OIShadowTests(unittest.TestCase):
 
 class DerivativesHistoryTests(unittest.TestCase):
     def test_basis_and_funding_windows_are_computed(self) -> None:
-        with tempfile.TemporaryDirectory() as runtime_dir:
+        with tempfile.TemporaryDirectory() as runtime_dir, patch.dict(
+            os.environ,
+            {"ALERT_STRATEGY_RUNTIME_DIR": runtime_dir},
+        ):
             store = DerivativesHistoryStore(
                 {
                     "runtime_dir": runtime_dir,
@@ -140,7 +151,10 @@ class DerivativesHistoryTests(unittest.TestCase):
 
 class RecorderAndCompatibilityTests(unittest.TestCase):
     def test_recorder_marks_review_ready_without_changing_scores(self) -> None:
-        with tempfile.TemporaryDirectory() as runtime_dir:
+        with tempfile.TemporaryDirectory() as runtime_dir, patch.dict(
+            os.environ,
+            {"ALERT_STRATEGY_RUNTIME_DIR": runtime_dir},
+        ):
             recorder = DerivativesShadowRecorder(
                 {
                     "runtime_dir": runtime_dir,
