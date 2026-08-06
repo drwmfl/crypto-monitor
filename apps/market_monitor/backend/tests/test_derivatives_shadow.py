@@ -162,6 +162,10 @@ class RecorderAndCompatibilityTests(unittest.TestCase):
                     "derivatives_shadow_review_min_first_push_samples": 2,
                 }
             )
+            initial = recorder.summary()
+            self.assertEqual(initial["valid_first_push_samples"], 0)
+            self.assertEqual(initial["review_gate"]["status"], "COLLECTING")
+            self.assertTrue(Path(runtime_dir, "derivatives_shadow_readiness.json").exists())
             row = {
                 "factor_state": {
                     "basis_bps_now": 10.0,
@@ -174,7 +178,6 @@ class RecorderAndCompatibilityTests(unittest.TestCase):
             summary = recorder.record({**row, "symbol": "BBBUSDT"}, alert_sent=True)
             self.assertEqual(summary["valid_first_push_samples"], 2)
             self.assertEqual(summary["review_gate"]["status"], "READY_FOR_REVIEW")
-            self.assertTrue(Path(runtime_dir, "derivatives_shadow_readiness.json").exists())
 
             candidate = Candidate(candidate_id="AAAUSDT", symbol="AAAUSDT", base_asset="AAA")
             candidate.latest_features = {

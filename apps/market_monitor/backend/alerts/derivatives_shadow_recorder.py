@@ -44,6 +44,13 @@ class DerivativesShadowRecorder:
             self.local_timezone = timezone.utc
         self._lock = threading.Lock()
         self._state = self._load_state()
+        if self.enabled:
+            now = datetime.now(timezone.utc)
+            if not self._state.get("started_at"):
+                self._state["started_at"] = now.isoformat()
+            self._state["updated_at"] = now.isoformat()
+            self._save_state()
+            _write_json_atomic(self.summary_path, self._build_summary(now))
 
     def record(self, row: Dict[str, Any], *, alert_sent: bool) -> Dict[str, Any]:
         if not self.enabled:
