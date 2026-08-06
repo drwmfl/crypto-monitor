@@ -121,6 +121,41 @@ class FactorEnricher:
             logger.debug("Microstructure prewarm failed: symbol=%s err=%s", candidate.symbol, exc)
             return False
 
+    async def prewarm_derivatives_shadow(self, candidate: Candidate) -> bool:
+        if not self.enabled:
+            return False
+        latest = _candidate_context(candidate)
+        return await self.binance_provider.prewarm(
+            candidate.symbol,
+            candidate.base_asset,
+            price=_safe_float(latest.get("price"), 0.0),
+            context=latest,
+        )
+
+    async def prewarm_factors(self, candidate: Candidate) -> bool:
+        if not self.enabled:
+            return False
+        latest = _candidate_context(candidate)
+        price = _safe_float(latest.get("price"), 0.0)
+        tasks = [
+            self.binance_provider.prewarm(
+                candidate.symbol,
+                candidate.base_asset,
+                price=price,
+                context=latest,
+            )
+        ]
+        if self.microstructure_provider.enabled:
+            tasks.append(
+                self.microstructure_provider.fetch(
+                    candidate.symbol,
+                    candidate.base_asset,
+                    context=_micro_context(candidate, candidate.factor_snapshot or {}),
+                )
+            )
+        results = await _gather_prewarm(tasks)
+        return any(results)
+
 
 def _merge_snapshots(left: FactorSnapshot, right: FactorSnapshot) -> FactorSnapshot:
     left.derivatives.update(right.derivatives or {})
@@ -182,6 +217,25 @@ def _annotate_factor_completeness(snapshot: Dict[str, Any]) -> None:
         "groups": groups,
         "statuses": statuses,
         "missing": missing,
+    }
+    shadow_groups = {
+        "basis": _has_any_number(
+            derivatives,
+            ("basis_bps_now", "market_basis_bps", "mark_basis_bps"),
+        ),
+        "oi_amount": _has_any_number(
+            derivatives,
+            ("oi_amount_change_pct_5m", "oi_amount_change_pct_15m", "oi_amount_change_pct_1h"),
+        ),
+        "funding_dynamic": str(derivatives.get("funding_shadow_status") or "") == "ready",
+    }
+    shadow_available = sum(1 for value in shadow_groups.values() if value)
+    snapshot["derivatives_shadow_completeness"] = {
+        "available": shadow_available,
+        "total": len(shadow_groups),
+        "pct": round(shadow_available / len(shadow_groups) * 100.0, 2),
+        "groups": shadow_groups,
+        "missing": [name for name, value in shadow_groups.items() if not value],
     }
 
 
@@ -252,6 +306,22 @@ def _microstructure_tracking(source_health: Dict[str, Any]) -> bool:
 
 def _candidate_context(candidate: Candidate) -> Dict[str, Any]:
     latest = dict(candidate.latest_features or {})
+    price_change_by_window: Dict[str, float] = {}
+    for event in candidate.recent_events or []:
+        if not isinstance(event, dict):
+            continue
+        window = str(event.get("window") or "").strip()
+        change = _safe_optional_float(event.get("change_pct"))
+        if window and change is not None:
+            price_change_by_window[window] = change
+    latest_window = str(latest.get("window") or "").strip()
+    latest_change = _safe_optional_float(latest.get("change_pct"))
+    if latest_window and latest_change is not None:
+        price_change_by_window[latest_window] = latest_change
+    change_1h = _safe_optional_float(latest.get("change_1h_pct"))
+    if change_1h is not None:
+        price_change_by_window["1h"] = change_1h
+    latest["price_change_by_window"] = price_change_by_window
     latest["event_count"] = candidate.event_count
     latest["windows"] = list(candidate.windows or [])
     latest["directions"] = dict(candidate.directions or {})
@@ -288,6 +358,30 @@ def _safe_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _safe_optional_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+async def _gather_prewarm(tasks: list[Any]) -> list[bool]:
+    import asyncio
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    normalized: list[bool] = []
+    for result in results:
+        if isinstance(result, Exception):
+            normalized.append(False)
+        elif isinstance(result, bool):
+            normalized.append(result)
+        else:
+            normalized.append(True)
+    return normalized
 
 
 def _safe_int(value: Any, default: int) -> int:

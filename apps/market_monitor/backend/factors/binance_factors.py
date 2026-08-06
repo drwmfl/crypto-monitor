@@ -15,12 +15,24 @@ except Exception:  # pragma: no cover
 
 try:
     from candidates.storage_paths import resolve_runtime_dir
+    from factors.derivatives_history import (
+        DerivativesHistoryStore,
+        classify_derivatives_shadow,
+    )
     from factors.factor_models import FactorSnapshot, recent_health_entry
-    from factors.oi_history import OIHistoryStore, classify_oi_regime
+    from factors.oi_history import OIHistoryStore, classify_oi_regime, classify_oi_regime_shadow
 except ModuleNotFoundError:
     from apps.market_monitor.backend.candidates.storage_paths import resolve_runtime_dir
+    from apps.market_monitor.backend.factors.derivatives_history import (
+        DerivativesHistoryStore,
+        classify_derivatives_shadow,
+    )
     from apps.market_monitor.backend.factors.factor_models import FactorSnapshot, recent_health_entry
-    from apps.market_monitor.backend.factors.oi_history import OIHistoryStore, classify_oi_regime
+    from apps.market_monitor.backend.factors.oi_history import (
+        OIHistoryStore,
+        classify_oi_regime,
+        classify_oi_regime_shadow,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -38,12 +50,23 @@ class BinanceFactorProvider:
         self.fetch_long_short_ratio = _parse_bool(self.settings.get("fetch_long_short_ratio"), False)
         self.fetch_taker_buy_sell = _parse_bool(self.settings.get("fetch_taker_buy_sell"), True)
         self.fetch_open_interest_hist = _parse_bool(self.settings.get("fetch_open_interest_hist"), True)
+        self.fetch_basis_history = _parse_bool(self.settings.get("fetch_basis_history"), True)
         self.fetch_orderbook = _parse_bool(self.settings.get("fetch_orderbook"), True)
         self.fetch_liquidations = _parse_bool(self.settings.get("fetch_liquidations"), False)
         self.liquidation_lookback_minutes = max(1, _safe_int(self.settings.get("liquidation_lookback_minutes"), 5))
         self.open_interest_hist_period = str(self.settings.get("open_interest_hist_period") or "5m").strip() or "5m"
         self.open_interest_hist_limit = max(2, _safe_int(self.settings.get("open_interest_hist_limit"), 576))
+        self.basis_history_period = str(self.settings.get("basis_history_period") or "5m").strip() or "5m"
+        self.basis_history_limit = max(20, min(500, _safe_int(self.settings.get("basis_history_limit"), 500)))
         self.taker_buy_sell_period = str(self.settings.get("taker_buy_sell_period") or "5m").strip() or "5m"
+        self.default_funding_interval_hours = max(
+            1.0,
+            _safe_float(self.settings.get("default_funding_interval_hours"), 8.0),
+        )
+        self.funding_info_refresh_sec = max(
+            300,
+            _safe_int(self.settings.get("funding_info_refresh_sec"), 3600),
+        )
         self.request_diagnostics_enabled = _parse_bool(self.settings.get("request_diagnostics_enabled"), True)
         request_error_file = str(self.settings.get("request_error_file") or "factor_source_errors.jsonl").strip()
         self.request_error_path = resolve_runtime_dir(self.settings) / (request_error_file or "factor_source_errors.jsonl")
@@ -52,9 +75,25 @@ class BinanceFactorProvider:
             oi_history_settings = dict(oi_history_settings)
             oi_history_settings["runtime_dir"] = self.settings.get("runtime_dir")
         self.oi_history = OIHistoryStore(oi_history_settings)
+        derivatives_history_settings = (
+            dict(self.settings.get("derivatives_history", {}) or {})
+            if isinstance(self.settings.get("derivatives_history"), dict)
+            else {}
+        )
+        if self.settings.get("runtime_dir") and not derivatives_history_settings.get("runtime_dir"):
+            derivatives_history_settings["runtime_dir"] = self.settings.get("runtime_dir")
+        self.derivatives_history = DerivativesHistoryStore(derivatives_history_settings)
         self.oi_signal_thresholds = dict(
             self.settings.get("oi_signal_thresholds") or oi_history_settings.get("signal_thresholds") or {}
         )
+        self.derivatives_shadow_thresholds = dict(
+            self.settings.get("derivatives_shadow_thresholds")
+            or derivatives_history_settings.get("signal_thresholds")
+            or {}
+        )
+        self._funding_interval_by_symbol: Dict[str, float] = {}
+        self._funding_info_loaded_at = 0.0
+        self._funding_info_lock = asyncio.Lock()
         self._proxy = (
             os.getenv("ALERT_HTTPS_PROXY")
             or os.getenv("HTTPS_PROXY")
@@ -87,7 +126,13 @@ class BinanceFactorProvider:
             or self.fetch_taker_buy_sell
             or self.fetch_open_interest_hist
         ):
-            tasks.append(self._fetch_derivatives(symbol=symbol, price=price, context=context or {}))
+            tasks.append(
+                self._fetch_derivatives(
+                    symbol=symbol,
+                    price=price,
+                    context=context or {},
+                )
+            )
         if self.fetch_orderbook:
             tasks.append(self._fetch_orderbook(symbol=symbol))
         if self.fetch_liquidations:
@@ -146,9 +191,88 @@ class BinanceFactorProvider:
                 }
             )
         snapshot.source_health["binance"] = health
+        self._annotate_derivatives_shadow(snapshot, context=context or {})
         return snapshot
 
-    async def _fetch_derivatives(self, symbol: str, price: Optional[float], context: Dict[str, Any]) -> Dict[str, Any]:
+    async def prewarm(
+        self,
+        symbol: str,
+        base_asset: str,
+        *,
+        price: Optional[float] = None,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if not self.enabled or aiohttp is None:
+            return False
+        diagnostics: list[Dict[str, Any]] = []
+        premium_payload: Dict[str, Any] = {}
+        async with self._client_session() as session:
+            if self.fetch_basis_history and self.derivatives_history.should_bootstrap_basis(symbol):
+                try:
+                    payload = await self._get_json(
+                        session,
+                        "/futures/data/basis",
+                        {
+                            "pair": symbol,
+                            "contractType": "PERPETUAL",
+                            "period": self.basis_history_period,
+                            "limit": self.basis_history_limit,
+                        },
+                        diagnostics=diagnostics,
+                        endpoint="basis_history",
+                    )
+                    if isinstance(payload, list):
+                        self.derivatives_history.merge_basis_rows(symbol, payload)
+                        self.derivatives_history.mark_basis_bootstrapped(symbol)
+                except Exception:
+                    pass
+            if self.fetch_funding:
+                try:
+                    payload = await self._get_json(
+                        session,
+                        "/fapi/v1/premiumIndex",
+                        {"symbol": symbol},
+                        diagnostics=diagnostics,
+                        endpoint="premium_index_shadow_prewarm",
+                    )
+                    if isinstance(payload, dict):
+                        premium_payload = payload
+                except Exception:
+                    pass
+            interval_hours = await self._funding_interval_hours(
+                session,
+                symbol,
+                diagnostics,
+                refresh=True,
+            )
+
+        index_price = _safe_float(premium_payload.get("indexPrice"), 0.0)
+        mark_price = _safe_float(premium_payload.get("markPrice"), 0.0)
+        mark_basis_bps = (
+            (mark_price - index_price) / index_price * 10000.0
+            if mark_price > 0 and index_price > 0
+            else None
+        )
+        funding_rate = _safe_optional_float(premium_payload.get("lastFundingRate"))
+        if mark_basis_bps is not None or funding_rate is not None:
+            self.derivatives_history.record_current(
+                symbol,
+                market_basis_bps=None,
+                mark_basis_bps=mark_basis_bps,
+                funding_rate=funding_rate,
+                funding_interval_hours=interval_hours,
+                index_price=index_price,
+                mark_price=mark_price,
+                timestamp_ms=_safe_int(premium_payload.get("time"), 0) or int(time.time() * 1000),
+            )
+        return _any_request_ok(diagnostics)
+
+    async def _fetch_derivatives(
+        self,
+        symbol: str,
+        price: Optional[float],
+        context: Dict[str, Any],
+    ) -> Dict[str, Any]:
         data: Dict[str, Any] = {"source": "binance_futures_rest", "updated_at_ms": int(time.time() * 1000)}
         diagnostics: list[Dict[str, Any]] = []
         async with self._client_session() as session:
@@ -197,6 +321,16 @@ class BinanceFactorProvider:
                     if isinstance(payload, dict):
                         data["funding_rate"] = _safe_float(payload.get("lastFundingRate"), 0.0)
                         data["mark_price"] = _safe_float(payload.get("markPrice"), 0.0)
+                        data["index_price"] = _safe_float(payload.get("indexPrice"), 0.0)
+                        data["estimated_settle_price"] = _safe_float(payload.get("estimatedSettlePrice"), 0.0)
+                        data["next_funding_time_ms"] = _safe_int(payload.get("nextFundingTime"), 0)
+                        data["premium_index_time_ms"] = _safe_int(payload.get("time"), 0)
+                        data["funding_interval_hours"] = await self._funding_interval_hours(
+                            session,
+                            symbol,
+                            diagnostics,
+                            refresh=False,
+                        )
                 except Exception as exc:
                     data["funding_error"] = str(exc)[:160]
             if self.fetch_long_short_ratio:
@@ -251,7 +385,101 @@ class BinanceFactorProvider:
         if oi_metrics:
             data.update(oi_metrics)
         data.update(classify_oi_regime(data, context=context, thresholds=self.oi_signal_thresholds))
+        data.update(classify_oi_regime_shadow(data, context=context, thresholds=self.oi_signal_thresholds))
         return {"kind": "derivatives", "data": data, "ok": _any_request_ok(diagnostics), "diagnostics": diagnostics}
+
+    def _annotate_derivatives_shadow(self, snapshot: FactorSnapshot, *, context: Dict[str, Any]) -> None:
+        if not self.derivatives_history.enabled:
+            return
+        derivatives = snapshot.derivatives
+        orderbook = snapshot.orderbook
+        index_price = _safe_float(derivatives.get("index_price"), 0.0)
+        mark_price = _safe_float(derivatives.get("mark_price"), 0.0)
+        best_bid = _safe_float(orderbook.get("best_bid"), 0.0)
+        best_ask = _safe_float(orderbook.get("best_ask"), 0.0)
+        market_mid = (best_bid + best_ask) / 2.0 if best_bid > 0 and best_ask > 0 else 0.0
+        spread_bps = _safe_float(orderbook.get("spread_bps"), 0.0)
+        max_spread_bps = max(0.0, _safe_float(self.settings.get("basis_max_spread_bps"), 30.0))
+
+        market_basis_bps: Optional[float] = None
+        mark_basis_bps: Optional[float] = None
+        if index_price > 0 and market_mid > 0 and (max_spread_bps <= 0 or spread_bps <= max_spread_bps):
+            market_basis_bps = (market_mid - index_price) / index_price * 10000.0
+        if index_price > 0 and mark_price > 0:
+            mark_basis_bps = (mark_price - index_price) / index_price * 10000.0
+
+        derivatives["market_mid_price"] = market_mid
+        derivatives["market_basis_bps"] = market_basis_bps
+        derivatives["mark_basis_bps"] = mark_basis_bps
+        derivatives["basis_market_valid"] = market_basis_bps is not None
+        derivatives["basis_market_spread_bps"] = spread_bps
+        funding_rate = _safe_optional_float(derivatives.get("funding_rate"))
+        funding_interval_hours = max(
+            1.0,
+            _safe_float(derivatives.get("funding_interval_hours"), self.default_funding_interval_hours),
+        )
+        timestamp_ms = _safe_int(derivatives.get("premium_index_time_ms"), 0) or int(time.time() * 1000)
+        self.derivatives_history.record_current(
+            snapshot.symbol,
+            market_basis_bps=market_basis_bps,
+            mark_basis_bps=mark_basis_bps,
+            funding_rate=funding_rate,
+            funding_interval_hours=funding_interval_hours,
+            index_price=index_price,
+            mark_price=mark_price,
+            market_mid_price=market_mid,
+            timestamp_ms=timestamp_ms,
+        )
+        metrics = self.derivatives_history.metrics(snapshot.symbol)
+        if metrics:
+            derivatives.update(metrics)
+        derivatives.update(
+            classify_derivatives_shadow(
+                derivatives,
+                context=context,
+                thresholds=self.derivatives_shadow_thresholds,
+            )
+        )
+
+    async def _funding_interval_hours(
+        self,
+        session: Any,
+        symbol: str,
+        diagnostics: list[Dict[str, Any]],
+        *,
+        refresh: bool,
+    ) -> float:
+        now = time.time()
+        if (now - self._funding_info_loaded_at) < self.funding_info_refresh_sec:
+            return self._funding_interval_by_symbol.get(symbol, self.default_funding_interval_hours)
+        if not refresh:
+            return self._funding_interval_by_symbol.get(symbol, self.default_funding_interval_hours)
+        async with self._funding_info_lock:
+            now = time.time()
+            if (now - self._funding_info_loaded_at) < self.funding_info_refresh_sec:
+                return self._funding_interval_by_symbol.get(symbol, self.default_funding_interval_hours)
+            try:
+                payload = await self._get_json(
+                    session,
+                    "/fapi/v1/fundingInfo",
+                    {},
+                    diagnostics=diagnostics,
+                    endpoint="funding_info",
+                )
+                intervals: Dict[str, float] = {}
+                if isinstance(payload, list):
+                    for item in payload:
+                        if not isinstance(item, dict):
+                            continue
+                        item_symbol = str(item.get("symbol") or "").strip().upper()
+                        interval = _safe_float(item.get("fundingIntervalHours"), 0.0)
+                        if item_symbol and interval > 0:
+                            intervals[item_symbol] = interval
+                self._funding_interval_by_symbol = intervals
+                self._funding_info_loaded_at = now
+            except Exception:
+                self._funding_info_loaded_at = now
+            return self._funding_interval_by_symbol.get(symbol, self.default_funding_interval_hours)
 
     async def _fetch_orderbook(self, symbol: str) -> Dict[str, Any]:
         diagnostics: list[Dict[str, Any]] = []
@@ -492,6 +720,18 @@ def _safe_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _safe_optional_float(value: Any) -> Optional[float]:
+    try:
+        if value is None:
+            return None
+        number = float(value)
+        if number != number or number in {float("inf"), float("-inf")}:
+            return None
+        return number
+    except (TypeError, ValueError):
+        return None
 
 
 def _safe_int(value: Any, default: int) -> int:

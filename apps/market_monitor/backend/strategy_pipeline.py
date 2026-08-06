@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 try:
+    from alerts.derivatives_shadow_recorder import DerivativesShadowRecorder
     from alerts.event_deduper import EventDeduper
     from alerts.alert_policy import AlertDecision, AlertPolicy
     from alerts.tg_formatter import format_strategy_alert
@@ -20,6 +21,7 @@ try:
     from scoring.candidate_score import score_candidate
     from scoring.risk_score import score_risk
 except ModuleNotFoundError:
+    from apps.market_monitor.backend.alerts.derivatives_shadow_recorder import DerivativesShadowRecorder
     from apps.market_monitor.backend.alerts.event_deduper import EventDeduper
     from apps.market_monitor.backend.alerts.alert_policy import AlertDecision, AlertPolicy
     from apps.market_monitor.backend.alerts.tg_formatter import format_strategy_alert
@@ -68,6 +70,7 @@ class AlertStrategyPipeline:
         self.actionable_policy_shadow_path = self.event_store.runtime_dir / (
             shadow_file or "actionable_policy_shadow.jsonl"
         )
+        self.derivatives_shadow_recorder = DerivativesShadowRecorder(self.settings)
         self._prewarm_last_ts: Dict[str, float] = {}
         self._prewarm_tasks: set[asyncio.Task] = set()
 
@@ -153,6 +156,12 @@ class AlertStrategyPipeline:
                 decision.reason,
                 dedupe_decision.reason if dedupe_decision else "not_checked",
             )
+            self._record_derivatives_shadow(
+                candidate,
+                decision=decision,
+                alert_sent=alert_sent,
+                dedupe_reason=dedupe_decision.reason if dedupe_decision else "not_checked",
+            )
             return StrategyProcessResult(
                 candidate_id=candidate.candidate_id,
                 alert_sent=alert_sent,
@@ -208,6 +217,12 @@ class AlertStrategyPipeline:
                 decision.reason,
                 dedupe_decision.reason if dedupe_decision else "not_checked",
             )
+            self._record_derivatives_shadow(
+                candidate,
+                decision=decision,
+                alert_sent=alert_sent,
+                dedupe_reason=dedupe_decision.reason if dedupe_decision else "not_checked",
+            )
             return StrategyProcessResult(
                 candidate_id=candidate.candidate_id,
                 alert_sent=alert_sent,
@@ -245,6 +260,12 @@ class AlertStrategyPipeline:
                     self.policy.mark_sent(candidate.symbol, decision.alert_type)
 
         self._record_actionable_policy_shadow(
+            candidate,
+            decision=decision,
+            alert_sent=alert_sent,
+            dedupe_reason=dedupe_decision.reason if dedupe_decision else "not_checked",
+        )
+        self._record_derivatives_shadow(
             candidate,
             decision=decision,
             alert_sent=alert_sent,
@@ -358,6 +379,112 @@ class AlertStrategyPipeline:
         if not isinstance(completeness, dict):
             return 0.0
         return max(0.0, min(100.0, _to_float(completeness.get("pct"), 0.0)))
+
+    def _record_derivatives_shadow(
+        self,
+        candidate: Any,
+        *,
+        decision: AlertDecision,
+        alert_sent: bool,
+        dedupe_reason: str,
+    ) -> None:
+        try:
+            derivatives = candidate.derivatives if isinstance(candidate.derivatives, dict) else {}
+            snapshot = candidate.factor_snapshot if isinstance(candidate.factor_snapshot, dict) else {}
+            latest = candidate.latest_features if isinstance(candidate.latest_features, dict) else {}
+            opportunity_modifier = _to_float(
+                derivatives.get("derivatives_shadow_opportunity_modifier"),
+                0.0,
+            )
+            risk_modifier = _to_float(derivatives.get("derivatives_shadow_risk_modifier"), 0.0)
+            proposed_score = max(0.0, min(100.0, float(candidate.score or 0.0) + opportunity_modifier))
+            proposed_risk = max(0.0, min(100.0, float(candidate.risk_score or 0.0) + risk_modifier))
+            factor_keys = (
+                "index_price",
+                "mark_price",
+                "market_mid_price",
+                "basis_bps_now",
+                "market_basis_bps",
+                "mark_basis_bps",
+                "basis_delta_5m_bps",
+                "basis_delta_15m_bps",
+                "basis_delta_1h_bps",
+                "basis_delta_zscore_5m",
+                "basis_delta_zscore_15m",
+                "basis_percentile_24h",
+                "basis_zscore_24h",
+                "basis_shadow_status",
+                "basis_shadow_state",
+                "basis_shadow_extreme",
+                "oi_change_pct_5m",
+                "oi_change_pct_15m",
+                "oi_change_pct_1h",
+                "oi_amount_change_pct_5m",
+                "oi_amount_change_pct_15m",
+                "oi_amount_change_pct_1h",
+                "oi_amount_zscore_5m",
+                "oi_amount_zscore_15m",
+                "oi_amount_shadow_status",
+                "oi_turn_direction",
+                "oi_turn_stage",
+                "oi_turn_strength",
+                "oi_regime",
+                "oi_shadow_regime",
+                "oi_shadow_signal_level",
+                "oi_shadow_primary_window",
+                "funding_rate",
+                "funding_rate_signed",
+                "funding_rate_8h",
+                "funding_interval_hours",
+                "funding_delta_15m_bps",
+                "funding_delta_1h_bps",
+                "funding_percentile_24h",
+                "funding_shadow_status",
+                "funding_shadow_state",
+            )
+            row = {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "policy_version": derivatives.get("derivatives_shadow_policy_version")
+                or self.settings.get("derivatives_shadow_policy_version")
+                or "derivatives-v1-shadow",
+                "symbol": candidate.symbol,
+                "base_asset": getattr(candidate, "base_asset", ""),
+                "candidate_id": candidate.candidate_id,
+                "event_count": int(candidate.event_count or 0),
+                "latest_event": {
+                    "event_id": latest.get("event_id"),
+                    "event_type": latest.get("event_type"),
+                    "event_time": latest.get("event_time"),
+                    "window": latest.get("window"),
+                    "direction": latest.get("direction"),
+                    "price": latest.get("price"),
+                    "change_pct": latest.get("change_pct"),
+                    "rvol": latest.get("rvol"),
+                },
+                "actual_decision": {
+                    "alert_type": decision.alert_type,
+                    "should_send": bool(decision.should_send),
+                    "reason": decision.reason,
+                    "dedupe_reason": dedupe_reason,
+                    "alert_sent": bool(alert_sent),
+                    "score": float(candidate.score or 0.0),
+                    "risk_score": float(candidate.risk_score or 0.0),
+                },
+                "shadow_decision": {
+                    "opportunity_modifier": opportunity_modifier,
+                    "risk_modifier": risk_modifier,
+                    "proposed_score": round(proposed_score, 2),
+                    "proposed_risk_score": round(proposed_risk, 2),
+                    "reasons": list(derivatives.get("derivatives_shadow_reasons") or []),
+                },
+                "factor_state": {key: derivatives.get(key) for key in factor_keys},
+                "shadow_completeness": snapshot.get("derivatives_shadow_completeness")
+                if isinstance(snapshot.get("derivatives_shadow_completeness"), dict)
+                else {},
+            }
+            self.derivatives_shadow_recorder.record(row, alert_sent=alert_sent)
+        except Exception as exc:
+            logger.debug("Failed to record derivatives shadow: symbol=%s err=%s", candidate.symbol, exc)
 
     def _record_factor_quality(self, candidate: Any, alert_type: str, reason: str = "") -> None:
         try:
@@ -488,7 +615,7 @@ class AlertStrategyPipeline:
     def _schedule_hot_pool_prewarm(self, candidate: Any, *, base_score: float) -> None:
         if not _parse_bool(self.settings.get("factor_prewarm_enabled"), True):
             return
-        if not getattr(getattr(self.factor_enricher, "microstructure_provider", None), "enabled", False):
+        if not getattr(self.factor_enricher, "enabled", False):
             return
 
         max_pending = max(1, _to_int(self.settings.get("factor_prewarm_max_pending"), 6))
@@ -507,7 +634,13 @@ class AlertStrategyPipeline:
             if not symbol or not self._prewarm_due(symbol):
                 continue
             self._prewarm_last_ts[symbol] = time.time()
-            task = asyncio.create_task(self._run_hot_prewarm(item), name=f"factor_prewarm_{symbol}")
+            include_micro = not (
+                item is candidate and self._will_enrich_current_candidate(item, base_score=base_score)
+            )
+            task = asyncio.create_task(
+                self._run_hot_prewarm(item, include_micro=include_micro),
+                name=f"factor_prewarm_{symbol}",
+            )
             self._prewarm_tasks.add(task)
             task.add_done_callback(lambda done: self._prewarm_tasks.discard(done))
 
@@ -530,8 +663,6 @@ class AlertStrategyPipeline:
         for item in pool.values():
             symbol = str(getattr(item, "symbol", "") or "").upper().strip()
             if not symbol:
-                continue
-            if item is current and self._will_enrich_current_candidate(item, base_score=base_score):
                 continue
             last_seen = _parse_iso_time(getattr(item, "last_seen", ""))
             age_minutes = ((now - last_seen).total_seconds() / 60.0) if last_seen is not None else 0.0
@@ -583,10 +714,13 @@ class AlertStrategyPipeline:
             return
         self._prewarm_tasks = {task for task in self._prewarm_tasks if not task.done()}
 
-    async def _run_hot_prewarm(self, candidate: Any) -> None:
+    async def _run_hot_prewarm(self, candidate: Any, *, include_micro: bool) -> None:
         symbol = str(getattr(candidate, "symbol", "") or "").upper().strip()
         try:
-            ok = await self.factor_enricher.prewarm_microstructure(candidate)
+            if include_micro:
+                ok = await self.factor_enricher.prewarm_factors(candidate)
+            else:
+                ok = await self.factor_enricher.prewarm_derivatives_shadow(candidate)
             logger.debug("Factor prewarm completed: symbol=%s ok=%s", symbol, ok)
         except asyncio.CancelledError:
             raise

@@ -164,6 +164,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "policy_state_file": "alert_policy_state.json",
         "factor_quality_file": "factor_quality.jsonl",
         "actionable_policy_shadow_file": "actionable_policy_shadow.jsonl",
+        "derivatives_shadow_enabled": True,
+        "derivatives_shadow_file": "derivatives_factor_shadow.jsonl",
+        "derivatives_shadow_summary_file": "derivatives_shadow_readiness.json",
+        "derivatives_shadow_state_file": "derivatives_shadow_state.json",
+        "derivatives_shadow_policy_version": "derivatives-v1-shadow",
+        "derivatives_shadow_review_min_days": 7.0,
+        "derivatives_shadow_review_min_first_push_samples": 100,
+        "derivatives_shadow_review_timezone": "Asia/Shanghai",
         "candidate_ttl_minutes": 120,
         "min_watch_score": 50.0,
         "min_actionable_score": 75.0,
@@ -271,6 +279,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "depth_levels": 20,
                 "fetch_open_interest": True,
                 "fetch_open_interest_hist": True,
+                "fetch_basis_history": True,
                 "fetch_funding": True,
                 "fetch_long_short_ratio": False,
                 "fetch_taker_buy_sell": True,
@@ -279,6 +288,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "liquidation_lookback_minutes": 5,
                 "open_interest_hist_period": "5m",
                 "open_interest_hist_limit": 576,
+                "basis_history_period": "5m",
+                "basis_history_limit": 500,
+                "basis_max_spread_bps": 30.0,
+                "default_funding_interval_hours": 8.0,
+                "funding_info_refresh_sec": 3600,
                 "taker_buy_sell_period": "5m",
                 "request_diagnostics_enabled": True,
                 "request_error_file": "factor_source_errors.jsonl",
@@ -300,6 +314,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                     },
                     "min_bootstrap_samples": 12,
                     "min_zscore_samples": 20,
+                    "turn_min_5m_pct": 0.015,
+                    "turn_confirm_15m_pct": 0.02,
+                    "turn_min_zscore": 1.5,
                     "signal_thresholds": {
                         "price_up_pct": 1.5,
                         "price_down_pct": -1.5,
@@ -314,6 +331,31 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                         "rvol_confirm": 2.0,
                         "taker_buy_confirm": 0.55,
                         "funding_overheated": 0.0015
+                    }
+                },
+                "derivatives_history": {
+                    "enabled": True,
+                    "history_file": "derivatives_shadow_history.json",
+                    "max_samples_per_symbol": 3000,
+                    "min_sample_interval_sec": 30,
+                    "basis_bootstrap_ttl_sec": 3600,
+                    "min_stats_samples": 20,
+                    "save_interval_sec": 10.0,
+                    "max_window_sample_lag_sec": {
+                        "5m": 600,
+                        "15m": 1200,
+                        "1h": 5400
+                    },
+                    "signal_thresholds": {
+                        "basis_fast_min_bps": 5.0,
+                        "basis_fast_fallback_bps": 15.0,
+                        "basis_sustained_min_bps": 10.0,
+                        "basis_sustained_fallback_bps": 25.0,
+                        "basis_delta_zscore": 1.5,
+                        "basis_extreme_percentile": 95.0,
+                        "funding_dynamic_min_bps": 0.05,
+                        "funding_dynamic_fallback_bps": 0.25,
+                        "funding_delta_zscore": 1.5
                     }
                 },
                 "microstructure": {
@@ -1599,6 +1641,34 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
             strategy_defaults.get("actionable_policy_shadow_file", "actionable_policy_shadow.jsonl"),
         )
     ).strip() or "actionable_policy_shadow.jsonl"
+    alert_strategy["derivatives_shadow_enabled"] = _parse_bool(
+        alert_strategy.get("derivatives_shadow_enabled"),
+        default=bool(strategy_defaults.get("derivatives_shadow_enabled", True)),
+    )
+    for key, fallback in (
+        ("derivatives_shadow_file", "derivatives_factor_shadow.jsonl"),
+        ("derivatives_shadow_summary_file", "derivatives_shadow_readiness.json"),
+        ("derivatives_shadow_state_file", "derivatives_shadow_state.json"),
+        ("derivatives_shadow_policy_version", "derivatives-v1-shadow"),
+        ("derivatives_shadow_review_timezone", "Asia/Shanghai"),
+    ):
+        alert_strategy[key] = str(
+            alert_strategy.get(key, strategy_defaults.get(key, fallback))
+        ).strip() or fallback
+    alert_strategy["derivatives_shadow_review_min_days"] = max(
+        0.0,
+        _to_float(
+            alert_strategy.get("derivatives_shadow_review_min_days"),
+            _to_float(strategy_defaults.get("derivatives_shadow_review_min_days"), 7.0),
+        ),
+    )
+    alert_strategy["derivatives_shadow_review_min_first_push_samples"] = max(
+        1,
+        _to_int(
+            alert_strategy.get("derivatives_shadow_review_min_first_push_samples"),
+            _to_int(strategy_defaults.get("derivatives_shadow_review_min_first_push_samples"), 100),
+        ),
+    )
     alert_strategy["candidate_ttl_minutes"] = max(
         1,
         _to_int(alert_strategy.get("candidate_ttl_minutes"), strategy_defaults["candidate_ttl_minutes"]),
@@ -2132,6 +2202,7 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     for key in (
         "fetch_open_interest",
         "fetch_open_interest_hist",
+        "fetch_basis_history",
         "fetch_funding",
         "fetch_long_short_ratio",
         "fetch_taker_buy_sell",
@@ -2154,6 +2225,40 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         _to_int(
             binance_factors.get("open_interest_hist_limit"),
             _to_int(binance_defaults.get("open_interest_hist_limit"), default=576),
+        ),
+    )
+    binance_factors["basis_history_period"] = str(
+        binance_factors.get("basis_history_period", binance_defaults.get("basis_history_period", "5m"))
+    ).strip() or "5m"
+    binance_factors["basis_history_limit"] = max(
+        20,
+        min(
+            500,
+            _to_int(
+                binance_factors.get("basis_history_limit"),
+                _to_int(binance_defaults.get("basis_history_limit"), 500),
+            ),
+        ),
+    )
+    binance_factors["basis_max_spread_bps"] = max(
+        0.0,
+        _to_float(
+            binance_factors.get("basis_max_spread_bps"),
+            _to_float(binance_defaults.get("basis_max_spread_bps"), 30.0),
+        ),
+    )
+    binance_factors["default_funding_interval_hours"] = max(
+        1.0,
+        _to_float(
+            binance_factors.get("default_funding_interval_hours"),
+            _to_float(binance_defaults.get("default_funding_interval_hours"), 8.0),
+        ),
+    )
+    binance_factors["funding_info_refresh_sec"] = max(
+        300,
+        _to_int(
+            binance_factors.get("funding_info_refresh_sec"),
+            _to_int(binance_defaults.get("funding_info_refresh_sec"), 3600),
         ),
     )
     binance_factors["taker_buy_sell_period"] = str(
@@ -2232,8 +2337,77 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         8,
         _to_int(oi_history.get("min_zscore_samples"), _to_int(oi_defaults.get("min_zscore_samples"), 20)),
     )
+    oi_history["turn_min_5m_pct"] = max(
+        0.0,
+        _to_float(oi_history.get("turn_min_5m_pct"), _to_float(oi_defaults.get("turn_min_5m_pct"), 0.015)),
+    )
+    oi_history["turn_confirm_15m_pct"] = max(
+        0.0,
+        _to_float(
+            oi_history.get("turn_confirm_15m_pct"),
+            _to_float(oi_defaults.get("turn_confirm_15m_pct"), 0.02),
+        ),
+    )
+    oi_history["turn_min_zscore"] = max(
+        0.0,
+        _to_float(oi_history.get("turn_min_zscore"), _to_float(oi_defaults.get("turn_min_zscore"), 1.5)),
+    )
     if not isinstance(oi_history.get("signal_thresholds"), dict):
         oi_history["signal_thresholds"] = dict(oi_defaults.get("signal_thresholds") or {})
+
+    derivatives_history = binance_factors.setdefault("derivatives_history", {})
+    if not isinstance(derivatives_history, dict):
+        derivatives_history = {}
+        binance_factors["derivatives_history"] = derivatives_history
+    derivatives_defaults = (
+        binance_defaults.get("derivatives_history", {})
+        if isinstance(binance_defaults.get("derivatives_history"), dict)
+        else {}
+    )
+    derivatives_history["enabled"] = _parse_bool(
+        derivatives_history.get("enabled"),
+        default=bool(derivatives_defaults.get("enabled", True)),
+    )
+    derivatives_history["history_file"] = str(
+        derivatives_history.get(
+            "history_file",
+            derivatives_defaults.get("history_file", "derivatives_shadow_history.json"),
+        )
+    ).strip() or "derivatives_shadow_history.json"
+    derivatives_history["max_samples_per_symbol"] = max(
+        100,
+        _to_int(
+            derivatives_history.get("max_samples_per_symbol"),
+            _to_int(derivatives_defaults.get("max_samples_per_symbol"), 3000),
+        ),
+    )
+    derivatives_history["min_sample_interval_sec"] = max(
+        0.0,
+        _to_float(
+            derivatives_history.get("min_sample_interval_sec"),
+            _to_float(derivatives_defaults.get("min_sample_interval_sec"), 30.0),
+        ),
+    )
+    derivatives_history["basis_bootstrap_ttl_sec"] = max(
+        30,
+        _to_int(
+            derivatives_history.get("basis_bootstrap_ttl_sec"),
+            _to_int(derivatives_defaults.get("basis_bootstrap_ttl_sec"), 3600),
+        ),
+    )
+    derivatives_history["min_stats_samples"] = max(
+        8,
+        _to_int(
+            derivatives_history.get("min_stats_samples"),
+            _to_int(derivatives_defaults.get("min_stats_samples"), 20),
+        ),
+    )
+    if not isinstance(derivatives_history.get("max_window_sample_lag_sec"), dict):
+        derivatives_history["max_window_sample_lag_sec"] = dict(
+            derivatives_defaults.get("max_window_sample_lag_sec") or {}
+        )
+    if not isinstance(derivatives_history.get("signal_thresholds"), dict):
+        derivatives_history["signal_thresholds"] = dict(derivatives_defaults.get("signal_thresholds") or {})
 
     microstructure = binance_factors.setdefault("microstructure", {})
     if not isinstance(microstructure, dict):

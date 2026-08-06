@@ -5,7 +5,7 @@ import json
 import math
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 try:
     from candidates.storage_paths import resolve_runtime_dir
@@ -69,6 +69,9 @@ class OIHistoryStore:
         self.max_window_sample_lag_ms = _parse_window_lag_ms(self.settings.get("max_window_sample_lag_sec"))
         self.min_bootstrap_samples = max(2, _safe_int(self.settings.get("min_bootstrap_samples"), 12))
         self.min_zscore_samples = max(8, _safe_int(self.settings.get("min_zscore_samples"), 20))
+        self.turn_min_5m_pct = max(0.0, _safe_float(self.settings.get("turn_min_5m_pct"), 0.015))
+        self.turn_confirm_15m_pct = max(0.0, _safe_float(self.settings.get("turn_confirm_15m_pct"), 0.02))
+        self.turn_min_zscore = max(0.0, _safe_float(self.settings.get("turn_min_zscore"), 1.5))
         self.save_interval_sec = max(0.0, _safe_float(self.settings.get("save_interval_sec"), 2.0))
         self._state: Dict[str, Any] = self._load()
         self._last_save_ts = 0.0
@@ -226,6 +229,107 @@ class OIHistoryStore:
         metrics["oi_valid_windows"] = valid_windows
         if stale_windows:
             metrics["oi_stale_windows"] = stale_windows
+        metrics.update(self._amount_metrics(samples, timestamps, latest_ts))
+        return metrics
+
+    def _amount_metrics(
+        self,
+        samples: List[Dict[str, Any]],
+        timestamps: List[int],
+        latest_ts: int,
+    ) -> Dict[str, Any]:
+        latest_amount = _oi_amount_value(samples[-1])
+        if latest_amount <= 0:
+            return {"oi_amount_shadow_status": "missing"}
+
+        metrics: Dict[str, Any] = {
+            "oi_amount_latest": latest_amount,
+            "oi_amount_shadow_status": "warming",
+        }
+        valid_windows: List[str] = []
+        primary_window = ""
+        primary_change: Optional[float] = None
+        for window, window_ms in WINDOW_MS.items():
+            target_ts = latest_ts - window_ms
+            previous = _sample_at_or_before(samples, timestamps, target_ts)
+            if not previous:
+                continue
+            previous_ts = _safe_int(previous.get("timestamp_ms"), 0)
+            baseline_lag_ms = target_ts - previous_ts
+            max_lag_ms = self.max_window_sample_lag_ms.get(window, window_ms)
+            previous_amount = _oi_amount_value(previous)
+            if baseline_lag_ms < 0 or baseline_lag_ms > max_lag_ms or previous_amount <= 0:
+                continue
+            change = (latest_amount - previous_amount) / previous_amount
+            metrics[f"oi_amount_change_pct_{window}"] = change
+            metrics[f"oi_amount_change_{window}"] = latest_amount - previous_amount
+            valid_windows.append(window)
+            zscore = _window_change_zscore(
+                samples,
+                timestamps,
+                window_ms,
+                current_change=change,
+                min_count=self.min_zscore_samples,
+                max_baseline_lag_ms=max_lag_ms,
+                value_getter=_oi_amount_value,
+            )
+            if zscore is not None:
+                metrics[f"oi_amount_zscore_{window}"] = zscore
+            if primary_change is None or abs(change) > abs(primary_change):
+                primary_window = window
+                primary_change = change
+
+        if primary_change is not None:
+            metrics["oi_amount_primary_window"] = primary_window
+            metrics["oi_amount_primary_change_pct"] = primary_change
+        metrics["oi_amount_valid_windows"] = valid_windows
+        if {"5m", "15m"}.issubset(valid_windows):
+            metrics["oi_amount_shadow_status"] = "ready"
+
+        current_5m = _safe_optional_float(metrics.get("oi_amount_change_pct_5m"))
+        previous_5m = _segment_change(
+            samples,
+            timestamps,
+            end_ts=latest_ts - WINDOW_MS["5m"],
+            window_ms=WINDOW_MS["5m"],
+            max_lag_ms=self.max_window_sample_lag_ms["5m"],
+            value_getter=_oi_amount_value,
+        )
+        if previous_5m is not None:
+            metrics["oi_amount_prev_change_pct_5m"] = previous_5m
+
+        turn_direction = "none"
+        turn_stage = "none"
+        if current_5m is not None and previous_5m is not None:
+            zscore_5m = abs(_safe_float(metrics.get("oi_amount_zscore_5m"), 0.0))
+            statistically_valid = zscore_5m <= 0 or zscore_5m >= self.turn_min_zscore
+            if previous_5m <= 0 and current_5m >= self.turn_min_5m_pct and statistically_valid:
+                turn_direction = "up"
+            elif previous_5m >= 0 and current_5m <= -self.turn_min_5m_pct and statistically_valid:
+                turn_direction = "down"
+            if turn_direction != "none":
+                change_15m = _safe_float(metrics.get("oi_amount_change_pct_15m"), 0.0)
+                confirmed = (
+                    turn_direction == "up" and change_15m >= self.turn_confirm_15m_pct
+                ) or (
+                    turn_direction == "down" and change_15m <= -self.turn_confirm_15m_pct
+                )
+                turn_stage = "confirmed" if confirmed else "early"
+
+        metrics["oi_turn_direction"] = turn_direction
+        metrics["oi_turn_stage"] = turn_stage
+        if current_5m is not None:
+            current_abs = abs(current_5m)
+            zscore_abs = abs(_safe_float(metrics.get("oi_amount_zscore_5m"), 0.0))
+            if current_abs >= 0.05 or zscore_abs >= 2.5:
+                strength = "L3"
+            elif current_abs >= 0.03 or zscore_abs >= 2.0:
+                strength = "L2"
+            elif current_abs >= self.turn_min_5m_pct or zscore_abs >= self.turn_min_zscore:
+                strength = "L1"
+            else:
+                strength = "none"
+            metrics["oi_turn_strength"] = strength
         return metrics
 
     def _merge_samples(self, symbol: str, incoming: List[Dict[str, Any]]) -> None:
@@ -398,6 +502,120 @@ def classify_oi_regime(
     }
 
 
+def classify_oi_regime_shadow(
+    derivatives: Dict[str, Any],
+    *,
+    context: Optional[Dict[str, Any]] = None,
+    thresholds: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    context = context or {}
+    cfg = {
+        "price_up_pct": 1.5,
+        "price_down_pct": -1.5,
+        "price_flat_abs_pct": 2.0,
+        "oi_shadow_min_5m_pct": 0.015,
+        "oi_shadow_min_15m_pct": 0.025,
+        "oi_shadow_min_1h_pct": 0.05,
+        "oi_shadow_l2_pct": 0.05,
+        "oi_shadow_l3_pct": 0.10,
+        "oi_shadow_l3_zscore": 2.5,
+    }
+    if isinstance(thresholds, dict):
+        for key, value in thresholds.items():
+            if key in cfg:
+                cfg[key] = _safe_float(value, cfg[key])
+
+    preferred_window = str(context.get("window") or "").strip()
+    if preferred_window not in {"5m", "15m", "1h"}:
+        preferred_window = ""
+    candidate_windows = [preferred_window, "15m", "5m", "1h"]
+    primary_window = ""
+    oi_change: Optional[float] = None
+    price_change: Optional[float] = None
+    for window in candidate_windows:
+        if not window or window == primary_window:
+            continue
+        candidate_oi = _safe_optional_float(derivatives.get(f"oi_amount_change_pct_{window}"))
+        candidate_price = _price_change_for_window(context, window)
+        if candidate_oi is None or candidate_price is None:
+            continue
+        primary_window = window
+        oi_change = candidate_oi
+        price_change = candidate_price
+        break
+
+    if oi_change is None or price_change is None:
+        return {
+            "oi_shadow_regime": "unknown",
+            "oi_shadow_signal_level": "none",
+            "oi_shadow_primary_window": primary_window,
+            "oi_shadow_reason": "amount OI or aligned price window unavailable",
+        }
+
+    min_oi_change = {
+        "5m": cfg["oi_shadow_min_5m_pct"],
+        "15m": cfg["oi_shadow_min_15m_pct"],
+        "1h": cfg["oi_shadow_min_1h_pct"],
+    }.get(primary_window, cfg["oi_shadow_min_15m_pct"])
+    oi_zscore = abs(_safe_float(derivatives.get(f"oi_amount_zscore_{primary_window}"), 0.0))
+    significant = abs(oi_change) >= min_oi_change or oi_zscore >= 1.5
+    price_up = price_change >= cfg["price_up_pct"]
+    price_down = price_change <= cfg["price_down_pct"]
+    price_flat = abs(price_change) <= cfg["price_flat_abs_pct"]
+
+    if not significant:
+        regime = "neutral"
+    elif price_up and oi_change > 0:
+        regime = "new_longs"
+    elif price_up and oi_change < 0:
+        regime = "short_cover"
+    elif price_down and oi_change > 0:
+        regime = "new_shorts"
+    elif price_down and oi_change < 0:
+        regime = "deleveraging"
+    elif price_flat and oi_change > 0:
+        regime = "accumulation"
+    elif price_flat:
+        regime = "churn"
+    else:
+        regime = "neutral"
+
+    max_abs_change = max(
+        [
+            abs(_safe_float(derivatives.get(f"oi_amount_change_pct_{window}"), 0.0))
+            for window in ("5m", "15m", "1h", "4h", "24h")
+        ]
+        or [0.0]
+    )
+    max_abs_zscore = max(
+        [
+            abs(_safe_float(derivatives.get(f"oi_amount_zscore_{window}"), 0.0))
+            for window in ("5m", "15m", "1h", "4h", "24h")
+        ]
+        or [0.0]
+    )
+    if max_abs_change >= cfg["oi_shadow_l3_pct"] or max_abs_zscore >= cfg["oi_shadow_l3_zscore"]:
+        signal_level = "L3"
+    elif max_abs_change >= cfg["oi_shadow_l2_pct"] or max_abs_zscore >= 2.0:
+        signal_level = "L2"
+    elif significant:
+        signal_level = "L1"
+    else:
+        signal_level = "none"
+
+    return {
+        "oi_shadow_regime": regime,
+        "oi_shadow_signal_level": signal_level,
+        "oi_shadow_primary_window": primary_window,
+        "oi_shadow_change_pct": oi_change,
+        "oi_shadow_price_change_pct": price_change,
+        "oi_shadow_reason": (
+            f"{signal_level}:{regime}; amount OI {primary_window} {oi_change * 100.0:+.2f}%; "
+            f"price {price_change:+.2f}%"
+        ),
+    }
+
+
 def _window_change_zscore(
     samples: List[Dict[str, Any]],
     timestamps: List[int],
@@ -406,7 +624,9 @@ def _window_change_zscore(
     current_change: float,
     min_count: int,
     max_baseline_lag_ms: int,
+    value_getter: Optional[Callable[[Dict[str, Any]], float]] = None,
 ) -> Optional[float]:
+    value_getter = value_getter or _oi_value
     changes: List[float] = []
     for index, sample in enumerate(samples):
         ts_ms = timestamps[index]
@@ -418,8 +638,8 @@ def _window_change_zscore(
         baseline_lag_ms = target_ts - previous_ts
         if baseline_lag_ms < 0 or baseline_lag_ms > max_baseline_lag_ms:
             continue
-        prev_value = _oi_value(previous)
-        curr_value = _oi_value(sample)
+        prev_value = value_getter(previous)
+        curr_value = value_getter(sample)
         if prev_value <= 0 or curr_value <= 0:
             continue
         changes.append((curr_value - prev_value) / prev_value)
@@ -431,6 +651,30 @@ def _window_change_zscore(
     if stdev <= 0:
         return None
     return (current_change - mean) / stdev
+
+
+def _segment_change(
+    samples: List[Dict[str, Any]],
+    timestamps: List[int],
+    *,
+    end_ts: int,
+    window_ms: int,
+    max_lag_ms: int,
+    value_getter: Callable[[Dict[str, Any]], float],
+) -> Optional[float]:
+    end_sample = _sample_at_or_before(samples, timestamps, end_ts)
+    start_sample = _sample_at_or_before(samples, timestamps, end_ts - window_ms)
+    if not end_sample or not start_sample:
+        return None
+    end_lag = end_ts - _safe_int(end_sample.get("timestamp_ms"), 0)
+    start_lag = (end_ts - window_ms) - _safe_int(start_sample.get("timestamp_ms"), 0)
+    if end_lag < 0 or start_lag < 0 or end_lag > max_lag_ms or start_lag > max_lag_ms:
+        return None
+    start_value = value_getter(start_sample)
+    end_value = value_getter(end_sample)
+    if start_value <= 0 or end_value <= 0:
+        return None
+    return (end_value - start_value) / start_value
 
 
 def _sample_at_or_before(samples: List[Dict[str, Any]], timestamps: List[int], target_ts: int) -> Optional[Dict[str, Any]]:
@@ -465,6 +709,26 @@ def _oi_value(sample: Dict[str, Any]) -> float:
     if oi_usdt > 0:
         return oi_usdt
     return _safe_float(sample.get("oi_amount"), 0.0)
+
+
+def _oi_amount_value(sample: Dict[str, Any]) -> float:
+    return _safe_float(sample.get("oi_amount"), 0.0)
+
+
+def _price_change_for_window(context: Dict[str, Any], window: str) -> Optional[float]:
+    by_window = context.get("price_change_by_window")
+    if isinstance(by_window, dict):
+        value = _safe_optional_float(by_window.get(window))
+        if value is not None:
+            return value
+    latest_window = str(context.get("window") or "").strip()
+    if latest_window == window:
+        value = _safe_optional_float(context.get("change_pct"))
+        if value is not None:
+            return value
+    if window == "1h":
+        return _safe_optional_float(context.get("change_1h_pct"))
+    return None
 
 
 def _best_price_change(context: Dict[str, Any]) -> float:

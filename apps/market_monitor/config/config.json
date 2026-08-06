@@ -249,6 +249,14 @@
     "policy_state_file": "alert_policy_state.json",
     "factor_quality_file": "factor_quality.jsonl",
     "actionable_policy_shadow_file": "actionable_policy_shadow.jsonl",
+    "derivatives_shadow_enabled": true,
+    "derivatives_shadow_file": "derivatives_factor_shadow.jsonl",
+    "derivatives_shadow_summary_file": "derivatives_shadow_readiness.json",
+    "derivatives_shadow_state_file": "derivatives_shadow_state.json",
+    "derivatives_shadow_policy_version": "derivatives-v1-shadow",
+    "derivatives_shadow_review_min_days": 7.0,
+    "derivatives_shadow_review_min_first_push_samples": 100,
+    "derivatives_shadow_review_timezone": "Asia/Shanghai",
     "candidate_ttl_minutes": 120,
     "min_watch_score": 50.0,
     "min_actionable_score": 75.0,
@@ -379,6 +387,7 @@
         "depth_levels": 20,
         "fetch_open_interest": true,
         "fetch_open_interest_hist": true,
+        "fetch_basis_history": true,
         "fetch_funding": true,
         "fetch_long_short_ratio": false,
         "fetch_taker_buy_sell": true,
@@ -387,6 +396,11 @@
         "liquidation_lookback_minutes": 5,
         "open_interest_hist_period": "5m",
         "open_interest_hist_limit": 576,
+        "basis_history_period": "5m",
+        "basis_history_limit": 500,
+        "basis_max_spread_bps": 30.0,
+        "default_funding_interval_hours": 8.0,
+        "funding_info_refresh_sec": 3600,
         "taker_buy_sell_period": "5m",
         "request_diagnostics_enabled": true,
         "request_error_file": "factor_source_errors.jsonl",
@@ -397,6 +411,9 @@
           "bootstrap_ttl_sec": 300,
           "min_bootstrap_samples": 12,
           "min_zscore_samples": 20,
+          "turn_min_5m_pct": 0.015,
+          "turn_confirm_15m_pct": 0.02,
+          "turn_min_zscore": 1.5,
           "signal_thresholds": {
             "price_up_pct": 1.5,
             "price_down_pct": -1.5,
@@ -411,6 +428,31 @@
             "rvol_confirm": 2.0,
             "taker_buy_confirm": 0.55,
             "funding_overheated": 0.0015
+          }
+        },
+        "derivatives_history": {
+          "enabled": true,
+          "history_file": "derivatives_shadow_history.json",
+          "max_samples_per_symbol": 3000,
+          "min_sample_interval_sec": 30,
+          "basis_bootstrap_ttl_sec": 3600,
+          "min_stats_samples": 20,
+          "save_interval_sec": 10.0,
+          "max_window_sample_lag_sec": {
+            "5m": 600,
+            "15m": 1200,
+            "1h": 5400
+          },
+          "signal_thresholds": {
+            "basis_fast_min_bps": 5.0,
+            "basis_fast_fallback_bps": 15.0,
+            "basis_sustained_min_bps": 10.0,
+            "basis_sustained_fallback_bps": 25.0,
+            "basis_delta_zscore": 1.5,
+            "basis_extreme_percentile": 95.0,
+            "funding_dynamic_min_bps": 0.05,
+            "funding_dynamic_fallback_bps": 0.25,
+            "funding_delta_zscore": 1.5
           }
         },
         "microstructure": {
