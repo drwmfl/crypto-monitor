@@ -4,16 +4,25 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from apps.market_monitor.backend.alert_config import load_config
-from apps.market_monitor.backend.alerts.derivatives_shadow_recorder import DerivativesShadowRecorder
-from apps.market_monitor.backend.candidates.candidate_models import Candidate
-from apps.market_monitor.backend.factors.derivatives_history import (
-    DerivativesHistoryStore,
-    classify_derivatives_shadow,
-)
-from apps.market_monitor.backend.factors.oi_history import OIHistoryStore, classify_oi_regime_shadow
-from apps.market_monitor.backend.scoring.candidate_score import score_candidate
-from apps.market_monitor.backend.scoring.risk_score import score_risk
+try:
+    from alert_config import load_config
+    from alerts.derivatives_shadow_recorder import DerivativesShadowRecorder
+    from candidates.candidate_models import Candidate
+    from factors.derivatives_history import DerivativesHistoryStore, classify_derivatives_shadow
+    from factors.oi_history import OIHistoryStore, classify_oi_regime_shadow
+    from scoring.candidate_score import score_candidate
+    from scoring.risk_score import score_risk
+except ModuleNotFoundError:
+    from apps.market_monitor.backend.alert_config import load_config
+    from apps.market_monitor.backend.alerts.derivatives_shadow_recorder import DerivativesShadowRecorder
+    from apps.market_monitor.backend.candidates.candidate_models import Candidate
+    from apps.market_monitor.backend.factors.derivatives_history import (
+        DerivativesHistoryStore,
+        classify_derivatives_shadow,
+    )
+    from apps.market_monitor.backend.factors.oi_history import OIHistoryStore, classify_oi_regime_shadow
+    from apps.market_monitor.backend.scoring.candidate_score import score_candidate
+    from apps.market_monitor.backend.scoring.risk_score import score_risk
 
 
 class OIShadowTests(unittest.TestCase):
@@ -177,7 +186,10 @@ class RecorderAndCompatibilityTests(unittest.TestCase):
             self.assertEqual(before_risk, score_risk(candidate))
 
     def test_production_config_enables_shadow_only(self) -> None:
-        path = Path("apps/market_monitor/config/config.json")
+        backend_root = Path(__file__).resolve().parents[1]
+        path = backend_root / "config" / "config.json"
+        if not path.exists():
+            path = backend_root.parent / "config" / "config.json"
         config = load_config(str(path))
         strategy = config["alert_strategy"]
         self.assertTrue(strategy["derivatives_shadow_enabled"])
