@@ -5,9 +5,11 @@ from typing import Any, Dict, Optional
 try:
     from alerts.alert_policy import AlertDecision
     from candidates.candidate_models import Candidate
+    from instrument_type import instrument_badge
 except ModuleNotFoundError:
     from apps.market_monitor.backend.alerts.alert_policy import AlertDecision
     from apps.market_monitor.backend.candidates.candidate_models import Candidate
+    from apps.market_monitor.backend.instrument_type import instrument_badge
 
 
 ALERT_TYPE_LABELS = {
@@ -61,9 +63,11 @@ def format_strategy_alert(
     windows = "/".join(candidate.windows) or str(latest.get("window") or "N/A")
     price = _fmt_float(latest.get("price"), digits=8)
     change = _fmt_pct(latest.get("change_pct"))
+    badge = instrument_badge(latest.get("instrument_type"))
+    title_badge = f" | {badge}" if badge else ""
 
     lines = [
-        f"**{alert_label} | {token_name}（触发{trigger_count}次）**",
+        f"**{alert_label} | {token_name}（触发{trigger_count}次）{title_badge}**",
         f"状态：OI {_oi_state_label(derivatives)} | Micro {_micro_state_label(derivatives)} | {direction} {windows}",
         f"价格：{change} | {price} | 评分/风险 {candidate.score:.1f}/{candidate.risk_score:.1f}",
     ]

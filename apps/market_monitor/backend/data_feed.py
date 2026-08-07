@@ -20,11 +20,13 @@ try:
     from candidates.storage_paths import resolve_runtime_dir
     from alert_config import AlertConfig
     from indicators import calculate_latest_indicators
+    from instrument_type import binance_instrument_metadata
     from rule_engine import MarketSnapshot
 except ModuleNotFoundError:
     from apps.market_monitor.backend.candidates.storage_paths import resolve_runtime_dir
     from apps.market_monitor.backend.alert_config import AlertConfig
     from apps.market_monitor.backend.indicators import calculate_latest_indicators
+    from apps.market_monitor.backend.instrument_type import binance_instrument_metadata
     from apps.market_monitor.backend.rule_engine import MarketSnapshot
 
 logger = logging.getLogger(__name__)
@@ -51,6 +53,7 @@ class BinanceKlineDataFeed:
         self.max_symbols = int(config.data_feed.get("max_symbols", 0))
         self.symbol_quote_volume: Dict[str, float] = {}
         self.symbol_change_24h: Dict[str, float] = {}
+        self.symbol_instrument_metadata: Dict[str, Dict[str, Any]] = {}
         self._trend_cache: Dict[str, Tuple[float, Optional[float]]] = {}
         self._trend_cache_ttl_sec = 30.0
         self.redis_url = os.getenv("ALERT_REDIS_URL", "redis://redis:6379/0")
@@ -93,10 +96,16 @@ class BinanceKlineDataFeed:
         await self.refresh_universe_if_due(force=True)
 
         sample_symbols = list(self.symbol_mapping.keys())[:12]
+        stock_contracts = sum(
+            1
+            for metadata in self.symbol_instrument_metadata.values()
+            if metadata.get("instrument_type") == "stock"
+        )
         logger.info(
-            "Data feed ready: mode=%s selected=%s sample=%s max_concurrent_requests=%s",
+            "Data feed ready: mode=%s selected=%s stock_contracts=%s sample=%s max_concurrent_requests=%s",
             self.universe_mode,
             len(self.symbol_mapping),
+            stock_contracts,
             sample_symbols,
             self.max_concurrent_requests,
         )
@@ -126,6 +135,7 @@ class BinanceKlineDataFeed:
             self.symbol_mapping = mapping
             self.symbol_quote_volume = quote_volume_map
             self.symbol_change_24h = change_24h_map
+            self.symbol_instrument_metadata = self._build_instrument_metadata_mapping(mapping)
             self._last_universe_refresh_ts = now
 
             if force or added or removed:
@@ -215,6 +225,7 @@ class BinanceKlineDataFeed:
         price = _safe_float(event.get("price"), 0.0)
         mc, fdv = await self._compute_mc_fdv(symbol=symbol, price=price)
 
+        event.update(self.symbol_instrument_metadata.get(symbol, {}))
         event["change_1h_pct"] = change_1h
         event["change_24h_pct"] = change_24h
         event["mc"] = mc
@@ -748,6 +759,16 @@ class BinanceKlineDataFeed:
                 len(mapping),
             )
         return mapping, quote_volume_map, change_24h_map
+
+    def _build_instrument_metadata_mapping(self, mapping: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+        markets = self.exchange.markets or {}
+        result: Dict[str, Dict[str, Any]] = {}
+        for raw_symbol, ccxt_symbol in mapping.items():
+            market = markets.get(ccxt_symbol)
+            if not isinstance(market, dict):
+                continue
+            result[raw_symbol] = binance_instrument_metadata(market)
+        return result
 
     def _fetch_1h_change_pct_sync(self, ccxt_symbol: str) -> Optional[float]:
         try:

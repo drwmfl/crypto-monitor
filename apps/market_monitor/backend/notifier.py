@@ -22,6 +22,11 @@ except ModuleNotFoundError:
         sys.path.insert(0, str(repo_root))
     from utils.telegram_alert import send_telegram_alert
 
+try:
+    from instrument_type import instrument_badge
+except ModuleNotFoundError:
+    from apps.market_monitor.backend.instrument_type import instrument_badge
+
 logger = logging.getLogger(__name__)
 VALID_LEVELS = {"low", "medium", "high"}
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -98,6 +103,7 @@ class AlertEvent:
     confidence: Optional[float] = None
     confidence_band: Optional[str] = None
     rvol: Optional[float] = None
+    instrument_type: Optional[str] = None
     alert_tier: Optional[str] = None
     repeat_count: int = 1
     merged_count: int = 0
@@ -357,6 +363,7 @@ class AlertNotifier:
             confidence=_safe_float(payload.get("confidence"), default=None),
             confidence_band=str(payload.get("confidence_band", "")),
             rvol=_safe_float(payload.get("rvol"), default=None),
+            instrument_type=str(payload.get("instrument_type", "")),
         )
         return await self.notify(event)
 
@@ -665,10 +672,12 @@ class AlertNotifier:
         confidence_band = str(event.confidence_band or "").strip().upper() or "N/A"
         token_name = self._token_name(event.symbol)
         direction_badge = f"{event.direction_icon()} {event.direction_label()}"
+        contract_badge = instrument_badge(event.instrument_type)
+        title_badge = f" | {contract_badge}" if contract_badge else ""
 
         first_push_warning = FIRST_DAILY_PUSH_WARNING if daily_push_count == 1 else ""
         lines = [
-            f"**{token_name}（今日第{daily_push_count}次推送）{first_push_warning} | {direction_badge} | {tier_label}**",
+            f"**{token_name}（今日第{daily_push_count}次推送）{first_push_warning}{title_badge} | {direction_badge} | {tier_label}**",
             (
                 f"核心变化：**{event.change_pct:+.2f}%**"
                 f"   现价：**{event.price:.6f}**"
