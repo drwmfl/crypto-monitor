@@ -25,6 +25,7 @@ except ModuleNotFoundError:
 logger = logging.getLogger(__name__)
 VALID_LEVELS = {"low", "medium", "high"}
 BEIJING_TZ = timezone(timedelta(hours=8))
+FIRST_DAILY_PUSH_WARNING = "⚠️"
 DEFAULT_PUSH_POLICY: Dict[str, Any] = {
     "repeat_window_minutes": 10,
     "merge_window_minutes": 8,
@@ -665,8 +666,9 @@ class AlertNotifier:
         token_name = self._token_name(event.symbol)
         direction_badge = f"{event.direction_icon()} {event.direction_label()}"
 
+        first_push_warning = FIRST_DAILY_PUSH_WARNING if daily_push_count == 1 else ""
         lines = [
-            f"**{token_name}（今日第{daily_push_count}次推送） | {direction_badge} | {tier_label}**",
+            f"**{token_name}（今日第{daily_push_count}次推送）{first_push_warning} | {direction_badge} | {tier_label}**",
             (
                 f"核心变化：**{event.change_pct:+.2f}%**"
                 f"   现价：**{event.price:.6f}**"
@@ -1411,8 +1413,9 @@ class AlertNotifier:
             count = max(1, int(daily_push_count or 0))
         except (TypeError, ValueError):
             return message
-        pattern = r"（(?:今日第\d+次推送|触发\d+次)）"
-        replacement = f"（今日第{count}次推送）"
+        pattern = rf"（(?:今日第\d+次推送|触发\d+次)）(?:{re.escape(FIRST_DAILY_PUSH_WARNING)})?"
+        first_push_warning = FIRST_DAILY_PUSH_WARNING if count == 1 else ""
+        replacement = f"（今日第{count}次推送）{first_push_warning}"
         updated, replaced = re.subn(pattern, replacement, message, count=1)
         return updated if replaced else message
 
