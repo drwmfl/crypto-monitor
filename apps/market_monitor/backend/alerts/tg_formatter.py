@@ -19,6 +19,13 @@ ALERT_TYPE_LABELS = {
     "strong_direct_alert": "急速异动",
     "startup_alert": "启动预警",
 }
+ALERT_TYPE_ICONS = {
+    "watchlist_alert": "👀",
+    "actionable_alert": "💎",
+    "risk_alert": "🚨",
+    "strong_direct_alert": "⚡",
+    "startup_alert": "🚀",
+}
 
 DETAIL_LEVELS = {"compact", "full", "verbose"}
 ACCUMULATION_STATUS_LABELS = {
@@ -57,6 +64,7 @@ def format_strategy_alert(
     accumulation = candidate.accumulation or {}
     latest = candidate.latest_features or {}
     alert_label = ALERT_TYPE_LABELS.get(decision.alert_type, "观察候选")
+    alert_icon = ALERT_TYPE_ICONS.get(decision.alert_type, "👀")
     token_name = str(candidate.base_asset or "").strip().upper() or _token_name(candidate.symbol)
     trigger_count = max(1, int(candidate.event_count or 0))
     direction = _direction_label(str(latest.get("direction") or ""))
@@ -67,9 +75,9 @@ def format_strategy_alert(
     title_badge = f" | {badge}" if badge else ""
 
     lines = [
-        f"**{alert_label} | {token_name}（触发{trigger_count}次）{title_badge}**",
-        f"状态：OI {_oi_state_label(derivatives)} | Micro {_micro_state_label(derivatives)} | {direction} {windows}",
-        f"价格：{change} | {price} | 评分/风险 {candidate.score:.1f}/{candidate.risk_score:.1f}",
+        f"**{alert_icon} {alert_label} | {token_name}（触发{trigger_count}次）{title_badge}**",
+        f"🧭 状态：OI {_oi_state_label(derivatives)} | Micro {_micro_state_label(derivatives)} | {direction} {windows}",
+        f"💵 价格：{change} | {price} | 评分/风险 {candidate.score:.1f}/{candidate.risk_score:.1f}",
     ]
     completeness_line = _factor_completeness_line(candidate.factor_snapshot or {})
     if completeness_line:
@@ -79,9 +87,9 @@ def format_strategy_alert(
         lines.append(pressure_line)
     lines.extend(
         [
-            f"OI: {_oi_matrix(derivatives)}",
-            f"微结构: {_micro_matrix(derivatives)}",
-            f"资金: {_funding_matrix(derivatives)}",
+            f"📊 OI: {_oi_matrix(derivatives)}",
+            f"🔬 微结构: {_micro_matrix(derivatives)}",
+            f"💰 资金: {_funding_matrix(derivatives)}",
         ]
     )
     strong_direct_line = _strong_direct_line(latest, decision.alert_type)
@@ -99,15 +107,15 @@ def format_strategy_alert(
     if _normalize_detail_level(detail_level) != "compact":
         source = _source_label(str(latest.get("source") or latest.get("trigger_source") or ""))
         event_name = str(latest.get("event_type") or latest.get("rule_name") or "N/A")
-        lines.append(f"事件：{event_name} | 来源 {source}")
+        lines.append(f"🧾 事件：{event_name} | 来源 {source}")
         oi_reason = str(derivatives.get("oi_reason") or "").strip()
         micro_reason = str(derivatives.get("micro_reason") or "").strip()
         if oi_reason:
-            lines.append(f"OI解释：{oi_reason}")
+            lines.append(f"📊 OI解释：{oi_reason}")
         if micro_reason:
-            lines.append(f"微结构解释：{micro_reason}")
+            lines.append(f"🔬 微结构解释：{micro_reason}")
 
-    lines.append(f"https://www.binance.com/futures/{candidate.symbol}")
+    lines.append(f"🔗 https://www.binance.com/futures/{candidate.symbol}")
     return "\n".join(lines)
 
 
@@ -152,7 +160,7 @@ def _accumulation_line(accumulation: Dict[str, Any]) -> str:
     range_pct = _fmt_pct_plain(accumulation.get("range_pct"))
     vol_ratio = _fmt_x(accumulation.get("recent_vol_ratio_7d"))
     market_cap = _fmt_compact_usd(accumulation.get("market_cap"))
-    return f"收筹：{status} {score} | 横盘 {days}天 | 区间 {range_pct} | Vol {vol_ratio} | 市值 {market_cap}"
+    return f"🧲 收筹：{status} {score} | 横盘 {days}天 | 区间 {range_pct} | Vol {vol_ratio} | 市值 {market_cap}"
 
 
 def _position_pressure_line(pressure: Dict[str, Any]) -> str:
@@ -185,7 +193,7 @@ def _position_pressure_line(pressure: Dict[str, Any]) -> str:
     label = state_labels.get(state, state)
     raw_driver = str(pressure.get("driver") or "")
     driver = driver_labels.get(raw_driver, raw_driver or "未知")
-    return f"仓位：{label} | {driver} | 可信度 {confidence:.0f}"
+    return f"⚖️ 仓位：{label} | {driver} | 可信度 {confidence:.0f}"
 
 
 def _startup_line(latest: Dict[str, Any], alert_type: str) -> str:
@@ -195,7 +203,7 @@ def _startup_line(latest: Dict[str, Any], alert_type: str) -> str:
     change = _fmt_pct(latest.get("startup_change_pct"))
     rvol = _fmt_x(latest.get("startup_rvol"))
     breakout = _fmt_pct(latest.get("startup_breakout_distance_pct"))
-    return f"启动: {window}累计 {change} | RVOL {rvol} | 距60m高点 {breakout} | 高波动仅观察"
+    return f"🚀 启动: {window}累计 {change} | RVOL {rvol} | 距60m高点 {breakout} | 高波动仅观察"
 
 
 def _strong_direct_line(latest: Dict[str, Any], alert_type: str) -> str:
@@ -203,10 +211,10 @@ def _strong_direct_line(latest: Dict[str, Any], alert_type: str) -> str:
         return ""
     direction = str(latest.get("direction") or "").strip().lower()
     if direction == "down":
-        return "提示: 急速下杀/风险释放，偏短线观察；非做多入场信号"
+        return "💡 提示: 急速下杀/风险释放，偏短线观察；非做多入场信号"
     if direction == "up":
-        return "提示: 急速拉升已过滤过热，仍属短线波动雷达；不建议无脑追涨"
-    return "提示: 急速波动，仅观察，不代表入场"
+        return "💡 提示: 急速拉升已过滤过热，仍属短线波动雷达；不建议无脑追涨"
+    return "💡 提示: 急速波动，仅观察，不代表入场"
 
 
 def _accumulation_status_label(status: Any) -> str:
@@ -309,10 +317,10 @@ def _factor_completeness_line(snapshot: Dict[str, Any]) -> str:
         liquidation_status = str(statuses.get("liquidation") or "").strip().lower()
     status_suffix = " | 爆仓近5m无强平" if liquidation_status == "none_recent" else ""
     if available >= total:
-        return f"数据：衍生品完整 {available}/{total}{status_suffix}"
+        return f"🧩 数据：衍生品完整 {available}/{total}{status_suffix}"
     missing = completeness.get("missing")
     missing_labels = _factor_group_labels(missing if isinstance(missing, list) else [])
-    prefix = "数据：衍生品不足" if pct < 50.0 else "数据：衍生品"
+    prefix = "🧩 数据：衍生品不足" if pct < 50.0 else "🧩 数据：衍生品"
     missing_suffix = f" | 缺 {missing_labels}" if missing_labels else ""
     return f"{prefix} {available}/{total} {pct:.0f}%{missing_suffix}{status_suffix}"
 

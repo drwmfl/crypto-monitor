@@ -275,45 +275,45 @@ def _build_summary_message(payload: Dict[str, Any], pool_path: Path, limit: int)
     generated_at = _format_beijing_time(str(payload.get("generated_at") or ""))
     total_count = int(payload.get("count") or len(symbols))
     lines = [
-        f"<b>吸筹池日报 | 重点观察 Top{len(focus_items)}</b>",
-        f"时间：{_html(generated_at)}",
+        f"<b>📋 吸筹池日报 | 重点观察 Top{len(focus_items)}</b>",
+        f"🕒 时间：{_html(generated_at)}",
         (
-            f"概览：入池 <b>{total_count}</b> | "
+            f"📊 概览：入池 <b>{total_count}</b> | "
             f"放量 <b>{status_counts.get('ready', 0)}</b> | "
             f"升温 <b>{status_counts.get('warming', 0)}</b> | "
             f"沉淀 <b>{status_counts.get('dormant', 0)}</b>"
         ),
-        "筛选：区间内、量能不过热、横盘>=80天优先；突破/爆量只列风险观察",
-        f"文件：<code>{_html(pool_path.name)}</code>",
+        "🎯 筛选：区间内、量能不过热、横盘>=80天优先；突破/爆量只列风险观察",
+        f"📁 文件：<code>{_html(pool_path.name)}</code>",
         "",
     ]
 
     if not items:
-        lines.append("暂无放量/升温标的。")
+        lines.append("ℹ️ 暂无放量/升温标的。")
         return "\n".join(lines)
 
-    lines.append("<b>重点观察</b>")
+    lines.append("<b>🎯 重点观察</b>")
     if focus_items:
         for idx, item in enumerate(focus_items, start=1):
             if idx > 1:
                 lines.append("")
             _append_focus_item(lines, idx, item)
     else:
-        lines.append("暂无符合重点条件，今日只保留备选/风险观察。")
+        lines.append("ℹ️ 暂无符合重点条件，今日只保留备选/风险观察。")
 
     if backup_items:
-        lines.extend(["", "<b>备选观察</b>"])
+        lines.extend(["", "<b>👀 备选观察</b>"])
         for idx, item in enumerate(backup_items, start=1):
             lines.append(_compact_item_line(idx, item, include_flags=False))
 
     if risk_items:
-        lines.extend(["", "<b>风险观察</b>"])
+        lines.extend(["", "<b>🚨 风险观察</b>"])
         for idx, item in enumerate(risk_items, start=1):
             lines.append(_compact_item_line(idx, item, include_flags=True))
 
     hidden_count = max(0, len(items) - len(focus_items) - len(backup_items) - len(risk_items))
     if hidden_count:
-        lines.extend(["", f"其余 {hidden_count} 个放量/升温标的已收起，避免日报噪音过多。"])
+        lines.extend(["", f"ℹ️ 其余 {hidden_count} 个放量/升温标的已收起，避免日报噪音过多。"])
     return "\n".join(lines)
 
 
@@ -392,9 +392,9 @@ def _append_focus_item(lines: List[str], idx: int, item: Dict[str, Any]) -> None
     suffix = f" | {'/'.join(flags)}" if flags else ""
     lines.extend(
         [
-            f"{idx}. {symbol_label}  {status_label}  评分 <b>{score:.1f}</b>{_html(suffix)}",
-            f"   横盘：{sideways_days}天 | 区间：{range_pct:.1f}% | 位置：{range_position:.0f}%",
-            f"   量能：Vol {vol_ratio:.1f}x | 市值：{_html(market_cap)}",
+            f"🪙 {idx}. {symbol_label}  {status_label}  评分 <b>{score:.1f}</b>{_html(suffix)}",
+            f"   📐 横盘：{sideways_days}天 | 区间：{range_pct:.1f}% | 位置：{range_position:.0f}%",
+            f"   📊 量能：Vol {vol_ratio:.1f}x | 市值：{_html(market_cap)}",
         ]
     )
 
@@ -408,7 +408,7 @@ def _compact_item_line(idx: int, item: Dict[str, Any], *, include_flags: bool) -
     range_position = _safe_float(item.get("range_position")) * 100.0
     vol_ratio = _safe_float(item.get("recent_vol_ratio_7d"))
     text = (
-        f"{idx}. {symbol_label} {status_label} | 评 {score:.1f} | "
+        f"🪙 {idx}. {symbol_label} {status_label} | 评 {score:.1f} | "
         f"位 {range_position:.0f}% | Vol {vol_ratio:.1f}x"
     )
     if include_flags:
@@ -422,10 +422,10 @@ def _build_failure_message(max_attempts: int, last_error: str) -> str:
     error_text = _html(str(last_error or "unknown")[:300])
     return "\n".join(
         [
-            "<b>吸筹池日报失败</b>",
-            f"时间：{_html(datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S UTC+8'))}",
-            f"尝试：{max_attempts} 次",
-            f"最后错误：{error_text}",
+            "<b>❌ 吸筹池日报失败</b>",
+            f"🕒 时间：{_html(datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S UTC+8'))}",
+            f"🔁 尝试：{max_attempts} 次",
+            f"🧾 最后错误：{error_text}",
         ]
     )
 

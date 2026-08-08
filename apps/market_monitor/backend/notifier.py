@@ -677,26 +677,26 @@ class AlertNotifier:
 
         first_push_warning = FIRST_DAILY_PUSH_WARNING if daily_push_count == 1 else ""
         lines = [
-            f"**{token_name}（今日第{daily_push_count}次推送）{first_push_warning}{title_badge} | {direction_badge} | {tier_label}**",
+            f"**📣 {token_name}（今日第{daily_push_count}次推送）{first_push_warning}{title_badge} | {direction_badge} | {tier_label}**",
             (
-                f"核心变化：**{event.change_pct:+.2f}%**"
+                f"💵 核心变化：**{event.change_pct:+.2f}%**"
                 f"   现价：**{event.price:.6f}**"
             ),
-            f"1h/24h：**{self._format_change_pct(event.change_1h_pct)} / {self._format_change_pct(event.change_24h_pct)}**",
-            f"MC/FDV：**{self._format_compact_usd(event.mc)} / {self._format_compact_usd(event.fdv)}**",
-            f"时间：**{event.format_time()}**",
+            f"🕒 1h/24h：**{self._format_change_pct(event.change_1h_pct)} / {self._format_change_pct(event.change_24h_pct)}**",
+            f"💰 MC/FDV：**{self._format_compact_usd(event.mc)} / {self._format_compact_usd(event.fdv)}**",
+            f"⏰ 时间：**{event.format_time()}**",
             "",
-            f"触发依据：**{self._trigger_basis_summary(event, confidence_band)}**",
+            f"🎯 触发依据：**{self._trigger_basis_summary(event, confidence_band)}**",
         ]
         coalesced_change_line = self._coalesced_change_summary(event)
         if coalesced_change_line:
-            lines.append(f"周期变化：**{coalesced_change_line}**")
+            lines.append(f"📊 周期变化：**{coalesced_change_line}**")
 
         flow_summary = self._flow_metrics_summary(event)
         if flow_summary:
-            lines.append(f"量能指标：**{flow_summary}**")
+            lines.append(f"📈 量能指标：**{flow_summary}**")
         if event.window_label() == "1m" and event.repeat_count >= 2:
-            lines.append(f"1m同向连发：**{event.repeat_count} 次（10分钟内）**")
+            lines.append(f"🔁 1m同向连发：**{event.repeat_count} 次（10分钟内）**")
         if event.merged_count > 0:
             peak_text = (
                 f"{event.merged_peak_change_pct:+.2f}%"
@@ -704,9 +704,9 @@ class AlertNotifier:
                 else "N/A"
             )
             lines.append(
-                f"合并更新：**8 分钟内同向额外触发 {event.merged_count} 次，峰值 {peak_text}**"
+                f"🧾 合并更新：**8 分钟内同向额外触发 {event.merged_count} 次，峰值 {peak_text}**"
             )
-        lines.append(binance_link)
+        lines.append(f"🔗 {binance_link}")
         return "\n".join(lines)
 
 
