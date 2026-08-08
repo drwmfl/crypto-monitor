@@ -257,6 +257,18 @@
     "derivatives_shadow_review_min_days": 7.0,
     "derivatives_shadow_review_min_first_push_samples": 100,
     "derivatives_shadow_review_timezone": "Asia/Shanghai",
+    "position_pressure_shadow_enabled": true,
+    "position_pressure_shadow_file": "position_pressure_shadow.jsonl",
+    "position_pressure_summary_file": "position_pressure_readiness.json",
+    "position_pressure_state_file": "position_pressure_state.json",
+    "position_pressure_policy_version": "position-pressure-v1-shadow",
+    "position_pressure_review_min_days": 7.0,
+    "position_pressure_review_min_first_push_samples": 100,
+    "position_pressure_review_min_smart_money_coverage_pct": 50.0,
+    "position_pressure_review_min_liquidation_coverage_pct": 90.0,
+    "position_pressure_review_timezone": "Asia/Shanghai",
+    "position_pressure_risk_enabled": false,
+    "position_pressure_confirmation_enabled": false,
     "candidate_ttl_minutes": 120,
     "min_watch_score": 50.0,
     "min_actionable_score": 75.0,
@@ -382,7 +394,7 @@
       "binance": {
         "enabled": true,
         "base_url": "https://fapi.binance.com",
-        "timeout_sec": 3.0,
+        "timeout_sec": 8.0,
         "depth_limit": 100,
         "depth_levels": 20,
         "fetch_open_interest": true,
@@ -392,7 +404,7 @@
         "fetch_long_short_ratio": false,
         "fetch_taker_buy_sell": true,
         "fetch_orderbook": true,
-        "fetch_liquidations": true,
+        "fetch_liquidations": false,
         "liquidation_lookback_minutes": 5,
         "open_interest_hist_period": "5m",
         "open_interest_hist_limit": 576,
@@ -457,7 +469,7 @@
         },
         "microstructure": {
           "enabled": true,
-          "ws_url": "wss://fstream.binance.com/ws",
+          "ws_url": "wss://fstream.binance.com/market/stream",
           "rest_base_url": "https://fapi.binance.com",
           "bootstrap_agg_trades_enabled": true,
           "bootstrap_lookback_sec": 300,
@@ -476,6 +488,23 @@
             180,
             300
           ],
+          "liquidation_windows_sec": [
+            60,
+            300,
+            900,
+            3600
+          ],
+          "global_liquidation_enabled": true,
+          "liquidation_decision_enabled": false,
+          "liquidation_history": {
+            "enabled": true,
+            "state_file": "liquidation_v2_state.json",
+            "event_file": "liquidation_v2_events.jsonl",
+            "retention_sec": 7200,
+            "max_events_per_symbol": 2000,
+            "save_interval_sec": 5.0,
+            "restore_tail_bytes": 8388608
+          },
           "signal_thresholds": {
             "min_trade_notional_1m": 25000.0,
             "min_trade_notional_5m": 100000.0,
@@ -509,6 +538,53 @@
             "oi_positive_15m": 0.015,
             "oi_positive_1h": 0.015
           }
+        }
+      },
+      "smart_money": {
+        "enabled": true,
+        "base_url": "https://www.binance.com",
+        "timeout_sec": 3.0,
+        "poll_interval_sec": 300,
+        "stale_after_sec": 900,
+        "track_ttl_sec": 1800,
+        "max_active_symbols": 12,
+        "concurrency": 1,
+        "request_spacing_sec": 1.0,
+        "rate_limit_cooldown_sec": 3600,
+        "stats_time_ranges": [
+          "30m",
+          "1h"
+        ],
+        "state_file": "smart_money_state.json",
+        "history_file": "smart_money_history.jsonl",
+        "max_history_samples": 360,
+        "min_sample_interval_sec": 45,
+        "save_interval_sec": 10.0
+      },
+      "position_pressure": {
+        "enabled": true,
+        "phase": "shadow",
+        "display_enabled": false,
+        "risk_enabled": false,
+        "confirmation_enabled": false,
+        "thresholds": {
+          "crowded_share": 0.7,
+          "extreme_share": 0.82,
+          "profitable_control_ratio": 0.65,
+          "pain_entry_gap_pct": 0.01,
+          "pain_profit_ratio": 0.55,
+          "smart_flow_imbalance": 0.15,
+          "position_retention_floor": -0.03,
+          "oi_positive": 0.01,
+          "oi_falling": -0.015,
+          "market_buy_ratio_up": 0.55,
+          "market_buy_ratio_down": 0.45,
+          "liquidation_noise_floor_usdt": 20000.0,
+          "liquidation_side_share": 0.6,
+          "liquidation_volume_ratio": 0.03,
+          "liquidation_oi_ratio": 0.001,
+          "liquidation_large_usdt": 100000.0,
+          "exhaustion_abs_change_pct": 6.0
         }
       },
       "accumulation_pool": {

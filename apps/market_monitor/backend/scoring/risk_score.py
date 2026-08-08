@@ -8,7 +8,10 @@ except ModuleNotFoundError:
     from apps.market_monitor.backend.candidates.candidate_models import Candidate
 
 
-def score_risk(candidate: Candidate) -> Tuple[float, str, Dict[str, Any]]:
+def score_risk(
+    candidate: Candidate,
+    settings: Dict[str, Any] | None = None,
+) -> Tuple[float, str, Dict[str, Any]]:
     latest = candidate.latest_features or {}
     latest_change = abs(_safe_float(latest.get("change_pct"), 0.0))
     max_change = max(latest_change, float(candidate.max_abs_change_pct or 0.0))
@@ -47,6 +50,7 @@ def score_risk(candidate: Candidate) -> Tuple[float, str, Dict[str, Any]]:
     derivatives_risk = _risk_derivatives(candidate)
     orderbook_risk = _risk_orderbook(candidate)
     liquidation_risk = _risk_liquidation(candidate)
+    position_pressure_risk = _risk_position_pressure(candidate, settings or {})
     accumulation_risk = _risk_accumulation(candidate)
 
     total = round(
@@ -61,6 +65,7 @@ def score_risk(candidate: Candidate) -> Tuple[float, str, Dict[str, Any]]:
             + derivatives_risk
             + orderbook_risk
             + liquidation_risk
+            + position_pressure_risk
             + accumulation_risk,
         ),
         2,
@@ -77,6 +82,7 @@ def score_risk(candidate: Candidate) -> Tuple[float, str, Dict[str, Any]]:
         "derivatives_risk": round(derivatives_risk, 2),
         "orderbook_risk": round(orderbook_risk, 2),
         "liquidation_risk": round(liquidation_risk, 2),
+        "position_pressure_risk": round(position_pressure_risk, 2),
         "accumulation_risk": round(accumulation_risk, 2),
         "raw": {
             "latest_window": latest_window,
@@ -178,6 +184,15 @@ def _risk_liquidation(candidate: Candidate) -> float:
     return min(12.0, total_liq / 250000.0)
 
 
+def _risk_position_pressure(candidate: Candidate, settings: Dict[str, Any]) -> float:
+    if not _parse_bool(settings.get("position_pressure_risk_enabled"), False):
+        return 0.0
+    pressure = candidate.position_pressure or {}
+    if not pressure.get("risk_enabled"):
+        return 0.0
+    return max(0.0, min(8.0, _safe_float(pressure.get("risk_modifier"), 0.0)))
+
+
 def _risk_accumulation(candidate: Candidate) -> float:
     accumulation = candidate.accumulation or {}
     if not accumulation or not accumulation.get("in_accumulation_pool"):
@@ -207,6 +222,19 @@ def _safe_float(value: Any, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _parse_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
 
 
 def _oi_signal_rank(level: str) -> int:

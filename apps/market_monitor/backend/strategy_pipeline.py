@@ -10,6 +10,7 @@ from typing import Any, Dict, Optional
 
 try:
     from alerts.derivatives_shadow_recorder import DerivativesShadowRecorder
+    from alerts.position_pressure_shadow_recorder import PositionPressureShadowRecorder
     from alerts.event_deduper import EventDeduper
     from alerts.alert_policy import AlertDecision, AlertPolicy
     from alerts.tg_formatter import format_strategy_alert
@@ -22,6 +23,7 @@ try:
     from scoring.risk_score import score_risk
 except ModuleNotFoundError:
     from apps.market_monitor.backend.alerts.derivatives_shadow_recorder import DerivativesShadowRecorder
+    from apps.market_monitor.backend.alerts.position_pressure_shadow_recorder import PositionPressureShadowRecorder
     from apps.market_monitor.backend.alerts.event_deduper import EventDeduper
     from apps.market_monitor.backend.alerts.alert_policy import AlertDecision, AlertPolicy
     from apps.market_monitor.backend.alerts.tg_formatter import format_strategy_alert
@@ -71,6 +73,7 @@ class AlertStrategyPipeline:
             shadow_file or "actionable_policy_shadow.jsonl"
         )
         self.derivatives_shadow_recorder = DerivativesShadowRecorder(self.settings)
+        self.position_pressure_shadow_recorder = PositionPressureShadowRecorder(self.settings)
         self._prewarm_last_ts: Dict[str, float] = {}
         self._prewarm_tasks: set[asyncio.Task] = set()
 
@@ -88,13 +91,26 @@ class AlertStrategyPipeline:
     def direct_tg_enabled(self) -> bool:
         return _parse_bool(self.settings.get("direct_tg_enabled"), False)
 
+    def start_background_tasks(self) -> None:
+        self.factor_enricher.start_background_tasks()
+
+    async def close(self) -> None:
+        tasks = list(self._prewarm_tasks)
+        self._prewarm_tasks.clear()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        await self.factor_enricher.close()
+
     async def process_event(self, payload: Dict[str, Any], *, source: str, notifier: Any) -> StrategyProcessResult:
         raw_event = RawEvent.from_alert_payload(payload, source=source)
         self.event_store.append(raw_event)
 
         candidate = self.candidate_engine.update_candidate(raw_event)
         score, score_breakdown, priority = score_candidate(candidate)
-        risk_score_value, risk_level, risk_breakdown = score_risk(candidate)
+        risk_score_value, risk_level, risk_breakdown = score_risk(candidate, self.settings)
 
         candidate.score = score
         candidate.score_breakdown = score_breakdown
@@ -162,6 +178,12 @@ class AlertStrategyPipeline:
                 alert_sent=alert_sent,
                 dedupe_reason=dedupe_decision.reason if dedupe_decision else "not_checked",
             )
+            self._record_position_pressure_shadow(
+                candidate,
+                decision=decision,
+                alert_sent=alert_sent,
+                dedupe_reason=dedupe_decision.reason if dedupe_decision else "not_checked",
+            )
             return StrategyProcessResult(
                 candidate_id=candidate.candidate_id,
                 alert_sent=alert_sent,
@@ -223,6 +245,12 @@ class AlertStrategyPipeline:
                 alert_sent=alert_sent,
                 dedupe_reason=dedupe_decision.reason if dedupe_decision else "not_checked",
             )
+            self._record_position_pressure_shadow(
+                candidate,
+                decision=decision,
+                alert_sent=alert_sent,
+                dedupe_reason=dedupe_decision.reason if dedupe_decision else "not_checked",
+            )
             return StrategyProcessResult(
                 candidate_id=candidate.candidate_id,
                 alert_sent=alert_sent,
@@ -266,6 +294,12 @@ class AlertStrategyPipeline:
             dedupe_reason=dedupe_decision.reason if dedupe_decision else "not_checked",
         )
         self._record_derivatives_shadow(
+            candidate,
+            decision=decision,
+            alert_sent=alert_sent,
+            dedupe_reason=dedupe_decision.reason if dedupe_decision else "not_checked",
+        )
+        self._record_position_pressure_shadow(
             candidate,
             decision=decision,
             alert_sent=alert_sent,
@@ -321,7 +355,7 @@ class AlertStrategyPipeline:
 
     def _recalculate_candidate(self, candidate: Any) -> None:
         score, score_breakdown, priority = score_candidate(candidate)
-        risk_score_value, risk_level, risk_breakdown = score_risk(candidate)
+        risk_score_value, risk_level, risk_breakdown = score_risk(candidate, self.settings)
         candidate.score = score
         candidate.score_breakdown = score_breakdown
         candidate.priority = priority
@@ -485,6 +519,88 @@ class AlertStrategyPipeline:
             self.derivatives_shadow_recorder.record(row, alert_sent=alert_sent)
         except Exception as exc:
             logger.debug("Failed to record derivatives shadow: symbol=%s err=%s", candidate.symbol, exc)
+
+    def _record_position_pressure_shadow(
+        self,
+        candidate: Any,
+        *,
+        decision: AlertDecision,
+        alert_sent: bool,
+        dedupe_reason: str,
+    ) -> None:
+        if not _parse_bool(self.settings.get("position_pressure_shadow_enabled"), True):
+            return
+        try:
+            snapshot = candidate.factor_snapshot if isinstance(candidate.factor_snapshot, dict) else {}
+            latest = candidate.latest_features if isinstance(candidate.latest_features, dict) else {}
+            confirmation = candidate.confirmation if isinstance(candidate.confirmation, dict) else {}
+            checks = confirmation.get("checks") if isinstance(confirmation.get("checks"), list) else []
+            liquidation_passed = any(
+                isinstance(check, dict)
+                and str(check.get("key") or "") == "liquidation"
+                and bool(check.get("passed"))
+                for check in checks
+            )
+            pressure = candidate.position_pressure if isinstance(candidate.position_pressure, dict) else {}
+            shadow_confirmation = bool(pressure.get("shadow_confirmation_passed"))
+            current_confirmation_count = confirmation_count(candidate)
+            proposed_confirmation_count = max(
+                0,
+                current_confirmation_count - int(liquidation_passed) + int(shadow_confirmation),
+            )
+            risk_modifier = _to_float(pressure.get("shadow_risk_modifier"), 0.0)
+            row = {
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "policy_version": pressure.get("policy_version")
+                or self.settings.get("position_pressure_policy_version")
+                or "position-pressure-v1-shadow",
+                "symbol": candidate.symbol,
+                "base_asset": getattr(candidate, "base_asset", ""),
+                "candidate_id": candidate.candidate_id,
+                "alert_type": decision.alert_type,
+                "event_count": int(candidate.event_count or 0),
+                "latest_event": {
+                    "event_id": latest.get("event_id"),
+                    "event_type": latest.get("event_type"),
+                    "event_time": latest.get("event_time"),
+                    "window": latest.get("window"),
+                    "direction": latest.get("direction"),
+                    "price": latest.get("price"),
+                    "change_pct": latest.get("change_pct"),
+                    "rvol": latest.get("rvol"),
+                },
+                "actual_decision": {
+                    "alert_type": decision.alert_type,
+                    "should_send": bool(decision.should_send),
+                    "reason": decision.reason,
+                    "dedupe_reason": dedupe_reason,
+                    "alert_sent": bool(alert_sent),
+                    "score": float(candidate.score or 0.0),
+                    "risk_score": float(candidate.risk_score or 0.0),
+                    "confirmation_count": current_confirmation_count,
+                },
+                "shadow_decision": {
+                    "risk_modifier": risk_modifier,
+                    "proposed_risk_score": round(min(100.0, float(candidate.risk_score or 0.0) + risk_modifier), 2),
+                    "legacy_liquidation_confirmation": liquidation_passed,
+                    "position_pressure_confirmation": shadow_confirmation,
+                    "proposed_confirmation_count": proposed_confirmation_count,
+                },
+                "smart_money": dict(candidate.smart_money or {}),
+                "liquidation_v2": dict(candidate.liquidation_v2 or {}),
+                "position_pressure": dict(pressure),
+                "position_pressure_completeness": (
+                    snapshot.get("position_pressure_completeness")
+                    if isinstance(snapshot.get("position_pressure_completeness"), dict)
+                    else {}
+                ),
+                "source_health": snapshot.get("source_health")
+                if isinstance(snapshot.get("source_health"), dict)
+                else {},
+            }
+            self.position_pressure_shadow_recorder.record(row, alert_sent=alert_sent)
+        except Exception as exc:
+            logger.debug("Failed to record position pressure shadow: symbol=%s err=%s", candidate.symbol, exc)
 
     def _record_factor_quality(self, candidate: Any, alert_type: str, reason: str = "") -> None:
         try:

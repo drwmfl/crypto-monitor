@@ -11,12 +11,16 @@ try:
     from factors.binance_factors import BinanceFactorProvider
     from factors.factor_models import FactorSnapshot, merge_factor_snapshot, recent_health_entry
     from factors.microstructure import MicrostructureProvider
+    from factors.position_pressure import classify_position_pressure
+    from factors.smart_money import SmartMoneyProvider
 except ModuleNotFoundError:
     from apps.market_monitor.backend.candidates.candidate_models import Candidate
     from apps.market_monitor.backend.factors.accumulation_pool import AccumulationPoolProvider
     from apps.market_monitor.backend.factors.binance_factors import BinanceFactorProvider
     from apps.market_monitor.backend.factors.factor_models import FactorSnapshot, merge_factor_snapshot, recent_health_entry
     from apps.market_monitor.backend.factors.microstructure import MicrostructureProvider
+    from apps.market_monitor.backend.factors.position_pressure import classify_position_pressure
+    from apps.market_monitor.backend.factors.smart_money import SmartMoneyProvider
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +41,37 @@ class FactorEnricher:
             if isinstance(binance_settings.get("microstructure"), dict)
             else {}
         )
+        if self.settings.get("runtime_dir") and not microstructure_settings.get("runtime_dir"):
+            microstructure_settings["runtime_dir"] = self.settings.get("runtime_dir")
         self.microstructure_provider = MicrostructureProvider(microstructure_settings)
+        smart_money_settings = (
+            dict(self.settings.get("smart_money", {}) or {})
+            if isinstance(self.settings.get("smart_money"), dict)
+            else {}
+        )
+        if self.settings.get("runtime_dir") and not smart_money_settings.get("runtime_dir"):
+            smart_money_settings["runtime_dir"] = self.settings.get("runtime_dir")
+        self.smart_money_provider = SmartMoneyProvider(smart_money_settings)
+        self.position_pressure_settings = (
+            dict(self.settings.get("position_pressure", {}) or {})
+            if isinstance(self.settings.get("position_pressure"), dict)
+            else {}
+        )
         accumulation_settings = dict(self.settings.get("accumulation_pool", {}) or {})
         if self.settings.get("runtime_dir") and not accumulation_settings.get("runtime_dir"):
             accumulation_settings["runtime_dir"] = self.settings.get("runtime_dir")
         self.accumulation_provider = AccumulationPoolProvider(accumulation_settings)
         self._cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
+
+    def start_background_tasks(self) -> None:
+        if not self.enabled:
+            return
+        self.microstructure_provider.start()
+        self.smart_money_provider.start()
+
+    async def close(self) -> None:
+        await self.smart_money_provider.close()
+        await self.microstructure_provider.close()
 
     def should_enrich(self, candidate: Candidate, base_score: float) -> bool:
         if not self.enabled:
@@ -100,7 +129,28 @@ class FactorEnricher:
                 current_health["microstructure"] = recent_health_entry("microstructure", False, str(exc))
                 snapshot_dict["source_health"] = current_health
 
+        if self.smart_money_provider.enabled:
+            try:
+                smart_snapshot = await self.smart_money_provider.fetch(
+                    candidate.symbol,
+                    candidate.base_asset,
+                    price=_safe_float((candidate.latest_features or {}).get("price"), 0.0),
+                )
+                snapshot_dict = merge_factor_snapshot(snapshot_dict, smart_snapshot)
+            except Exception as exc:
+                logger.debug("Smart money factor enrich failed: symbol=%s err=%s", candidate.symbol, exc)
+                current_health = dict(snapshot_dict.get("source_health") or {})
+                current_health["smart_money"] = recent_health_entry("smart_money", False, str(exc))
+                snapshot_dict["source_health"] = current_health
+
         _derive_factor_changes(candidate, snapshot_dict)
+        snapshot_dict["position_pressure"] = classify_position_pressure(
+            smart_money=snapshot_dict.get("smart_money"),
+            liquidation_v2=snapshot_dict.get("liquidation_v2"),
+            derivatives=snapshot_dict.get("derivatives"),
+            latest=_candidate_context(candidate),
+            settings=self.position_pressure_settings,
+        )
         _annotate_factor_completeness(snapshot_dict)
         candidate.factor_snapshot = snapshot_dict
         candidate.factor_updated_at = str(snapshot_dict.get("updated_at") or "")
@@ -125,12 +175,18 @@ class FactorEnricher:
         if not self.enabled:
             return False
         latest = _candidate_context(candidate)
-        return await self.binance_provider.prewarm(
-            candidate.symbol,
-            candidate.base_asset,
-            price=_safe_float(latest.get("price"), 0.0),
-            context=latest,
-        )
+        tasks = [
+            self.binance_provider.prewarm(
+                candidate.symbol,
+                candidate.base_asset,
+                price=_safe_float(latest.get("price"), 0.0),
+                context=latest,
+            )
+        ]
+        if self.smart_money_provider.enabled:
+            tasks.append(self.smart_money_provider.prewarm(candidate.symbol))
+        results = await _gather_prewarm(tasks)
+        return any(results)
 
     async def prewarm_factors(self, candidate: Candidate) -> bool:
         if not self.enabled:
@@ -153,6 +209,8 @@ class FactorEnricher:
                     context=_micro_context(candidate, candidate.factor_snapshot or {}),
                 )
             )
+        if self.smart_money_provider.enabled:
+            tasks.append(self.smart_money_provider.prewarm(candidate.symbol))
         results = await _gather_prewarm(tasks)
         return any(results)
 
@@ -161,6 +219,9 @@ def _merge_snapshots(left: FactorSnapshot, right: FactorSnapshot) -> FactorSnaps
     left.derivatives.update(right.derivatives or {})
     left.orderbook.update(right.orderbook or {})
     left.liquidation.update(right.liquidation or {})
+    left.liquidation_v2.update(right.liquidation_v2 or {})
+    left.smart_money.update(right.smart_money or {})
+    left.position_pressure.update(right.position_pressure or {})
     left.accumulation.update(right.accumulation or {})
     left.source_health.update(right.source_health or {})
     left.updated_at = right.updated_at or left.updated_at
@@ -171,6 +232,9 @@ def _apply_factor_sections(candidate: Candidate, snapshot: Dict[str, Any]) -> No
     candidate.derivatives = dict(snapshot.get("derivatives") or {})
     candidate.orderbook = dict(snapshot.get("orderbook") or {})
     candidate.liquidation = dict(snapshot.get("liquidation") or {})
+    candidate.liquidation_v2 = dict(snapshot.get("liquidation_v2") or {})
+    candidate.smart_money = dict(snapshot.get("smart_money") or {})
+    candidate.position_pressure = dict(snapshot.get("position_pressure") or {})
     candidate.accumulation = dict(snapshot.get("accumulation") or {})
 
 
@@ -236,6 +300,30 @@ def _annotate_factor_completeness(snapshot: Dict[str, Any]) -> None:
         "pct": round(shadow_available / len(shadow_groups) * 100.0, 2),
         "groups": shadow_groups,
         "missing": [name for name, value in shadow_groups.items() if not value],
+    }
+    smart_money = snapshot.get("smart_money") if isinstance(snapshot.get("smart_money"), dict) else {}
+    liquidation_v2 = (
+        snapshot.get("liquidation_v2")
+        if isinstance(snapshot.get("liquidation_v2"), dict)
+        else {}
+    )
+    position_pressure = (
+        snapshot.get("position_pressure")
+        if isinstance(snapshot.get("position_pressure"), dict)
+        else {}
+    )
+    enhancement_groups = {
+        "smart_money": bool(smart_money.get("data_available") and smart_money.get("is_fresh", True)),
+        "liquidation_v2": bool(liquidation_v2.get("tracking")),
+        "position_pressure": bool(position_pressure.get("data_valid")),
+    }
+    enhancement_available = sum(1 for value in enhancement_groups.values() if value)
+    snapshot["position_pressure_completeness"] = {
+        "available": enhancement_available,
+        "total": len(enhancement_groups),
+        "pct": round(enhancement_available / len(enhancement_groups) * 100.0, 2),
+        "groups": enhancement_groups,
+        "missing": [name for name, value in enhancement_groups.items() if not value],
     }
 
 

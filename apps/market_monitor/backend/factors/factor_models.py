@@ -17,6 +17,9 @@ class FactorSnapshot:
     derivatives: Dict[str, Any] = field(default_factory=dict)
     orderbook: Dict[str, Any] = field(default_factory=dict)
     liquidation: Dict[str, Any] = field(default_factory=dict)
+    liquidation_v2: Dict[str, Any] = field(default_factory=dict)
+    smart_money: Dict[str, Any] = field(default_factory=dict)
+    position_pressure: Dict[str, Any] = field(default_factory=dict)
     accumulation: Dict[str, Any] = field(default_factory=dict)
     source_health: Dict[str, Any] = field(default_factory=dict)
 
@@ -34,7 +37,16 @@ def merge_factor_snapshot(existing: Optional[Dict[str, Any]], incoming: FactorSn
     result["symbol"] = incoming.symbol
     result["base_asset"] = incoming.base_asset
     result["updated_at"] = incoming.updated_at
-    for key in ("derivatives", "orderbook", "liquidation", "accumulation", "source_health"):
+    for key in (
+        "derivatives",
+        "orderbook",
+        "liquidation",
+        "liquidation_v2",
+        "smart_money",
+        "position_pressure",
+        "accumulation",
+        "source_health",
+    ):
         current = result.get(key)
         if not isinstance(current, dict):
             current = {}

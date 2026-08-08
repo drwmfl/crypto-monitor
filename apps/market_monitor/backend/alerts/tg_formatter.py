@@ -74,6 +74,9 @@ def format_strategy_alert(
     completeness_line = _factor_completeness_line(candidate.factor_snapshot or {})
     if completeness_line:
         lines.append(completeness_line)
+    pressure_line = _position_pressure_line(candidate.position_pressure or {})
+    if pressure_line:
+        lines.append(pressure_line)
     lines.extend(
         [
             f"OI: {_oi_matrix(derivatives)}",
@@ -150,6 +153,39 @@ def _accumulation_line(accumulation: Dict[str, Any]) -> str:
     vol_ratio = _fmt_x(accumulation.get("recent_vol_ratio_7d"))
     market_cap = _fmt_compact_usd(accumulation.get("market_cap"))
     return f"收筹：{status} {score} | 横盘 {days}天 | 区间 {range_pct} | Vol {vol_ratio} | 市值 {market_cap}"
+
+
+def _position_pressure_line(pressure: Dict[str, Any]) -> str:
+    if not pressure or not pressure.get("display_enabled") or not pressure.get("data_valid"):
+        return ""
+    confidence = _safe_optional_float(pressure.get("confidence"))
+    if confidence is None or confidence < 55.0:
+        return ""
+    state = str(pressure.get("state") or "unknown").strip().lower()
+    if state in {"unknown", "neutral", "no_active_pressure"}:
+        return ""
+    state_labels = {
+        "position_control": "持仓方控制",
+        "crowded": "仓位拥挤",
+        "pre_squeeze": "挤压预热",
+        "active_squeeze": "强平进行",
+        "exhaustion": "强平尾声",
+        "organic_continuation": "新增仓位延续",
+    }
+    driver_labels = {
+        "position_pressure": "持仓压力",
+        "short_cover": "空头回补",
+        "long_liquidation": "多头强平",
+        "new_positions": "新增仓位",
+        "profitable_shorts": "盈利空头",
+        "profitable_longs": "盈利多头",
+        "crowded_shorts": "空头拥挤",
+        "crowded_longs": "多头拥挤",
+    }
+    label = state_labels.get(state, state)
+    raw_driver = str(pressure.get("driver") or "")
+    driver = driver_labels.get(raw_driver, raw_driver or "未知")
+    return f"仓位：{label} | {driver} | 可信度 {confidence:.0f}"
 
 
 def _startup_line(latest: Dict[str, Any], alert_type: str) -> str:

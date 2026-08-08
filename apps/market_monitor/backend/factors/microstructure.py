@@ -15,8 +15,10 @@ except Exception:  # pragma: no cover
 
 try:
     from factors.factor_models import FactorSnapshot, recent_health_entry
+    from factors.liquidation_history import LiquidationHistoryStore
 except ModuleNotFoundError:
     from apps.market_monitor.backend.factors.factor_models import FactorSnapshot, recent_health_entry
+    from apps.market_monitor.backend.factors.liquidation_history import LiquidationHistoryStore
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,8 @@ WINDOW_LABELS = {
     60: "1m",
     180: "3m",
     300: "5m",
+    900: "15m",
+    3600: "1h",
 }
 
 DEFAULT_SIGNAL_THRESHOLDS: Dict[str, float] = {
@@ -322,7 +326,10 @@ class MicrostructureProvider:
     def __init__(self, settings: Optional[Dict[str, Any]] = None) -> None:
         self.settings = settings or {}
         self.enabled = _parse_bool(self.settings.get("enabled"), True)
-        self.ws_url = str(self.settings.get("ws_url") or "wss://fstream.binance.com/ws").strip() or "wss://fstream.binance.com/ws"
+        self.ws_url = (
+            str(self.settings.get("ws_url") or "wss://fstream.binance.com/market/stream").strip()
+            or "wss://fstream.binance.com/market/stream"
+        )
         self.rest_base_url = str(self.settings.get("rest_base_url") or "https://fapi.binance.com").strip().rstrip("/")
         self.track_ttl_sec = max(60, _safe_int(self.settings.get("track_ttl_sec"), 900))
         self.subscription_refresh_sec = max(1, _safe_int(self.settings.get("subscription_refresh_sec"), 5))
@@ -331,6 +338,17 @@ class MicrostructureProvider:
         self.max_trades_per_symbol = max(500, _safe_int(self.settings.get("max_trades_per_symbol"), 5000))
         self.max_liquidations_per_symbol = max(100, _safe_int(self.settings.get("max_liquidations_per_symbol"), 1000))
         self.windows_sec = _normalize_windows(self.settings.get("windows_sec"))
+        self.liquidation_windows_sec = _normalize_windows(
+            self.settings.get("liquidation_windows_sec", [60, 300, 900, 3600])
+        )
+        self.global_liquidation_enabled = _parse_bool(
+            self.settings.get("global_liquidation_enabled"),
+            True,
+        )
+        self.liquidation_decision_enabled = _parse_bool(
+            self.settings.get("liquidation_decision_enabled"),
+            False,
+        )
         self.bootstrap_agg_trades_enabled = _parse_bool(self.settings.get("bootstrap_agg_trades_enabled"), True)
         self.bootstrap_lookback_sec = max(
             max(self.windows_sec),
@@ -363,7 +381,20 @@ class MicrostructureProvider:
         self._last_trade_ts: Dict[str, int] = {}
         self._last_liq_ts: Dict[str, int] = {}
         self._last_bootstrap_ts: Dict[str, float] = {}
+        self._liquidation_stream_connected = False
+        self._liquidation_stream_connected_since_ms = 0
+        self._liquidation_stream_last_message_ms = 0
         self._lock = asyncio.Lock()
+        liquidation_history_settings = (
+            dict(self.settings.get("liquidation_history", {}) or {})
+            if isinstance(self.settings.get("liquidation_history"), dict)
+            else {}
+        )
+        if self.settings.get("runtime_dir") and not liquidation_history_settings.get("runtime_dir"):
+            liquidation_history_settings["runtime_dir"] = self.settings.get("runtime_dir")
+        liquidation_history_settings.setdefault("max_events_per_symbol", self.max_liquidations_per_symbol)
+        liquidation_history_settings.setdefault("retention_sec", max(self.liquidation_windows_sec) * 2)
+        self.liquidation_history = LiquidationHistoryStore(liquidation_history_settings)
 
     async def fetch(
         self,
@@ -386,16 +417,50 @@ class MicrostructureProvider:
 
         derivatives, liquidation = await self._build_symbol_snapshot(symbol, context=context or {})
         snapshot.derivatives.update(derivatives)
-        snapshot.liquidation.update(liquidation)
+        snapshot.liquidation.update(liquidation.get("legacy") or {})
+        snapshot.liquidation_v2.update(liquidation.get("v2") or {})
 
-        has_data = bool(derivatives.get("micro_last_trade_ts") or liquidation.get("micro_last_liq_ts"))
+        has_data = bool(
+            derivatives.get("micro_last_trade_ts")
+            or (liquidation.get("v2") or {}).get("micro_last_liq_ts")
+        )
         message = "tracking" if has_data else "warming_up"
         snapshot.source_health["microstructure"] = recent_health_entry("microstructure", True, message)
+        liquidation_summary = self.liquidation_history.summary()
+        liquidation_tracking = bool((liquidation.get("v2") or {}).get("tracking"))
+        if not self.global_liquidation_enabled:
+            liquidation_message = "disabled"
+        elif liquidation_tracking:
+            liquidation_message = "connected"
+        else:
+            liquidation_message = "warming_up"
+        snapshot.source_health["liquidation_v2"] = recent_health_entry(
+            "liquidation_v2",
+            not self.global_liquidation_enabled or liquidation_tracking,
+            liquidation_message,
+        )
+        snapshot.source_health["liquidation_v2"].update(liquidation_summary)
         return snapshot
 
     def _ensure_started(self) -> None:
         if self._task is None or self._task.done():
             self._task = asyncio.create_task(self.run_forever(), name="microstructure_ws")
+
+    def start(self) -> None:
+        if self.enabled and aiohttp is not None:
+            self.liquidation_history.save(force=True)
+            self._ensure_started()
+
+    async def close(self) -> None:
+        task = self._task
+        self._task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self.liquidation_history.save(force=True)
 
     async def _touch(self, symbol: str) -> None:
         async with self._lock:
@@ -406,38 +471,62 @@ class MicrostructureProvider:
         symbol: str,
         *,
         context: Dict[str, Any],
-    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    ) -> tuple[Dict[str, Any], Dict[str, Dict[str, Any]]]:
         now_ms = int(time.time() * 1000)
         symbol_upper = str(symbol or "").upper()
         async with self._lock:
             self._prune_stale_locked(now_ms=now_ms)
             trades = list(self._trade_buffers.get(symbol_upper, deque()))
-            liquidations = list(self._liq_buffers.get(symbol_upper, deque()))
+            legacy_liquidations = list(self._liq_buffers.get(symbol_upper, deque()))
             last_trade_ts = int(self._last_trade_ts.get(symbol_upper, 0))
-            last_liq_ts = int(self._last_liq_ts.get(symbol_upper, 0))
+            legacy_last_liq_ts = int(self._last_liq_ts.get(symbol_upper, 0))
+            stream_connected = bool(self._liquidation_stream_connected)
+            stream_connected_since_ms = int(self._liquidation_stream_connected_since_ms)
+            stream_last_message_ms = int(self._liquidation_stream_last_message_ms)
+        liquidations = self.liquidation_history.events(symbol_upper, now_ms=now_ms)
+        last_liq_ts = max((int(row[0]) for row in liquidations), default=0)
+        liquidation_tracking = bool(self.global_liquidation_enabled and stream_connected)
 
         derivatives: Dict[str, Any] = {
             "micro_source": "binance_microstructure_ws",
             "micro_updated_at_ms": now_ms,
             "micro_last_trade_ts": last_trade_ts,
-            "micro_last_liq_ts": last_liq_ts,
-            "micro_data_age_sec": _compute_age_seconds(now_ms, last_trade_ts, last_liq_ts),
+            "micro_last_liq_ts": legacy_last_liq_ts,
+            "micro_data_age_sec": _compute_age_seconds(now_ms, last_trade_ts, legacy_last_liq_ts),
             "micro_symbol_active": symbol_upper in self._tracked_symbols,
         }
-        liquidation_metrics: Dict[str, Any] = {
+        legacy_liquidation: Dict[str, Any] = {
+            "micro_last_liq_ts": legacy_last_liq_ts,
+            "micro_updated_at_ms": now_ms,
+        }
+        liquidation_v2: Dict[str, Any] = {
+            "source": "binance_all_force_order_ws",
+            "stream_semantics": "latest_per_symbol_1000ms",
+            "tracking": liquidation_tracking,
+            "decision_enabled": self.liquidation_decision_enabled,
+            "stream_connected": stream_connected,
+            "stream_connected_since_ms": stream_connected_since_ms,
+            "stream_last_message_ms": stream_last_message_ms,
             "micro_last_liq_ts": last_liq_ts,
             "micro_updated_at_ms": now_ms,
         }
 
-        if trades or liquidations:
-            micro_metrics, liq_metrics = build_microstructure_metrics(
+        if trades or legacy_liquidations or liquidations:
+            micro_metrics, legacy_metrics = build_microstructure_metrics(
                 trades,
-                liquidations,
+                legacy_liquidations,
                 as_of_ms=now_ms,
                 windows_sec=self.windows_sec,
             )
+            _, v2_metrics = build_microstructure_metrics(
+                [],
+                liquidations,
+                as_of_ms=now_ms,
+                windows_sec=self.liquidation_windows_sec,
+            )
             derivatives.update(micro_metrics)
-            liquidation_metrics.update(liq_metrics)
+            legacy_liquidation.update(legacy_metrics)
+            liquidation_v2.update(v2_metrics)
             derivatives.update(
                 classify_microstructure_regime(
                     derivatives,
@@ -456,7 +545,7 @@ class MicrostructureProvider:
                 }
             )
 
-        return derivatives, liquidation_metrics
+        return derivatives, {"legacy": legacy_liquidation, "v2": liquidation_v2}
 
     async def _bootstrap_agg_trades_if_needed(self, symbol: str) -> None:
         if not self.bootstrap_agg_trades_enabled or aiohttp is None:
@@ -541,46 +630,54 @@ class MicrostructureProvider:
 
     async def _run_connection(self) -> None:
         timeout = aiohttp.ClientTimeout(total=None, connect=20, sock_read=60)
-        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
-            async with session.ws_connect(self.ws_url, proxy=self._proxy, heartbeat=20) as ws:
-                logger.info("Microstructure WS connected%s", f" via proxy {self._proxy}" if self._proxy else "")
-                current_subs: set[str] = set()
-                current_subs = await self._sync_subscriptions(
-                    send_payload=lambda payload: ws.send_str(json.dumps(payload)),
-                    current_subs=current_subs,
-                    force=True,
-                )
-                while True:
-                    try:
-                        msg = await ws.receive(timeout=1.0)
-                    except asyncio.TimeoutError:
-                        current_subs = await self._sync_subscriptions(
-                            send_payload=lambda payload: ws.send_str(json.dumps(payload)),
-                            current_subs=current_subs,
-                            force=False,
-                        )
-                        continue
+        try:
+            async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
+                async with session.ws_connect(self.ws_url, proxy=self._proxy, heartbeat=20) as ws:
+                    logger.info("Microstructure WS connected%s", f" via proxy {self._proxy}" if self._proxy else "")
+                    current_subs: set[str] = set()
+                    current_subs = await self._sync_subscriptions(
+                        send_payload=lambda payload: ws.send_str(json.dumps(payload)),
+                        current_subs=current_subs,
+                        force=True,
+                    )
+                    async with self._lock:
+                        self._liquidation_stream_connected = self.global_liquidation_enabled
+                        self._liquidation_stream_connected_since_ms = int(time.time() * 1000)
+                    while True:
+                        try:
+                            msg = await ws.receive(timeout=1.0)
+                        except asyncio.TimeoutError:
+                            current_subs = await self._sync_subscriptions(
+                                send_payload=lambda payload: ws.send_str(json.dumps(payload)),
+                                current_subs=current_subs,
+                                force=False,
+                            )
+                            continue
 
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        await self._handle_message(msg.data)
-                        current_subs = await self._sync_subscriptions(
-                            send_payload=lambda payload: ws.send_str(json.dumps(payload)),
-                            current_subs=current_subs,
-                            force=False,
-                        )
-                        continue
-                    if msg.type == aiohttp.WSMsgType.PING:
-                        await ws.pong()
-                        continue
-                    if msg.type == aiohttp.WSMsgType.PONG:
-                        continue
-                    if msg.type in {
-                        aiohttp.WSMsgType.CLOSED,
-                        aiohttp.WSMsgType.CLOSE,
-                        aiohttp.WSMsgType.CLOSING,
-                        aiohttp.WSMsgType.ERROR,
-                    }:
-                        raise RuntimeError(f"microstructure ws closed: {msg.type}")
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            await self._handle_message(msg.data)
+                            current_subs = await self._sync_subscriptions(
+                                send_payload=lambda payload: ws.send_str(json.dumps(payload)),
+                                current_subs=current_subs,
+                                force=False,
+                            )
+                            continue
+                        if msg.type == aiohttp.WSMsgType.PING:
+                            await ws.pong()
+                            continue
+                        if msg.type == aiohttp.WSMsgType.PONG:
+                            continue
+                        if msg.type in {
+                            aiohttp.WSMsgType.CLOSED,
+                            aiohttp.WSMsgType.CLOSE,
+                            aiohttp.WSMsgType.CLOSING,
+                            aiohttp.WSMsgType.ERROR,
+                        }:
+                            raise RuntimeError(f"microstructure ws closed: {msg.type}")
+        finally:
+            async with self._lock:
+                self._liquidation_stream_connected = False
+                self._liquidation_stream_connected_since_ms = 0
 
     async def _sync_subscriptions(
         self,
@@ -596,11 +693,10 @@ class MicrostructureProvider:
             self._prune_stale_locked(now_ms=int(now * 1000))
             active_symbols = self._active_symbols_locked(now)
 
-        target_subs: set[str] = set()
+        target_subs: set[str] = {"!forceOrder@arr"} if self.global_liquidation_enabled else set()
         for symbol in active_symbols:
             symbol_lower = symbol.lower()
             target_subs.add(f"{symbol_lower}@aggTrade")
-            target_subs.add(f"{symbol_lower}@forceOrder")
 
         added = sorted(target_subs - current_subs)
         removed = sorted(current_subs - target_subs)
@@ -625,17 +721,39 @@ class MicrostructureProvider:
             payload = json.loads(raw)
         except json.JSONDecodeError:
             return
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, dict):
+                    await self._handle_payload(item)
+            return
         if not isinstance(payload, dict):
             return
-        if "stream" in payload and "data" in payload and isinstance(payload.get("data"), dict):
-            payload = payload["data"]
+        if "stream" in payload and "data" in payload:
+            data = payload.get("data")
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        await self._handle_payload(item)
+                return
+            if isinstance(data, dict):
+                payload = data
+        await self._handle_payload(payload)
+
+    async def _handle_payload(self, payload: Dict[str, Any]) -> None:
 
         event_type = str(payload.get("e") or "").strip()
         if event_type == "aggTrade":
             await self._on_agg_trade(payload)
         elif event_type == "forceOrder":
             order = payload.get("o")
-            await self._on_force_order(order if isinstance(order, dict) else payload)
+            if isinstance(order, dict):
+                normalized = dict(order)
+                normalized["_stream_symbol_type"] = payload.get("st")
+                normalized["_stream_pair"] = payload.get("ps")
+                normalized["_event_time"] = payload.get("E")
+            else:
+                normalized = payload
+            await self._on_force_order(normalized)
 
     async def _on_agg_trade(self, payload: Dict[str, Any]) -> None:
         symbol = str(payload.get("s") or "").upper().strip()
@@ -658,8 +776,16 @@ class MicrostructureProvider:
             self._prune_symbol_locked(symbol, now_ms=trade_ts)
 
     async def _on_force_order(self, payload: Dict[str, Any]) -> None:
+        symbol_type = _safe_int(payload.get("_stream_symbol_type") or payload.get("st"), 0)
+        async with self._lock:
+            self._liquidation_stream_last_message_ms = int(time.time() * 1000)
+        if symbol_type not in {0, 1}:
+            return
         symbol = str(payload.get("s") or "").upper().strip()
-        event_ts = _safe_int(payload.get("T") or payload.get("E") or payload.get("oT"), 0)
+        event_ts = _safe_int(
+            payload.get("T") or payload.get("E") or payload.get("oT") or payload.get("_event_time"),
+            0,
+        )
         price = _safe_float(payload.get("ap") or payload.get("p"), 0.0)
         qty = _safe_float(payload.get("z") or payload.get("l") or payload.get("q"), 0.0)
         side = str(payload.get("S") or payload.get("side") or "").upper().strip()
@@ -672,11 +798,27 @@ class MicrostructureProvider:
         if short_liq <= 0 and long_liq <= 0:
             return
 
+        accepted = self.liquidation_history.add_event(
+            symbol=symbol,
+            event_ts_ms=event_ts,
+            short_liq_usdt=short_liq,
+            long_liq_usdt=long_liq,
+            side=side,
+            price=price,
+            qty=qty,
+        )
+        if not accepted:
+            return
         async with self._lock:
-            buffer = self._liq_buffers.setdefault(symbol, deque(maxlen=self.max_liquidations_per_symbol))
-            buffer.append((event_ts, short_liq, long_liq))
-            self._last_liq_ts[symbol] = event_ts
-            self._prune_symbol_locked(symbol, now_ms=event_ts)
+            touched_at = float(self._tracked_symbols.get(symbol, 0.0))
+            if touched_at > 0 and time.time() - touched_at <= float(self.track_ttl_sec):
+                buffer = self._liq_buffers.setdefault(
+                    symbol,
+                    deque(maxlen=self.max_liquidations_per_symbol),
+                )
+                buffer.append((event_ts, short_liq, long_liq))
+                self._last_liq_ts[symbol] = event_ts
+                self._prune_symbol_locked(symbol, now_ms=event_ts)
 
     def _active_symbols_locked(self, now: float) -> List[str]:
         active = [

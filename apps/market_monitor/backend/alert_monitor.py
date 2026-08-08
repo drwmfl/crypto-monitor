@@ -323,6 +323,7 @@ async def run_alert_monitor(config_path: Optional[str] = None) -> None:
     notifier = AlertNotifier.from_config(config.raw)
     await notifier.start()
     strategy = AlertStrategyPipeline.from_config(config.raw)
+    strategy.start_background_tasks()
     logger.info(
         "Alert strategy pipeline: enabled=%s direct_tg_enabled=%s runtime_dir=%s",
         strategy.enabled,
@@ -523,6 +524,7 @@ async def run_alert_monitor(config_path: Optional[str] = None) -> None:
                 await realtime_task
             except asyncio.CancelledError:
                 pass
+        await strategy.close()
         await notifier.stop()
         await cooldown_mgr.close()
 

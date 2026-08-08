@@ -172,6 +172,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "derivatives_shadow_review_min_days": 7.0,
         "derivatives_shadow_review_min_first_push_samples": 100,
         "derivatives_shadow_review_timezone": "Asia/Shanghai",
+        "position_pressure_shadow_enabled": True,
+        "position_pressure_shadow_file": "position_pressure_shadow.jsonl",
+        "position_pressure_summary_file": "position_pressure_readiness.json",
+        "position_pressure_state_file": "position_pressure_state.json",
+        "position_pressure_policy_version": "position-pressure-v1-shadow",
+        "position_pressure_review_min_days": 7.0,
+        "position_pressure_review_min_first_push_samples": 100,
+        "position_pressure_review_min_smart_money_coverage_pct": 50.0,
+        "position_pressure_review_min_liquidation_coverage_pct": 90.0,
+        "position_pressure_review_timezone": "Asia/Shanghai",
+        "position_pressure_risk_enabled": False,
+        "position_pressure_confirmation_enabled": False,
         "candidate_ttl_minutes": 120,
         "min_watch_score": 50.0,
         "min_actionable_score": 75.0,
@@ -274,7 +286,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             "binance": {
                 "enabled": True,
                 "base_url": "https://fapi.binance.com",
-                "timeout_sec": 3.0,
+                "timeout_sec": 8.0,
                 "depth_limit": 100,
                 "depth_levels": 20,
                 "fetch_open_interest": True,
@@ -284,7 +296,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "fetch_long_short_ratio": False,
                 "fetch_taker_buy_sell": True,
                 "fetch_orderbook": True,
-                "fetch_liquidations": True,
+                "fetch_liquidations": False,
                 "liquidation_lookback_minutes": 5,
                 "open_interest_hist_period": "5m",
                 "open_interest_hist_limit": 576,
@@ -360,7 +372,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 },
                 "microstructure": {
                     "enabled": True,
-                    "ws_url": "wss://fstream.binance.com/ws",
+                    "ws_url": "wss://fstream.binance.com/market/stream",
                     "track_ttl_sec": 900,
                     "subscription_refresh_sec": 5,
                     "reconnect_sec": 3,
@@ -368,6 +380,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                     "max_trades_per_symbol": 5000,
                     "max_liquidations_per_symbol": 1000,
                     "windows_sec": [10, 30, 60, 180, 300],
+                    "liquidation_windows_sec": [60, 300, 900, 3600],
+                    "global_liquidation_enabled": True,
+                    "liquidation_decision_enabled": False,
+                    "liquidation_history": {
+                        "enabled": True,
+                        "state_file": "liquidation_v2_state.json",
+                        "event_file": "liquidation_v2_events.jsonl",
+                        "retention_sec": 7200,
+                        "max_events_per_symbol": 2000,
+                        "save_interval_sec": 5.0,
+                        "restore_tail_bytes": 8388608,
+                    },
                     "signal_thresholds": {
                         "min_trade_notional_1m": 25000.0,
                         "min_trade_notional_5m": 100000.0,
@@ -401,6 +425,50 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                         "oi_positive_15m": 0.015,
                         "oi_positive_1h": 0.015
                     }
+                },
+            },
+            "smart_money": {
+                "enabled": True,
+                "base_url": "https://www.binance.com",
+                "timeout_sec": 3.0,
+                "poll_interval_sec": 300,
+                "stale_after_sec": 900,
+                "track_ttl_sec": 1800,
+                "max_active_symbols": 12,
+                "concurrency": 1,
+                "request_spacing_sec": 1.0,
+                "rate_limit_cooldown_sec": 3600,
+                "stats_time_ranges": ["30m", "1h"],
+                "state_file": "smart_money_state.json",
+                "history_file": "smart_money_history.jsonl",
+                "max_history_samples": 360,
+                "min_sample_interval_sec": 45,
+                "save_interval_sec": 10.0,
+            },
+            "position_pressure": {
+                "enabled": True,
+                "phase": "shadow",
+                "display_enabled": False,
+                "risk_enabled": False,
+                "confirmation_enabled": False,
+                "thresholds": {
+                    "crowded_share": 0.70,
+                    "extreme_share": 0.82,
+                    "profitable_control_ratio": 0.65,
+                    "pain_entry_gap_pct": 0.01,
+                    "pain_profit_ratio": 0.55,
+                    "smart_flow_imbalance": 0.15,
+                    "position_retention_floor": -0.03,
+                    "oi_positive": 0.01,
+                    "oi_falling": -0.015,
+                    "market_buy_ratio_up": 0.55,
+                    "market_buy_ratio_down": 0.45,
+                    "liquidation_noise_floor_usdt": 20_000.0,
+                    "liquidation_side_share": 0.60,
+                    "liquidation_volume_ratio": 0.03,
+                    "liquidation_oi_ratio": 0.001,
+                    "liquidation_large_usdt": 100_000.0,
+                    "exhaustion_abs_change_pct": 6.0,
                 },
             },
             "accumulation_pool": {
@@ -1669,6 +1737,56 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
             _to_int(strategy_defaults.get("derivatives_shadow_review_min_first_push_samples"), 100),
         ),
     )
+    alert_strategy["position_pressure_shadow_enabled"] = _parse_bool(
+        alert_strategy.get("position_pressure_shadow_enabled"),
+        default=bool(strategy_defaults.get("position_pressure_shadow_enabled", True)),
+    )
+    for key, fallback in (
+        ("position_pressure_shadow_file", "position_pressure_shadow.jsonl"),
+        ("position_pressure_summary_file", "position_pressure_readiness.json"),
+        ("position_pressure_state_file", "position_pressure_state.json"),
+        ("position_pressure_policy_version", "position-pressure-v1-shadow"),
+        ("position_pressure_review_timezone", "Asia/Shanghai"),
+    ):
+        alert_strategy[key] = str(
+            alert_strategy.get(key, strategy_defaults.get(key, fallback))
+        ).strip() or fallback
+    alert_strategy["position_pressure_review_min_days"] = max(
+        0.0,
+        _to_float(
+            alert_strategy.get("position_pressure_review_min_days"),
+            _to_float(strategy_defaults.get("position_pressure_review_min_days"), 7.0),
+        ),
+    )
+    alert_strategy["position_pressure_review_min_first_push_samples"] = max(
+        1,
+        _to_int(
+            alert_strategy.get("position_pressure_review_min_first_push_samples"),
+            _to_int(strategy_defaults.get("position_pressure_review_min_first_push_samples"), 100),
+        ),
+    )
+    for key, fallback in (
+        ("position_pressure_review_min_smart_money_coverage_pct", 50.0),
+        ("position_pressure_review_min_liquidation_coverage_pct", 90.0),
+    ):
+        alert_strategy[key] = max(
+            0.0,
+            min(
+                100.0,
+                _to_float(
+                    alert_strategy.get(key),
+                    _to_float(strategy_defaults.get(key), fallback),
+                ),
+            ),
+        )
+    alert_strategy["position_pressure_risk_enabled"] = _parse_bool(
+        alert_strategy.get("position_pressure_risk_enabled"),
+        default=bool(strategy_defaults.get("position_pressure_risk_enabled", False)),
+    )
+    alert_strategy["position_pressure_confirmation_enabled"] = _parse_bool(
+        alert_strategy.get("position_pressure_confirmation_enabled"),
+        default=bool(strategy_defaults.get("position_pressure_confirmation_enabled", False)),
+    )
     alert_strategy["candidate_ttl_minutes"] = max(
         1,
         _to_int(alert_strategy.get("candidate_ttl_minutes"), strategy_defaults["candidate_ttl_minutes"]),
@@ -2420,8 +2538,14 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     )
     microstructure["enabled"] = _parse_bool(microstructure.get("enabled"), default=bool(micro_defaults.get("enabled", True)))
     microstructure["ws_url"] = str(
-        microstructure.get("ws_url", micro_defaults.get("ws_url", "wss://fstream.binance.com/ws"))
-    ).strip() or "wss://fstream.binance.com/ws"
+        microstructure.get(
+            "ws_url",
+            micro_defaults.get("ws_url", "wss://fstream.binance.com/market/stream"),
+        )
+    ).strip() or "wss://fstream.binance.com/market/stream"
+    microstructure["rest_base_url"] = str(
+        microstructure.get("rest_base_url", micro_defaults.get("rest_base_url", "https://fapi.binance.com"))
+    ).strip().rstrip("/") or "https://fapi.binance.com"
     microstructure["track_ttl_sec"] = max(
         60,
         _to_int(microstructure.get("track_ttl_sec"), _to_int(micro_defaults.get("track_ttl_sec"), 900)),
@@ -2466,10 +2590,212 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     if not normalized_micro_windows:
         normalized_micro_windows = [10, 30, 60, 180, 300]
     microstructure["windows_sec"] = normalized_micro_windows
+    raw_liquidation_windows = microstructure.get(
+        "liquidation_windows_sec",
+        micro_defaults.get("liquidation_windows_sec", [60, 300, 900, 3600]),
+    )
+    if not isinstance(raw_liquidation_windows, list):
+        raw_liquidation_windows = [60, 300, 900, 3600]
+    normalized_liquidation_windows: List[int] = []
+    for item in raw_liquidation_windows:
+        seconds = _to_int(item, 0)
+        if seconds > 0 and seconds not in normalized_liquidation_windows:
+            normalized_liquidation_windows.append(seconds)
+    if not normalized_liquidation_windows:
+        normalized_liquidation_windows = [60, 300, 900, 3600]
+    microstructure["liquidation_windows_sec"] = normalized_liquidation_windows
+    microstructure["global_liquidation_enabled"] = _parse_bool(
+        microstructure.get("global_liquidation_enabled"),
+        default=bool(micro_defaults.get("global_liquidation_enabled", True)),
+    )
+    microstructure["liquidation_decision_enabled"] = _parse_bool(
+        microstructure.get("liquidation_decision_enabled"),
+        default=bool(micro_defaults.get("liquidation_decision_enabled", False)),
+    )
+    liquidation_history = microstructure.setdefault("liquidation_history", {})
+    if not isinstance(liquidation_history, dict):
+        liquidation_history = {}
+        microstructure["liquidation_history"] = liquidation_history
+    liquidation_history_defaults = (
+        micro_defaults.get("liquidation_history", {})
+        if isinstance(micro_defaults.get("liquidation_history"), dict)
+        else {}
+    )
+    liquidation_history["enabled"] = _parse_bool(
+        liquidation_history.get("enabled"),
+        default=bool(liquidation_history_defaults.get("enabled", True)),
+    )
+    for key, fallback in (
+        ("state_file", "liquidation_v2_state.json"),
+        ("event_file", "liquidation_v2_events.jsonl"),
+    ):
+        liquidation_history[key] = str(
+            liquidation_history.get(key, liquidation_history_defaults.get(key, fallback))
+        ).strip() or fallback
+    liquidation_history["retention_sec"] = max(
+        3600,
+        _to_int(
+            liquidation_history.get("retention_sec"),
+            _to_int(liquidation_history_defaults.get("retention_sec"), 7200),
+        ),
+    )
+    liquidation_history["max_events_per_symbol"] = max(
+        100,
+        _to_int(
+            liquidation_history.get("max_events_per_symbol"),
+            _to_int(liquidation_history_defaults.get("max_events_per_symbol"), 2000),
+        ),
+    )
+    liquidation_history["save_interval_sec"] = max(
+        1.0,
+        _to_float(
+            liquidation_history.get("save_interval_sec"),
+            _to_float(liquidation_history_defaults.get("save_interval_sec"), 5.0),
+        ),
+    )
+    liquidation_history["restore_tail_bytes"] = max(
+        65536,
+        _to_int(
+            liquidation_history.get("restore_tail_bytes"),
+            _to_int(liquidation_history_defaults.get("restore_tail_bytes"), 8388608),
+        ),
+    )
     merged_micro_thresholds = dict(micro_defaults.get("signal_thresholds") or {})
     if isinstance(microstructure.get("signal_thresholds"), dict):
         merged_micro_thresholds.update(microstructure["signal_thresholds"])
     microstructure["signal_thresholds"] = merged_micro_thresholds
+
+    smart_money = factors.setdefault("smart_money", {})
+    if not isinstance(smart_money, dict):
+        smart_money = {}
+        factors["smart_money"] = smart_money
+    smart_defaults = (
+        factor_defaults.get("smart_money", {})
+        if isinstance(factor_defaults.get("smart_money"), dict)
+        else {}
+    )
+    smart_money["enabled"] = _parse_bool(
+        smart_money.get("enabled"),
+        default=bool(smart_defaults.get("enabled", True)),
+    )
+    smart_money["base_url"] = str(
+        smart_money.get("base_url", smart_defaults.get("base_url", "https://www.binance.com"))
+    ).strip().rstrip("/") or "https://www.binance.com"
+    smart_money["timeout_sec"] = max(
+        0.5,
+        _to_float(smart_money.get("timeout_sec"), _to_float(smart_defaults.get("timeout_sec"), 8.0)),
+    )
+    smart_money["poll_interval_sec"] = max(
+        30,
+        _to_int(
+            smart_money.get("poll_interval_sec"),
+            _to_int(smart_defaults.get("poll_interval_sec"), 300),
+        ),
+    )
+    smart_money["stale_after_sec"] = max(
+        smart_money["poll_interval_sec"],
+        _to_int(
+            smart_money.get("stale_after_sec"),
+            _to_int(smart_defaults.get("stale_after_sec"), 900),
+        ),
+    )
+    smart_money["track_ttl_sec"] = max(
+        300,
+        _to_int(smart_money.get("track_ttl_sec"), _to_int(smart_defaults.get("track_ttl_sec"), 1800)),
+    )
+    smart_money["max_active_symbols"] = max(
+        1,
+        _to_int(
+            smart_money.get("max_active_symbols"),
+            _to_int(smart_defaults.get("max_active_symbols"), 12),
+        ),
+    )
+    smart_money["concurrency"] = max(
+        1,
+        min(
+            8,
+            _to_int(smart_money.get("concurrency"), _to_int(smart_defaults.get("concurrency"), 1)),
+        ),
+    )
+    smart_money["request_spacing_sec"] = max(
+        0.0,
+        _to_float(
+            smart_money.get("request_spacing_sec"),
+            _to_float(smart_defaults.get("request_spacing_sec"), 1.0),
+        ),
+    )
+    smart_money["rate_limit_cooldown_sec"] = max(
+        60.0,
+        _to_float(
+            smart_money.get("rate_limit_cooldown_sec"),
+            _to_float(smart_defaults.get("rate_limit_cooldown_sec"), 3600.0),
+        ),
+    )
+    raw_stats_ranges = smart_money.get("stats_time_ranges", smart_defaults.get("stats_time_ranges", ["30m", "1h"]))
+    if not isinstance(raw_stats_ranges, list):
+        raw_stats_ranges = ["30m", "1h"]
+    smart_money["stats_time_ranges"] = [
+        value
+        for value in (str(item or "").strip().lower() for item in raw_stats_ranges)
+        if value in {"30m", "1h", "24h", "7d", "all"}
+    ] or ["30m", "1h"]
+    for key, fallback in (
+        ("state_file", "smart_money_state.json"),
+        ("history_file", "smart_money_history.jsonl"),
+    ):
+        smart_money[key] = str(smart_money.get(key, smart_defaults.get(key, fallback))).strip() or fallback
+    smart_money["max_history_samples"] = max(
+        60,
+        _to_int(
+            smart_money.get("max_history_samples"),
+            _to_int(smart_defaults.get("max_history_samples"), 360),
+        ),
+    )
+    smart_money["min_sample_interval_sec"] = max(
+        15.0,
+        _to_float(
+            smart_money.get("min_sample_interval_sec"),
+            _to_float(smart_defaults.get("min_sample_interval_sec"), 45.0),
+        ),
+    )
+    smart_money["save_interval_sec"] = max(
+        1.0,
+        _to_float(
+            smart_money.get("save_interval_sec"),
+            _to_float(smart_defaults.get("save_interval_sec"), 10.0),
+        ),
+    )
+
+    position_pressure = factors.setdefault("position_pressure", {})
+    if not isinstance(position_pressure, dict):
+        position_pressure = {}
+        factors["position_pressure"] = position_pressure
+    pressure_defaults = (
+        factor_defaults.get("position_pressure", {})
+        if isinstance(factor_defaults.get("position_pressure"), dict)
+        else {}
+    )
+    position_pressure["enabled"] = _parse_bool(
+        position_pressure.get("enabled"),
+        default=bool(pressure_defaults.get("enabled", True)),
+    )
+    pressure_phase = str(position_pressure.get("phase", pressure_defaults.get("phase", "shadow"))).strip().lower()
+    if pressure_phase not in {"shadow", "display", "risk", "confirm"}:
+        pressure_phase = "shadow"
+    position_pressure["phase"] = pressure_phase
+    for key in ("display_enabled", "risk_enabled", "confirmation_enabled"):
+        position_pressure[key] = _parse_bool(
+            position_pressure.get(key),
+            default=bool(pressure_defaults.get(key, False)),
+        )
+    merged_pressure_thresholds = dict(pressure_defaults.get("thresholds") or {})
+    if isinstance(position_pressure.get("thresholds"), dict):
+        merged_pressure_thresholds.update(position_pressure["thresholds"])
+    position_pressure["thresholds"] = {
+        str(key): _to_float(value, 0.0)
+        for key, value in merged_pressure_thresholds.items()
+        if value is not None
+    }
 
     accumulation_factors = factors.setdefault("accumulation_pool", {})
     if not isinstance(accumulation_factors, dict):

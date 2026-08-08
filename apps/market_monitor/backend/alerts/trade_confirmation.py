@@ -25,6 +25,7 @@ DEFAULT_TRADE_CONFIRMATION: Dict[str, Any] = {
     "trade_confirmation_orderbook_imbalance": 0.08,
     "trade_confirmation_max_spread_bps": 12.0,
     "trade_confirmation_min_depth_notional": 0.0,
+    "position_pressure_confirmation_enabled": False,
 }
 
 
@@ -95,12 +96,18 @@ def evaluate_trade_confirmation(candidate: Candidate, settings: Dict[str, Any] |
             checks=[],
         )
 
+    pressure_enabled = _parse_bool(
+        cfg.get("position_pressure_confirmation_enabled"),
+        False,
+    ) and bool((candidate.position_pressure or {}).get("confirmation_enabled"))
     checks = [
         _check_price_persistence(candidate, cfg),
         _check_oi(candidate, cfg, direction),
         _check_flow(candidate, cfg, direction),
         _check_orderbook(candidate, cfg, direction),
-        _check_liquidation(candidate, cfg, direction),
+        _check_position_pressure(candidate, direction)
+        if pressure_enabled
+        else _check_liquidation(candidate, cfg, direction),
     ]
     passed_count = sum(1 for item in checks if item.passed)
     if passed_count >= max(actionable_required_count, strong_direct_required_count):
@@ -266,6 +273,27 @@ def _check_liquidation(candidate: Candidate, cfg: Dict[str, Any], direction: str
         passed=passed,
         value={"long_liq_usdt": long_liq, "short_liq_usdt": short_liq, "micro_imbalance": micro_imbalance},
         reason="liquidation_confirmed" if passed else "liquidation_not_confirmed",
+    )
+
+
+def _check_position_pressure(candidate: Candidate, direction: str) -> ConfirmationCheck:
+    pressure = candidate.position_pressure or {}
+    pressure_direction = str(pressure.get("direction") or "").strip().lower()
+    passed = bool(
+        pressure.get("confirmation_enabled")
+        and pressure.get("confirmation_passed")
+        and pressure_direction == direction
+    )
+    return ConfirmationCheck(
+        key="position_pressure",
+        passed=passed,
+        value={
+            "state": pressure.get("state"),
+            "driver": pressure.get("driver"),
+            "confidence": pressure.get("confidence"),
+            "direction": pressure_direction,
+        },
+        reason="position_pressure_confirmed" if passed else "position_pressure_not_confirmed",
     )
 
 
