@@ -19,6 +19,8 @@
       - ./packages:/workspace/packages:ro
     environment:
       - PYTHONPATH=/workspace
+      - BINANCE_STREAM_WS_URL=${BINANCE_STREAM_WS_URL:-}
+      - BINANCE_STREAM_NO_MESSAGE_RECONNECT_SEC=${BINANCE_STREAM_NO_MESSAGE_RECONNECT_SEC:-45}
       - HTTP_PROXY=${ALERT_HTTP_PROXY}
       - HTTPS_PROXY=${ALERT_HTTPS_PROXY}
       - NO_PROXY=${ALERT_NO_PROXY}

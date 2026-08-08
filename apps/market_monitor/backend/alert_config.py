@@ -10,6 +10,14 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
+try:
+    from binance_ws_routes import FUTURES_MARKET_STREAM_URL, normalize_market_stream_url
+except ModuleNotFoundError:
+    from apps.market_monitor.backend.binance_ws_routes import (
+        FUTURES_MARKET_STREAM_URL,
+        normalize_market_stream_url,
+    )
+
 logger = logging.getLogger(__name__)
 
 VALID_WINDOW_LIST = ["1m", "5m", "15m", "30m", "1h"]
@@ -561,7 +569,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "ws_realtime_no_message_reconnect_sec": 45,
         "ws_realtime_subscription_chunk_size": 180,
         "ws_realtime_symbol_refresh_sec": 60,
-        "ws_realtime_url": "wss://fstream.binance.com/ws",
+        "ws_realtime_url": FUTURES_MARKET_STREAM_URL,
         "ws_local_agg_enabled": True,
         "ws_local_agg_windows": ["15m", "30m", "1h"],
         "ws_local_agg_skip_poll_windows": True,
@@ -2979,10 +2987,15 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         5,
         _to_int(data_feed.get("ws_realtime_symbol_refresh_sec"), default=60),
     )
-    data_feed["ws_realtime_url"] = str(
-        data_feed.get(
-            "ws_realtime_url",
-            DEFAULT_CONFIG["data_feed"].get("ws_realtime_url", "wss://fstream.binance.com/ws"),
+    data_feed["ws_realtime_url"] = normalize_market_stream_url(
+        str(
+            data_feed.get(
+                "ws_realtime_url",
+                DEFAULT_CONFIG["data_feed"].get(
+                    "ws_realtime_url",
+                    FUTURES_MARKET_STREAM_URL,
+                ),
+            )
         )
     ).strip()
 

@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover
 
 try:
     from alert_config import AlertConfig
+    from binance_ws_routes import FUTURES_MARKET_STREAM_URL, normalize_market_stream_url
     from cooldown import AlertCooldownManager
     from data_feed import BinanceKlineDataFeed
     from indicators import calculate_latest_indicators
@@ -27,6 +28,10 @@ try:
     from rule_engine import MarketSnapshot, evaluate_snapshot
 except ModuleNotFoundError:
     from apps.market_monitor.backend.alert_config import AlertConfig
+    from apps.market_monitor.backend.binance_ws_routes import (
+        FUTURES_MARKET_STREAM_URL,
+        normalize_market_stream_url,
+    )
     from apps.market_monitor.backend.cooldown import AlertCooldownManager
     from apps.market_monitor.backend.data_feed import BinanceKlineDataFeed
     from apps.market_monitor.backend.indicators import calculate_latest_indicators
@@ -45,6 +50,10 @@ AGGREGATABLE_WINDOWS = {"5m", "15m", "30m", "1h"}
 
 
 class RealtimeDataStalled(RuntimeError):
+    pass
+
+
+class RealtimeSubscriptionError(RuntimeError):
     pass
 
 
@@ -77,7 +86,9 @@ class RealtimeKlineWatcher:
         self.no_message_reconnect_sec = float(data_feed_cfg.get("ws_realtime_no_message_reconnect_sec", 45.0))
         self.sub_chunk_size = int(data_feed_cfg.get("ws_realtime_subscription_chunk_size", 180))
         self.symbol_refresh_sec = int(data_feed_cfg.get("ws_realtime_symbol_refresh_sec", 60))
-        self.ws_url = str(data_feed_cfg.get("ws_realtime_url", "wss://fstream.binance.com/ws")).strip()
+        self.ws_url = normalize_market_stream_url(
+            str(data_feed_cfg.get("ws_realtime_url", FUTURES_MARKET_STREAM_URL))
+        )
 
         self.local_agg_enabled = bool(data_feed_cfg.get("ws_local_agg_enabled", True))
         raw_local_agg_windows = data_feed_cfg.get("ws_local_agg_windows", [])
@@ -108,6 +119,12 @@ class RealtimeKlineWatcher:
         self._last_sub_refresh_ts = 0.0
         self._last_data_msg_ts = 0.0
         self._last_valid_kline_msg_ts = 0.0
+        self._connection_message_count = 0
+        self._connection_kline_count = 0
+        self._requested_subscriptions: Set[str] = set()
+        self._confirmed_subscriptions: Set[str] = set()
+        self._pending_subscription_requests: Dict[int, Dict[str, Any]] = {}
+        self._last_subscription_error = ""
         self._check_state: Dict[Tuple[str, str], Tuple[int, float]] = {}
         self.high_priority_extra_minutes = config.high_priority_cooldown_extra_minutes()
         self._closed_1m_last_start: Dict[str, int] = {}
@@ -131,8 +148,18 @@ class RealtimeKlineWatcher:
         if self.skip_poll_windows:
             skipped.update(self.windows)
         if self.local_agg_enabled and self.local_agg_skip_poll_windows:
-            skipped.update(self.local_agg_windows)
+            skipped.update(
+                window
+                for window in self.local_agg_windows
+                if self._is_local_agg_window_ready(window)
+            )
         return skipped
+
+    def _is_local_agg_window_ready(self, window: str) -> bool:
+        symbols = set(self.feed.symbol_mapping.keys())
+        if not symbols:
+            return False
+        return all((symbol, window) in self._agg_bootstrap_ready for symbol in symbols)
 
     def is_data_healthy(self) -> bool:
         if not self.is_enabled():
@@ -144,12 +171,29 @@ class RealtimeKlineWatcher:
 
     def data_health_snapshot(self) -> Dict[str, Any]:
         last_ts = float(self._last_valid_kline_msg_ts or 0.0)
+        local_agg_target_count = len(self.feed.symbol_mapping)
+        local_agg_ready = {
+            window: sum(
+                1
+                for symbol in self.feed.symbol_mapping.keys()
+                if (symbol, window) in self._agg_bootstrap_ready
+            )
+            for window in self.local_agg_windows
+        }
         return {
             "enabled": self.is_enabled(),
             "healthy": self.is_data_healthy(),
             "last_kline_age_sec": round(time.time() - last_ts, 1) if last_ts > 0 else None,
             "last_kline_at": datetime.fromtimestamp(last_ts).isoformat() if last_ts > 0 else None,
             "stale_after_sec": max(10.0, float(self.no_message_reconnect_sec)),
+            "received_messages": int(self._connection_message_count),
+            "received_klines": int(self._connection_kline_count),
+            "requested_subscriptions": len(self._requested_subscriptions),
+            "confirmed_subscriptions": len(self._confirmed_subscriptions),
+            "pending_subscription_batches": len(self._pending_subscription_requests),
+            "last_subscription_error": self._last_subscription_error,
+            "local_agg_target_count": local_agg_target_count,
+            "local_agg_ready": local_agg_ready,
         }
 
     async def run_forever(self) -> None:
@@ -186,7 +230,7 @@ class RealtimeKlineWatcher:
                 await self._run_one_connection()
             except asyncio.CancelledError:
                 raise
-            except RealtimeDataStalled as exc:
+            except (RealtimeDataStalled, RealtimeSubscriptionError) as exc:
                 logger.warning("%s; reconnecting soon.", exc)
             except Exception:
                 logger.exception("Realtime WS loop failed, reconnecting soon.")
@@ -212,7 +256,7 @@ class RealtimeKlineWatcher:
             close_timeout=10,
         ) as ws:
             logger.info("Realtime WS connected (direct).")
-            self._last_data_msg_ts = time.time()
+            self._reset_connection_state()
             current_subs: Set[str] = set()
             current_subs = await self._sync_subscriptions(
                 send_payload=lambda payload: ws.send(json.dumps(payload)),
@@ -245,7 +289,7 @@ class RealtimeKlineWatcher:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.ws_connect(self.ws_url, proxy=self.ws_proxy, heartbeat=20) as ws:
                 logger.info("Realtime WS connected via proxy: %s", self.ws_proxy)
-                self._last_data_msg_ts = time.time()
+                self._reset_connection_state()
                 current_subs: Set[str] = set()
                 current_subs = await self._sync_subscriptions(
                     send_payload=lambda payload: ws.send_str(json.dumps(payload)),
@@ -297,6 +341,7 @@ class RealtimeKlineWatcher:
         current_subs: Set[str],
         force: bool,
     ) -> Set[str]:
+        self._raise_if_subscription_ack_stalled()
         now = time.time()
         if not force and (now - self._last_sub_refresh_ts) < float(self.symbol_refresh_sec):
             return current_subs
@@ -313,31 +358,102 @@ class RealtimeKlineWatcher:
         removed = sorted(current_subs - target_subs)
 
         for chunk in _chunked(added, self.sub_chunk_size):
-            await send_payload(
-                {
-                    "method": "SUBSCRIBE",
-                    "params": chunk,
-                    "id": self._next_id(),
-                }
-            )
+            await send_payload(self._subscription_request("SUBSCRIBE", chunk))
         for chunk in _chunked(removed, self.sub_chunk_size):
-            await send_payload(
-                {
-                    "method": "UNSUBSCRIBE",
-                    "params": chunk,
-                    "id": self._next_id(),
-                }
-            )
+            await send_payload(self._subscription_request("UNSUBSCRIBE", chunk))
 
         self._last_sub_refresh_ts = now
+        self._requested_subscriptions = set(target_subs)
         if force or added or removed:
             logger.info(
-                "Realtime WS subscriptions synced: total=%s add=%s remove=%s",
+                "Realtime WS subscription requests sent: total=%s add=%s remove=%s pending_batches=%s",
                 len(target_subs),
                 len(added),
                 len(removed),
+                len(self._pending_subscription_requests),
             )
         return target_subs
+
+    def _reset_connection_state(self) -> None:
+        self._last_sub_refresh_ts = 0.0
+        self._last_data_msg_ts = time.time()
+        self._last_valid_kline_msg_ts = 0.0
+        self._connection_message_count = 0
+        self._connection_kline_count = 0
+        self._requested_subscriptions.clear()
+        self._confirmed_subscriptions.clear()
+        self._pending_subscription_requests.clear()
+        self._last_subscription_error = ""
+
+    def _subscription_request(self, action: str, streams: List[str]) -> Dict[str, Any]:
+        request_id = self._next_id()
+        normalized_action = str(action or "").strip().upper()
+        normalized_streams = tuple(str(stream) for stream in streams if str(stream))
+        self._pending_subscription_requests[request_id] = {
+            "action": normalized_action,
+            "streams": normalized_streams,
+            "sent_at": time.time(),
+        }
+        return {
+            "method": normalized_action,
+            "params": list(normalized_streams),
+            "id": request_id,
+        }
+
+    def _handle_subscription_control(self, payload: Dict[str, Any]) -> bool:
+        is_error = payload.get("code") is not None
+        if "result" not in payload and not is_error:
+            return False
+
+        request_id = payload.get("id")
+        pending = self._pending_subscription_requests.pop(request_id, None)
+        if is_error:
+            error = (
+                f"Realtime WS subscription rejected: id={request_id} "
+                f"code={payload.get('code')} msg={payload.get('msg') or 'unknown'}"
+            )
+            self._last_subscription_error = error
+            raise RealtimeSubscriptionError(error)
+
+        if pending:
+            streams = set(pending.get("streams") or ())
+            action = str(pending.get("action") or "")
+            if action == "SUBSCRIBE":
+                self._confirmed_subscriptions.update(streams)
+            elif action == "UNSUBSCRIBE":
+                self._confirmed_subscriptions.difference_update(streams)
+            logger.info(
+                (
+                    "Realtime WS subscription acknowledged: id=%s action=%s count=%s "
+                    "confirmed=%s pending_batches=%s"
+                ),
+                request_id,
+                action,
+                len(streams),
+                len(self._confirmed_subscriptions),
+                len(self._pending_subscription_requests),
+            )
+        else:
+            logger.debug("Realtime WS unmatched control response: id=%s", request_id)
+        return True
+
+    def _raise_if_subscription_ack_stalled(self) -> None:
+        if not self._pending_subscription_requests:
+            return
+        oldest_sent_at = min(
+            float(item.get("sent_at") or 0.0)
+            for item in self._pending_subscription_requests.values()
+        )
+        timeout_sec = max(5.0, min(30.0, float(self.no_message_reconnect_sec) / 2.0))
+        age = time.time() - oldest_sent_at
+        if oldest_sent_at > 0 and age < timeout_sec:
+            return
+        error = (
+            f"Realtime WS subscription ACK stalled for {age:.1f}s: "
+            f"pending_batches={len(self._pending_subscription_requests)}"
+        )
+        self._last_subscription_error = error
+        raise RealtimeSubscriptionError(error)
 
     async def _handle_message(self, raw: str) -> None:
         try:
@@ -347,13 +463,16 @@ class RealtimeKlineWatcher:
 
         if not isinstance(payload, dict):
             return
+        self._connection_message_count += 1
+
+        if self._handle_subscription_control(payload):
+            return
 
         if "stream" in payload and "data" in payload and isinstance(payload.get("data"), dict):
             payload = payload["data"]
 
         if payload.get("e") != "kline" and "k" not in payload:
             return
-        self._last_data_msg_ts = time.time()
 
         kline = payload.get("k") or {}
         if not isinstance(kline, dict):
@@ -363,7 +482,6 @@ class RealtimeKlineWatcher:
         window = str(kline.get("i") or "").strip()
         if not symbol or window not in self.windows:
             return
-        self._last_valid_kline_msg_ts = time.time()
 
         open_price = _safe_float(kline.get("o"))
         high_price = _safe_float(kline.get("h"))
@@ -372,6 +490,17 @@ class RealtimeKlineWatcher:
         volume = _safe_float(kline.get("v"))
         if open_price <= 0 or high_price <= 0 or low_price <= 0 or close_price <= 0:
             return
+        now = time.time()
+        self._last_data_msg_ts = now
+        self._last_valid_kline_msg_ts = now
+        self._connection_kline_count += 1
+        if self._connection_kline_count == 1:
+            logger.info(
+                "Realtime WS first valid kline received: symbol=%s window=%s confirmed_subscriptions=%s",
+                symbol,
+                window,
+                len(self._confirmed_subscriptions),
+            )
 
         candle_start_ms = _safe_int(kline.get("t"))
         candle_close_ms = _safe_int(kline.get("T"))
@@ -400,7 +529,6 @@ class RealtimeKlineWatcher:
         if change_pct < prefilter_pct:
             return
 
-        now = time.time()
         state_key = (symbol, window)
         prev_state = self._check_state.get(state_key)
         if prev_state and prev_state[0] == candle_start_ms:

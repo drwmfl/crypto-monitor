@@ -405,11 +405,22 @@ async def run_alert_monitor(config_path: Optional[str] = None) -> None:
                 effective_poll_windows = [w for w in config.windows if w not in effective_skip_windows]
                 log_fn = logger.info if health.get("healthy") else logger.warning
                 log_fn(
-                    "Realtime WS scan routing: healthy=%s skipped_windows=%s poll_windows=%s last_kline_age=%s",
+                    (
+                        "Realtime WS scan routing: healthy=%s skipped_windows=%s poll_windows=%s "
+                        "last_kline_age=%s messages=%s klines=%s subscriptions=%s/%s "
+                        "pending_batches=%s local_agg_ready=%s/%s"
+                    ),
                     health.get("healthy"),
                     sorted(effective_skip_windows),
                     effective_poll_windows,
                     health.get("last_kline_age_sec"),
+                    health.get("received_messages"),
+                    health.get("received_klines"),
+                    health.get("confirmed_subscriptions"),
+                    health.get("requested_subscriptions"),
+                    health.get("pending_subscription_batches"),
+                    health.get("local_agg_ready"),
+                    health.get("local_agg_target_count"),
                 )
                 last_effective_skip_windows = set(effective_skip_windows)
             poll_windows = [w for w in config.windows if w not in effective_skip_windows]

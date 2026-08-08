@@ -684,7 +684,7 @@
     "ws_realtime_no_message_reconnect_sec": 45,
     "ws_realtime_subscription_chunk_size": 180,
     "ws_realtime_symbol_refresh_sec": 60,
-    "ws_realtime_url": "wss://fstream.binance.com/ws",
+    "ws_realtime_url": "wss://fstream.binance.com/market/stream",
     "ws_local_agg_enabled": true,
     "ws_local_agg_windows": [
       "15m",
