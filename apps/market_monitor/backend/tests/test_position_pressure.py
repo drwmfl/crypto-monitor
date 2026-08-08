@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import tempfile
 import time
 import unittest
 from collections import deque
 from pathlib import Path
+from unittest.mock import patch
 
 try:
     from alert_config import load_config
@@ -76,7 +78,10 @@ def _derivatives_up(**overrides):
 
 class SmartMoneyMetricTests(unittest.IsolatedAsyncioTestCase):
     async def test_background_collectors_share_runtime_dir_and_close_cleanly(self) -> None:
-        with tempfile.TemporaryDirectory() as runtime_dir:
+        with tempfile.TemporaryDirectory() as runtime_dir, patch.dict(
+            os.environ,
+            {"ALERT_STRATEGY_RUNTIME_DIR": runtime_dir},
+        ):
             enricher = FactorEnricher(
                 {
                     "runtime_dir": runtime_dir,
@@ -159,7 +164,10 @@ class SmartMoneyMetricTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(metrics["stats_complete"])
 
     async def test_cached_state_returns_independent_copies(self) -> None:
-        with tempfile.TemporaryDirectory() as runtime_dir:
+        with tempfile.TemporaryDirectory() as runtime_dir, patch.dict(
+            os.environ,
+            {"ALERT_STRATEGY_RUNTIME_DIR": runtime_dir},
+        ):
             provider = SmartMoneyProvider({"runtime_dir": runtime_dir})
             provider._cache["AAAUSDT"] = {"overview": {"totalTraders": 1}}
             provider._history["AAAUSDT"] = deque(
@@ -280,7 +288,10 @@ class PositionPressureClassifierTests(unittest.TestCase):
 
 class LiquidationCollectionTests(unittest.IsolatedAsyncioTestCase):
     async def test_um_filter_dedupe_and_stream_status(self) -> None:
-        with tempfile.TemporaryDirectory() as runtime_dir:
+        with tempfile.TemporaryDirectory() as runtime_dir, patch.dict(
+            os.environ,
+            {"ALERT_STRATEGY_RUNTIME_DIR": runtime_dir},
+        ):
             provider = MicrostructureProvider(
                 {
                     "runtime_dir": runtime_dir,
@@ -320,7 +331,10 @@ class LiquidationCollectionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(derivatives["micro_short_liq_usdt_1m"], 50.0)
 
     async def test_event_journal_recovers_rows_newer_than_state_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory() as runtime_dir:
+        with tempfile.TemporaryDirectory() as runtime_dir, patch.dict(
+            os.environ,
+            {"ALERT_STRATEGY_RUNTIME_DIR": runtime_dir},
+        ):
             settings = {
                 "runtime_dir": runtime_dir,
                 "save_interval_sec": 999,
@@ -417,7 +431,10 @@ class ShadowCompatibilityTests(unittest.TestCase):
         self.assertEqual(_position_pressure_line(candidate.position_pressure), "")
 
     def test_readiness_requires_time_samples_and_source_coverage(self) -> None:
-        with tempfile.TemporaryDirectory() as runtime_dir:
+        with tempfile.TemporaryDirectory() as runtime_dir, patch.dict(
+            os.environ,
+            {"ALERT_STRATEGY_RUNTIME_DIR": runtime_dir},
+        ):
             recorder = PositionPressureShadowRecorder(
                 {
                     "runtime_dir": runtime_dir,
@@ -454,7 +471,10 @@ class ShadowCompatibilityTests(unittest.TestCase):
             self.assertTrue(Path(runtime_dir, "position_pressure_readiness.json").exists())
 
     def test_missing_first_push_stays_in_coverage_denominator(self) -> None:
-        with tempfile.TemporaryDirectory() as runtime_dir:
+        with tempfile.TemporaryDirectory() as runtime_dir, patch.dict(
+            os.environ,
+            {"ALERT_STRATEGY_RUNTIME_DIR": runtime_dir},
+        ):
             recorder = PositionPressureShadowRecorder(
                 {
                     "runtime_dir": runtime_dir,
