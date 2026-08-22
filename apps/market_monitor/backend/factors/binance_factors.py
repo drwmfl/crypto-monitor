@@ -58,6 +58,14 @@ class BinanceFactorProvider:
         self.open_interest_hist_limit = max(2, _safe_int(self.settings.get("open_interest_hist_limit"), 576))
         self.basis_history_period = str(self.settings.get("basis_history_period") or "5m").strip() or "5m"
         self.basis_history_limit = max(20, min(500, _safe_int(self.settings.get("basis_history_limit"), 500)))
+        self.basis_request_spacing_sec = max(
+            0.0,
+            _safe_float(self.settings.get("basis_request_spacing_sec"), 1.0),
+        )
+        self.basis_rate_limit_cooldown_sec = max(
+            60,
+            _safe_int(self.settings.get("basis_rate_limit_cooldown_sec"), 900),
+        )
         self.taker_buy_sell_period = str(self.settings.get("taker_buy_sell_period") or "5m").strip() or "5m"
         self.default_funding_interval_hours = max(
             1.0,
@@ -94,6 +102,9 @@ class BinanceFactorProvider:
         self._funding_interval_by_symbol: Dict[str, float] = {}
         self._funding_info_loaded_at = 0.0
         self._funding_info_lock = asyncio.Lock()
+        self._basis_bootstrap_lock = asyncio.Lock()
+        self._basis_last_request_ts = 0.0
+        self._basis_rate_limited_until = 0.0
         self._proxy = (
             os.getenv("ALERT_HTTPS_PROXY")
             or os.getenv("HTTPS_PROXY")
@@ -207,25 +218,12 @@ class BinanceFactorProvider:
         diagnostics: list[Dict[str, Any]] = []
         premium_payload: Dict[str, Any] = {}
         async with self._client_session() as session:
-            if self.fetch_basis_history and self.derivatives_history.should_bootstrap_basis(symbol):
-                try:
-                    payload = await self._get_json(
-                        session,
-                        "/futures/data/basis",
-                        {
-                            "pair": symbol,
-                            "contractType": "PERPETUAL",
-                            "period": self.basis_history_period,
-                            "limit": self.basis_history_limit,
-                        },
-                        diagnostics=diagnostics,
-                        endpoint="basis_history",
-                    )
-                    if isinstance(payload, list):
-                        self.derivatives_history.merge_basis_rows(symbol, payload)
-                        self.derivatives_history.mark_basis_bootstrapped(symbol)
-                except Exception:
-                    pass
+            await self._prewarm_basis_history(
+                session,
+                symbol=symbol,
+                context=context or {},
+                diagnostics=diagnostics,
+            )
             if self.fetch_funding:
                 try:
                     payload = await self._get_json(
@@ -266,6 +264,67 @@ class BinanceFactorProvider:
                 timestamp_ms=_safe_int(premium_payload.get("time"), 0) or int(time.time() * 1000),
             )
         return _any_request_ok(diagnostics)
+
+    async def _prewarm_basis_history(
+        self,
+        session: Any,
+        *,
+        symbol: str,
+        context: Dict[str, Any],
+        diagnostics: list[Dict[str, Any]],
+    ) -> bool:
+        if not self.fetch_basis_history or not self._basis_history_supported(context):
+            return False
+
+        async with self._basis_bootstrap_lock:
+            now = time.time()
+            if now < self._basis_rate_limited_until:
+                return False
+            if not self.derivatives_history.reserve_basis_bootstrap(symbol):
+                return False
+
+            wait_sec = self.basis_request_spacing_sec - (now - self._basis_last_request_ts)
+            if wait_sec > 0:
+                await asyncio.sleep(wait_sec)
+            self._basis_last_request_ts = time.time()
+
+            try:
+                payload = await self._get_json(
+                    session,
+                    "/futures/data/basis",
+                    {
+                        "pair": symbol,
+                        "contractType": "PERPETUAL",
+                        "period": self.basis_history_period,
+                        "limit": self.basis_history_limit,
+                    },
+                    diagnostics=diagnostics,
+                    endpoint="basis_history",
+                )
+            except Exception as exc:
+                status = _safe_int(getattr(exc, "status", 0), 0)
+                if status in {418, 429}:
+                    self._basis_rate_limited_until = time.time() + self.basis_rate_limit_cooldown_sec
+                    logger.warning(
+                        "Binance basis bootstrap rate limited: status=%s cooldown_sec=%s",
+                        status,
+                        self.basis_rate_limit_cooldown_sec,
+                    )
+                return False
+
+            if not isinstance(payload, list):
+                return False
+            self.derivatives_history.merge_basis_rows(symbol, payload)
+            self.derivatives_history.mark_basis_bootstrapped(symbol)
+            return True
+
+    @staticmethod
+    def _basis_history_supported(context: Dict[str, Any]) -> bool:
+        instrument_type = str(context.get("instrument_type") or "").strip().lower()
+        contract_type = str(context.get("instrument_contract_type") or "").strip().upper()
+        if contract_type == "TRADIFI_PERPETUAL":
+            return False
+        return instrument_type not in {"stock", "tradifi", "commodity", "index", "premarket"}
 
     async def _fetch_derivatives(
         self,
@@ -635,7 +694,7 @@ class BinanceFactorProvider:
             "ts_ms": int(time.time() * 1000),
             "endpoint": endpoint,
             "path": path,
-            "symbol": str(params.get("symbol") or ""),
+            "symbol": str(params.get("symbol") or params.get("pair") or ""),
             "ok": bool(ok),
             "status": status,
             "elapsed_ms": round(float(elapsed_ms), 1),

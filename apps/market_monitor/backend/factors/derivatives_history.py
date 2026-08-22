@@ -55,6 +55,10 @@ class DerivativesHistoryStore:
             30,
             _safe_int(self.settings.get("basis_bootstrap_ttl_sec"), 3600),
         )
+        self.basis_bootstrap_retry_sec = max(
+            30,
+            _safe_int(self.settings.get("basis_bootstrap_retry_sec"), 1800),
+        )
         self.min_stats_samples = max(8, _safe_int(self.settings.get("min_stats_samples"), 20))
         self.save_interval_sec = max(0.0, _safe_float(self.settings.get("save_interval_sec"), 10.0))
         self.max_window_sample_lag_ms = _parse_window_lag_ms(
@@ -68,6 +72,12 @@ class DerivativesHistoryStore:
         if not self.enabled:
             return False
         symbol = _normalize_symbol(symbol)
+        attempted_at = _safe_float(
+            self._state.setdefault("basis_bootstrap_attempted_at", {}).get(symbol),
+            0.0,
+        )
+        if attempted_at and (time.time() - attempted_at) < self.basis_bootstrap_retry_sec:
+            return False
         loaded_at = _safe_float(
             self._state.setdefault("basis_bootstrap_loaded_at", {}).get(symbol),
             0.0,
@@ -81,9 +91,20 @@ class DerivativesHistoryStore:
         oldest = _safe_int(basis_samples[0].get("timestamp_ms"), 0)
         return newest <= 0 or (newest - oldest) < (24 * 60 * 60 * 1000)
 
+    def reserve_basis_bootstrap(self, symbol: str) -> bool:
+        symbol = _normalize_symbol(symbol)
+        if not symbol or not self.should_bootstrap_basis(symbol):
+            return False
+        self._state.setdefault("basis_bootstrap_attempted_at", {})[symbol] = time.time()
+        self._dirty = True
+        self._save_if_due()
+        return True
+
     def mark_basis_bootstrapped(self, symbol: str) -> None:
         symbol = _normalize_symbol(symbol)
-        self._state.setdefault("basis_bootstrap_loaded_at", {})[symbol] = time.time()
+        now = time.time()
+        self._state.setdefault("basis_bootstrap_attempted_at", {})[symbol] = now
+        self._state.setdefault("basis_bootstrap_loaded_at", {})[symbol] = now
         self._dirty = True
         self._save_if_due()
 
@@ -336,17 +357,28 @@ class DerivativesHistoryStore:
 
     def _load(self) -> Dict[str, Any]:
         if not self.history_path.exists():
-            return {"version": 1, "symbols": {}, "basis_bootstrap_loaded_at": {}}
+            return {
+                "version": 1,
+                "symbols": {},
+                "basis_bootstrap_attempted_at": {},
+                "basis_bootstrap_loaded_at": {},
+            }
         try:
             payload = json.loads(self.history_path.read_text(encoding="utf-8"))
             if isinstance(payload, dict):
                 payload.setdefault("version", 1)
                 payload.setdefault("symbols", {})
+                payload.setdefault("basis_bootstrap_attempted_at", {})
                 payload.setdefault("basis_bootstrap_loaded_at", {})
                 return payload
         except Exception:
             pass
-        return {"version": 1, "symbols": {}, "basis_bootstrap_loaded_at": {}}
+        return {
+            "version": 1,
+            "symbols": {},
+            "basis_bootstrap_attempted_at": {},
+            "basis_bootstrap_loaded_at": {},
+        }
 
     def _save_if_due(self) -> None:
         if not self._dirty:

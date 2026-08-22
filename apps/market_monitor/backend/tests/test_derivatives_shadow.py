@@ -4,13 +4,14 @@ import tempfile
 import unittest
 import os
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 try:
     from alert_config import load_config
     from alerts.derivatives_shadow_recorder import DerivativesShadowRecorder
     from candidates.candidate_models import Candidate
     from factors.derivatives_history import DerivativesHistoryStore, classify_derivatives_shadow
+    from factors.binance_factors import BinanceFactorProvider
     from factors.oi_history import OIHistoryStore, classify_oi_regime_shadow
     from scoring.candidate_score import score_candidate
     from scoring.risk_score import score_risk
@@ -22,6 +23,7 @@ except ModuleNotFoundError:
         DerivativesHistoryStore,
         classify_derivatives_shadow,
     )
+    from apps.market_monitor.backend.factors.binance_factors import BinanceFactorProvider
     from apps.market_monitor.backend.factors.oi_history import OIHistoryStore, classify_oi_regime_shadow
     from apps.market_monitor.backend.scoring.candidate_score import score_candidate
     from apps.market_monitor.backend.scoring.risk_score import score_risk
@@ -83,6 +85,19 @@ class OIShadowTests(unittest.TestCase):
 
 
 class DerivativesHistoryTests(unittest.TestCase):
+    def test_basis_bootstrap_reservation_prevents_duplicate_requests(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            store = DerivativesHistoryStore(
+                {
+                    "runtime_dir": runtime_dir,
+                    "save_interval_sec": 0,
+                    "basis_bootstrap_retry_sec": 1800,
+                }
+            )
+
+            self.assertTrue(store.reserve_basis_bootstrap("TESTUSDT"))
+            self.assertFalse(store.reserve_basis_bootstrap("TESTUSDT"))
+
     def test_basis_and_funding_windows_are_computed(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir, patch.dict(
             os.environ,
@@ -149,6 +164,89 @@ class DerivativesHistoryTests(unittest.TestCase):
             self.assertGreaterEqual(state["derivatives_shadow_opportunity_modifier"], 2.0)
 
 
+class BinanceBasisPrewarmTests(unittest.IsolatedAsyncioTestCase):
+    def _provider(self, runtime_dir: str) -> BinanceFactorProvider:
+        return BinanceFactorProvider(
+            {
+                "runtime_dir": runtime_dir,
+                "fetch_basis_history": True,
+                "fetch_funding": False,
+                "basis_request_spacing_sec": 0,
+                "basis_rate_limit_cooldown_sec": 900,
+                "derivatives_history": {
+                    "runtime_dir": runtime_dir,
+                    "save_interval_sec": 0,
+                    "basis_bootstrap_retry_sec": 1800,
+                },
+            }
+        )
+
+    async def test_tradfi_contract_skips_unsupported_basis_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            provider = self._provider(runtime_dir)
+            provider._get_json = AsyncMock(return_value=[])
+
+            result = await provider._prewarm_basis_history(
+                None,
+                symbol="HOODUSDT",
+                context={
+                    "instrument_type": "stock",
+                    "instrument_contract_type": "TRADIFI_PERPETUAL",
+                },
+                diagnostics=[],
+            )
+
+            self.assertFalse(result)
+            provider._get_json.assert_not_awaited()
+
+    async def test_successful_basis_bootstrap_is_not_repeated(self) -> None:
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            provider = self._provider(runtime_dir)
+            provider._get_json = AsyncMock(return_value=[])
+
+            first = await provider._prewarm_basis_history(
+                None,
+                symbol="BTCUSDT",
+                context={"instrument_type": "crypto"},
+                diagnostics=[],
+            )
+            second = await provider._prewarm_basis_history(
+                None,
+                symbol="BTCUSDT",
+                context={"instrument_type": "crypto"},
+                diagnostics=[],
+            )
+
+            self.assertTrue(first)
+            self.assertFalse(second)
+            self.assertEqual(provider._get_json.await_count, 1)
+
+    async def test_rate_limit_pauses_followup_basis_requests(self) -> None:
+        class RateLimitError(RuntimeError):
+            status = 429
+
+        with tempfile.TemporaryDirectory() as runtime_dir:
+            provider = self._provider(runtime_dir)
+            provider._get_json = AsyncMock(side_effect=RateLimitError("rate limited"))
+
+            first = await provider._prewarm_basis_history(
+                None,
+                symbol="BTCUSDT",
+                context={"instrument_type": "crypto"},
+                diagnostics=[],
+            )
+            second = await provider._prewarm_basis_history(
+                None,
+                symbol="ETHUSDT",
+                context={"instrument_type": "crypto"},
+                diagnostics=[],
+            )
+
+            self.assertFalse(first)
+            self.assertFalse(second)
+            self.assertEqual(provider._get_json.await_count, 1)
+
+
 class RecorderAndCompatibilityTests(unittest.TestCase):
     def test_recorder_marks_review_ready_without_changing_scores(self) -> None:
         with tempfile.TemporaryDirectory() as runtime_dir, patch.dict(
@@ -209,9 +307,17 @@ class RecorderAndCompatibilityTests(unittest.TestCase):
             path = backend_root.parent / "config" / "config.json"
         config = load_config(str(path))
         strategy = config["alert_strategy"]
+        data_feed = config["data_feed"]
         self.assertTrue(strategy["derivatives_shadow_enabled"])
         self.assertTrue(strategy["confirmation_factors"]["binance"]["fetch_basis_history"])
         self.assertEqual(strategy["actionable_policy_version"], "edge3-shadow-v1")
+        self.assertEqual(data_feed["ws_realtime_ping_timeout_sec"], 0.0)
+        self.assertEqual(data_feed["ws_realtime_processing_concurrency"], 8)
+        self.assertEqual(data_feed["ws_realtime_max_pending_evaluations"], 128)
+        position_pressure = strategy["confirmation_factors"]["position_pressure"]
+        self.assertFalse(position_pressure["display_enabled"])
+        self.assertFalse(position_pressure["risk_enabled"])
+        self.assertFalse(position_pressure["confirmation_enabled"])
 
 
 if __name__ == "__main__":

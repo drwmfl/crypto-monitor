@@ -86,6 +86,23 @@ class RealtimeKlineWatcher:
         self.no_message_reconnect_sec = float(data_feed_cfg.get("ws_realtime_no_message_reconnect_sec", 45.0))
         self.sub_chunk_size = int(data_feed_cfg.get("ws_realtime_subscription_chunk_size", 180))
         self.symbol_refresh_sec = int(data_feed_cfg.get("ws_realtime_symbol_refresh_sec", 60))
+        self.ping_interval_sec = max(
+            0.0,
+            float(data_feed_cfg.get("ws_realtime_ping_interval_sec", 20.0)),
+        )
+        self.ping_timeout_sec = max(
+            0.0,
+            float(data_feed_cfg.get("ws_realtime_ping_timeout_sec", 0.0)),
+        )
+        self.max_queue = max(64, int(data_feed_cfg.get("ws_realtime_max_queue", 4096)))
+        self.processing_concurrency = max(
+            1,
+            int(data_feed_cfg.get("ws_realtime_processing_concurrency", 8)),
+        )
+        self.max_pending_evaluations = max(
+            self.processing_concurrency,
+            int(data_feed_cfg.get("ws_realtime_max_pending_evaluations", 128)),
+        )
         self.ws_url = normalize_market_stream_url(
             str(data_feed_cfg.get("ws_realtime_url", FUTURES_MARKET_STREAM_URL))
         )
@@ -134,6 +151,9 @@ class RealtimeKlineWatcher:
         self._agg_bootstrap_pending: Set[Tuple[str, str]] = set()
         self._agg_bootstrap_tasks: Dict[Tuple[str, str], asyncio.Task] = {}
         self._agg_bootstrap_semaphore = asyncio.Semaphore(self.local_agg_bootstrap_concurrency)
+        self._evaluation_semaphore = asyncio.Semaphore(self.processing_concurrency)
+        self._evaluation_tasks: Dict[Tuple[str, str], asyncio.Task] = {}
+        self._dropped_evaluations = 0
 
     def is_enabled(self) -> bool:
         return self.enabled and bool(self.windows)
@@ -192,6 +212,8 @@ class RealtimeKlineWatcher:
             "confirmed_subscriptions": len(self._confirmed_subscriptions),
             "pending_subscription_batches": len(self._pending_subscription_requests),
             "last_subscription_error": self._last_subscription_error,
+            "pending_evaluations": len(self._evaluation_tasks),
+            "dropped_evaluations": int(self._dropped_evaluations),
             "local_agg_target_count": local_agg_target_count,
             "local_agg_ready": local_agg_ready,
         }
@@ -213,6 +235,7 @@ class RealtimeKlineWatcher:
             (
                 "Realtime WS enabled: windows=%s prefilter=%s skip_poll_windows=%s "
                 "local_agg_enabled=%s local_agg_windows=%s local_agg_skip_poll_windows=%s "
+                "processing_concurrency=%s max_pending=%s ping_timeout=%s max_queue=%s "
                 "url=%s proxy=%s"
             ),
             self.windows,
@@ -221,6 +244,10 @@ class RealtimeKlineWatcher:
             self.local_agg_enabled,
             self.local_agg_windows,
             self.local_agg_skip_poll_windows,
+            self.processing_concurrency,
+            self.max_pending_evaluations,
+            self.ping_timeout_sec or None,
+            self.max_queue,
             self.ws_url,
             bool(self.ws_proxy),
         )
@@ -251,9 +278,10 @@ class RealtimeKlineWatcher:
         async with websockets.connect(
             self.ws_url,
             open_timeout=20,
-            ping_interval=20,
-            ping_timeout=20,
+            ping_interval=self.ping_interval_sec or None,
+            ping_timeout=self.ping_timeout_sec or None,
             close_timeout=10,
+            max_queue=self.max_queue,
         ) as ws:
             logger.info("Realtime WS connected (direct).")
             self._reset_connection_state()
@@ -287,7 +315,11 @@ class RealtimeKlineWatcher:
 
         timeout = aiohttp.ClientTimeout(total=None, connect=20, sock_read=60)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.ws_connect(self.ws_url, proxy=self.ws_proxy, heartbeat=20) as ws:
+            async with session.ws_connect(
+                self.ws_url,
+                proxy=self.ws_proxy,
+                heartbeat=self.ping_interval_sec or None,
+            ) as ws:
                 logger.info("Realtime WS connected via proxy: %s", self.ws_proxy)
                 self._reset_connection_state()
                 current_subs: Set[str] = set()
@@ -535,6 +567,99 @@ class RealtimeKlineWatcher:
             if (now - prev_state[1]) < float(self.recheck_interval_sec):
                 return
         self._check_state[state_key] = (candle_start_ms, now)
+
+        self._schedule_realtime_evaluation(
+            symbol=symbol,
+            window=window,
+            candle_start_ms=candle_start_ms,
+            candle_close_ms=candle_close_ms,
+            is_closed=is_closed,
+            open_price=open_price,
+            close_price=close_price,
+            volume=volume,
+        )
+
+    def _schedule_realtime_evaluation(
+        self,
+        *,
+        symbol: str,
+        window: str,
+        candle_start_ms: int,
+        candle_close_ms: int,
+        is_closed: bool,
+        open_price: float,
+        close_price: float,
+        volume: float,
+    ) -> bool:
+        state_key = (symbol, window)
+        current = self._evaluation_tasks.get(state_key)
+        if current is not None and not current.done():
+            return False
+        if current is not None:
+            self._evaluation_tasks.pop(state_key, None)
+
+        if len(self._evaluation_tasks) >= self.max_pending_evaluations:
+            self._dropped_evaluations += 1
+            if self._dropped_evaluations == 1 or self._dropped_evaluations % 100 == 0:
+                logger.warning(
+                    "Realtime evaluation backlog full: pending=%s dropped=%s",
+                    len(self._evaluation_tasks),
+                    self._dropped_evaluations,
+                )
+            return False
+
+        task = asyncio.create_task(
+            self._run_realtime_evaluation(
+                symbol=symbol,
+                window=window,
+                candle_start_ms=candle_start_ms,
+                candle_close_ms=candle_close_ms,
+                is_closed=is_closed,
+                open_price=open_price,
+                close_price=close_price,
+                volume=volume,
+            ),
+            name=f"realtime_eval_{symbol}_{window}",
+        )
+        self._evaluation_tasks[state_key] = task
+        task.add_done_callback(
+            lambda done, key=state_key: self._finish_realtime_evaluation(key, done)
+        )
+        return True
+
+    def _finish_realtime_evaluation(
+        self,
+        state_key: Tuple[str, str],
+        task: asyncio.Task,
+    ) -> None:
+        if self._evaluation_tasks.get(state_key) is task:
+            self._evaluation_tasks.pop(state_key, None)
+
+    async def _run_realtime_evaluation(self, **kwargs: Any) -> None:
+        try:
+            async with self._evaluation_semaphore:
+                await self._evaluate_realtime_kline(**kwargs)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Realtime evaluation failed: symbol=%s window=%s",
+                kwargs.get("symbol"),
+                kwargs.get("window"),
+            )
+
+    async def _evaluate_realtime_kline(
+        self,
+        *,
+        symbol: str,
+        window: str,
+        candle_start_ms: int,
+        candle_close_ms: int,
+        is_closed: bool,
+        open_price: float,
+        close_price: float,
+        volume: float,
+    ) -> None:
 
         ccxt_symbol = self.feed.symbol_mapping.get(symbol)
         if not ccxt_symbol:

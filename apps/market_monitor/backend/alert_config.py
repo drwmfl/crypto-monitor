@@ -310,6 +310,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "open_interest_hist_limit": 576,
                 "basis_history_period": "5m",
                 "basis_history_limit": 500,
+                "basis_request_spacing_sec": 1.0,
+                "basis_rate_limit_cooldown_sec": 900,
                 "basis_max_spread_bps": 30.0,
                 "default_funding_interval_hours": 8.0,
                 "funding_info_refresh_sec": 3600,
@@ -359,6 +361,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                     "max_samples_per_symbol": 3000,
                     "min_sample_interval_sec": 30,
                     "basis_bootstrap_ttl_sec": 3600,
+                    "basis_bootstrap_retry_sec": 1800,
                     "min_stats_samples": 20,
                     "save_interval_sec": 10.0,
                     "max_window_sample_lag_sec": {
@@ -569,6 +572,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "ws_realtime_no_message_reconnect_sec": 45,
         "ws_realtime_subscription_chunk_size": 180,
         "ws_realtime_symbol_refresh_sec": 60,
+        "ws_realtime_ping_interval_sec": 20,
+        "ws_realtime_ping_timeout_sec": 0,
+        "ws_realtime_max_queue": 4096,
+        "ws_realtime_processing_concurrency": 8,
+        "ws_realtime_max_pending_evaluations": 128,
         "ws_realtime_url": FUTURES_MARKET_STREAM_URL,
         "ws_local_agg_enabled": True,
         "ws_local_agg_windows": ["15m", "30m", "1h"],
@@ -1048,6 +1056,31 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
         data_feed["ws_realtime_symbol_refresh_sec"] = _to_int(
             os.getenv("ALERT_WS_REALTIME_SYMBOL_REFRESH_SEC"),
             default=60,
+        )
+    if os.getenv("ALERT_WS_REALTIME_PING_INTERVAL_SEC"):
+        data_feed["ws_realtime_ping_interval_sec"] = _to_float(
+            os.getenv("ALERT_WS_REALTIME_PING_INTERVAL_SEC"),
+            default=20.0,
+        )
+    if os.getenv("ALERT_WS_REALTIME_PING_TIMEOUT_SEC") is not None:
+        data_feed["ws_realtime_ping_timeout_sec"] = _to_float(
+            os.getenv("ALERT_WS_REALTIME_PING_TIMEOUT_SEC"),
+            default=0.0,
+        )
+    if os.getenv("ALERT_WS_REALTIME_MAX_QUEUE"):
+        data_feed["ws_realtime_max_queue"] = _to_int(
+            os.getenv("ALERT_WS_REALTIME_MAX_QUEUE"),
+            default=4096,
+        )
+    if os.getenv("ALERT_WS_REALTIME_PROCESSING_CONCURRENCY"):
+        data_feed["ws_realtime_processing_concurrency"] = _to_int(
+            os.getenv("ALERT_WS_REALTIME_PROCESSING_CONCURRENCY"),
+            default=8,
+        )
+    if os.getenv("ALERT_WS_REALTIME_MAX_PENDING_EVALUATIONS"):
+        data_feed["ws_realtime_max_pending_evaluations"] = _to_int(
+            os.getenv("ALERT_WS_REALTIME_MAX_PENDING_EVALUATIONS"),
+            default=128,
         )
     if os.getenv("ALERT_WS_REALTIME_URL"):
         data_feed["ws_realtime_url"] = str(os.getenv("ALERT_WS_REALTIME_URL")).strip()
@@ -2366,6 +2399,20 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
             ),
         ),
     )
+    binance_factors["basis_request_spacing_sec"] = max(
+        0.0,
+        _to_float(
+            binance_factors.get("basis_request_spacing_sec"),
+            _to_float(binance_defaults.get("basis_request_spacing_sec"), 1.0),
+        ),
+    )
+    binance_factors["basis_rate_limit_cooldown_sec"] = max(
+        60,
+        _to_int(
+            binance_factors.get("basis_rate_limit_cooldown_sec"),
+            _to_int(binance_defaults.get("basis_rate_limit_cooldown_sec"), 900),
+        ),
+    )
     binance_factors["basis_max_spread_bps"] = max(
         0.0,
         _to_float(
@@ -2519,6 +2566,13 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         _to_int(
             derivatives_history.get("basis_bootstrap_ttl_sec"),
             _to_int(derivatives_defaults.get("basis_bootstrap_ttl_sec"), 3600),
+        ),
+    )
+    derivatives_history["basis_bootstrap_retry_sec"] = max(
+        30,
+        _to_int(
+            derivatives_history.get("basis_bootstrap_retry_sec"),
+            _to_int(derivatives_defaults.get("basis_bootstrap_retry_sec"), 1800),
         ),
     )
     derivatives_history["min_stats_samples"] = max(
@@ -2986,6 +3040,32 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     data_feed["ws_realtime_symbol_refresh_sec"] = max(
         5,
         _to_int(data_feed.get("ws_realtime_symbol_refresh_sec"), default=60),
+    )
+    data_feed["ws_realtime_ping_interval_sec"] = max(
+        0.0,
+        _to_float(data_feed.get("ws_realtime_ping_interval_sec"), default=20.0),
+    )
+    data_feed["ws_realtime_ping_timeout_sec"] = max(
+        0.0,
+        _to_float(data_feed.get("ws_realtime_ping_timeout_sec"), default=0.0),
+    )
+    data_feed["ws_realtime_max_queue"] = max(
+        64,
+        _to_int(data_feed.get("ws_realtime_max_queue"), default=4096),
+    )
+    data_feed["ws_realtime_processing_concurrency"] = max(
+        1,
+        min(
+            32,
+            _to_int(data_feed.get("ws_realtime_processing_concurrency"), default=8),
+        ),
+    )
+    data_feed["ws_realtime_max_pending_evaluations"] = max(
+        data_feed["ws_realtime_processing_concurrency"],
+        min(
+            1000,
+            _to_int(data_feed.get("ws_realtime_max_pending_evaluations"), default=128),
+        ),
     )
     data_feed["ws_realtime_url"] = normalize_market_stream_url(
         str(

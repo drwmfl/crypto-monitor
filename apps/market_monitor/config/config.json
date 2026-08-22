@@ -410,6 +410,8 @@
         "open_interest_hist_limit": 576,
         "basis_history_period": "5m",
         "basis_history_limit": 500,
+        "basis_request_spacing_sec": 1.0,
+        "basis_rate_limit_cooldown_sec": 900,
         "basis_max_spread_bps": 30.0,
         "default_funding_interval_hours": 8.0,
         "funding_info_refresh_sec": 3600,
@@ -448,6 +450,7 @@
           "max_samples_per_symbol": 3000,
           "min_sample_interval_sec": 30,
           "basis_bootstrap_ttl_sec": 3600,
+          "basis_bootstrap_retry_sec": 1800,
           "min_stats_samples": 20,
           "save_interval_sec": 10.0,
           "max_window_sample_lag_sec": {
@@ -684,6 +687,11 @@
     "ws_realtime_no_message_reconnect_sec": 45,
     "ws_realtime_subscription_chunk_size": 180,
     "ws_realtime_symbol_refresh_sec": 60,
+    "ws_realtime_ping_interval_sec": 20,
+    "ws_realtime_ping_timeout_sec": 0,
+    "ws_realtime_max_queue": 4096,
+    "ws_realtime_processing_concurrency": 8,
+    "ws_realtime_max_pending_evaluations": 128,
     "ws_realtime_url": "wss://fstream.binance.com/market/stream",
     "ws_local_agg_enabled": true,
     "ws_local_agg_windows": [

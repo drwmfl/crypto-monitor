@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 import unittest
@@ -59,6 +60,11 @@ def _watcher() -> RealtimeKlineWatcher:
     watcher._last_subscription_error = ""
     watcher._check_state = {}
     watcher._agg_bootstrap_ready = set()
+    watcher.processing_concurrency = 1
+    watcher.max_pending_evaluations = 2
+    watcher._evaluation_semaphore = asyncio.Semaphore(1)
+    watcher._evaluation_tasks = {}
+    watcher._dropped_evaluations = 0
     return watcher
 
 
@@ -145,6 +151,62 @@ class RealtimeWebSocketHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(health["healthy"])
         self.assertEqual(health["received_klines"], 0)
         self.assertEqual(health["confirmed_subscriptions"], 0)
+
+    async def test_slow_evaluation_does_not_block_receive_loop_and_is_deduplicated(self) -> None:
+        watcher = _watcher()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_evaluation(**_kwargs) -> None:
+            started.set()
+            await release.wait()
+
+        watcher._evaluate_realtime_kline = slow_evaluation
+        kwargs = {
+            "symbol": "BTCUSDT",
+            "window": "1m",
+            "candle_start_ms": 1,
+            "candle_close_ms": 2,
+            "is_closed": False,
+            "open_price": 100.0,
+            "close_price": 101.0,
+            "volume": 1.0,
+        }
+
+        self.assertTrue(watcher._schedule_realtime_evaluation(**kwargs))
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        self.assertFalse(watcher._schedule_realtime_evaluation(**kwargs))
+        self.assertEqual(len(watcher._evaluation_tasks), 1)
+
+        release.set()
+        await asyncio.gather(*list(watcher._evaluation_tasks.values()))
+        await asyncio.sleep(0)
+        self.assertEqual(watcher._evaluation_tasks, {})
+
+    async def test_evaluation_backlog_is_bounded(self) -> None:
+        watcher = _watcher()
+        watcher.max_pending_evaluations = 1
+        release = asyncio.Event()
+
+        async def slow_evaluation(**_kwargs) -> None:
+            await release.wait()
+
+        watcher._evaluate_realtime_kline = slow_evaluation
+        base = {
+            "window": "1m",
+            "candle_start_ms": 1,
+            "candle_close_ms": 2,
+            "is_closed": False,
+            "open_price": 100.0,
+            "close_price": 101.0,
+            "volume": 1.0,
+        }
+        self.assertTrue(watcher._schedule_realtime_evaluation(symbol="BTCUSDT", **base))
+        self.assertFalse(watcher._schedule_realtime_evaluation(symbol="ETHUSDT", **base))
+        self.assertEqual(watcher._dropped_evaluations, 1)
+
+        release.set()
+        await asyncio.gather(*list(watcher._evaluation_tasks.values()))
 
     def test_local_aggregation_keeps_polling_until_each_window_is_ready(self) -> None:
         watcher = _watcher()
