@@ -184,7 +184,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "position_pressure_shadow_file": "position_pressure_shadow.jsonl",
         "position_pressure_summary_file": "position_pressure_readiness.json",
         "position_pressure_state_file": "position_pressure_state.json",
-        "position_pressure_policy_version": "position-pressure-v1-shadow",
+        "position_pressure_policy_version": "position-pressure-v2-display-risk-holdout",
         "position_pressure_review_min_days": 7.0,
         "position_pressure_review_min_first_push_samples": 100,
         "position_pressure_review_min_smart_money_coverage_pct": 50.0,
@@ -458,8 +458,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             },
             "position_pressure": {
                 "enabled": True,
-                "phase": "shadow",
-                "display_enabled": False,
+                "policy_version": "position-pressure-v2-display-risk-holdout",
+                "phase": "display",
+                "display_enabled": True,
+                "display_states": ["active_squeeze", "exhaustion", "position_control"],
                 "risk_enabled": False,
                 "confirmation_enabled": False,
                 "thresholds": {
@@ -1786,7 +1788,7 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         ("position_pressure_shadow_file", "position_pressure_shadow.jsonl"),
         ("position_pressure_summary_file", "position_pressure_readiness.json"),
         ("position_pressure_state_file", "position_pressure_state.json"),
-        ("position_pressure_policy_version", "position-pressure-v1-shadow"),
+        ("position_pressure_policy_version", "position-pressure-v2-display-risk-holdout"),
         ("position_pressure_review_timezone", "Asia/Shanghai"),
     ):
         alert_strategy[key] = str(
@@ -2841,6 +2843,12 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         position_pressure.get("enabled"),
         default=bool(pressure_defaults.get("enabled", True)),
     )
+    position_pressure["policy_version"] = str(
+        position_pressure.get(
+            "policy_version",
+            pressure_defaults.get("policy_version", "position-pressure-v2-display-risk-holdout"),
+        )
+    ).strip() or "position-pressure-v2-display-risk-holdout"
     pressure_phase = str(position_pressure.get("phase", pressure_defaults.get("phase", "shadow"))).strip().lower()
     if pressure_phase not in {"shadow", "display", "risk", "confirm"}:
         pressure_phase = "shadow"
@@ -2850,6 +2858,27 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
             position_pressure.get(key),
             default=bool(pressure_defaults.get(key, False)),
         )
+    allowed_pressure_states = {
+        "position_control",
+        "crowded",
+        "pre_squeeze",
+        "active_squeeze",
+        "exhaustion",
+        "organic_continuation",
+    }
+    raw_display_states = position_pressure.get(
+        "display_states",
+        pressure_defaults.get("display_states", ["active_squeeze", "exhaustion", "position_control"]),
+    )
+    if not isinstance(raw_display_states, (list, tuple, set)):
+        raw_display_states = ["active_squeeze", "exhaustion", "position_control"]
+    position_pressure["display_states"] = list(
+        dict.fromkeys(
+            str(state).strip().lower()
+            for state in raw_display_states
+            if str(state).strip().lower() in allowed_pressure_states
+        )
+    ) or ["active_squeeze", "exhaustion", "position_control"]
     merged_pressure_thresholds = dict(pressure_defaults.get("thresholds") or {})
     if isinstance(position_pressure.get("thresholds"), dict):
         merged_pressure_thresholds.update(position_pressure["thresholds"])

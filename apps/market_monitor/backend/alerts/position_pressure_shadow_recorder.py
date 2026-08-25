@@ -28,7 +28,8 @@ class PositionPressureShadowRecorder:
             self.settings.get("position_pressure_state_file") or "position_pressure_state.json"
         )
         self.policy_version = str(
-            self.settings.get("position_pressure_policy_version") or "position-pressure-v1-shadow"
+            self.settings.get("position_pressure_policy_version")
+            or "position-pressure-v2-display-risk-holdout"
         )
         self.min_days = max(
             0.0,
@@ -70,6 +71,9 @@ class PositionPressureShadowRecorder:
         if self.enabled:
             now = datetime.now(timezone.utc)
             self._state.setdefault("started_at", now.isoformat())
+            if self._state.get("active_policy_version") != self.policy_version:
+                self._state["active_policy_version"] = self.policy_version
+                self._state["policy_started_at"] = now.isoformat()
             self._state["updated_at"] = now.isoformat()
             self._save_state()
             _write_json_atomic(self.summary_path, self._build_summary(now))
@@ -149,7 +153,13 @@ class PositionPressureShadowRecorder:
 
     def _build_summary(self, now: datetime) -> Dict[str, Any]:
         started = _parse_time(self._state.get("started_at"))
+        policy_started = _parse_time(self._state.get("policy_started_at"))
         elapsed_days = max(0.0, (now - started).total_seconds() / 86400.0) if started else 0.0
+        policy_elapsed_days = (
+            max(0.0, (now - policy_started).total_seconds() / 86400.0)
+            if policy_started
+            else 0.0
+        )
         first_push_samples = _safe_int(self._state.get("first_push_samples"), 0)
         valid_samples = _safe_int(self._state.get("valid_first_push_samples"), 0)
         coverage_counts = self._state.get("coverage_counts")
@@ -169,6 +179,8 @@ class PositionPressureShadowRecorder:
         return {
             "version": 1,
             "policy_version": self.policy_version,
+            "policy_started_at": self._state.get("policy_started_at"),
+            "policy_elapsed_days": round(policy_elapsed_days, 2),
             "started_at": self._state.get("started_at"),
             "updated_at": self._state.get("updated_at"),
             "elapsed_days": round(elapsed_days, 2),

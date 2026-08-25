@@ -216,6 +216,7 @@ class PositionPressureClassifierTests(unittest.TestCase):
         self.assertEqual(pressure["driver"], "profitable_shorts")
         self.assertFalse(pressure["confirmation_passed"])
         self.assertEqual(pressure["risk_modifier"], 0.0)
+        self.assertGreaterEqual(pressure["shadow_risk_strength"], 65.0)
 
     def test_squeeze_lifecycle_and_downside_symmetry(self) -> None:
         pre_squeeze = classify_position_pressure(
@@ -242,6 +243,7 @@ class PositionPressureClassifierTests(unittest.TestCase):
         )
         self.assertEqual(active["state"], "active_squeeze")
         self.assertEqual(active["driver"], "short_cover")
+        self.assertGreaterEqual(active["shadow_risk_strength"], 50.0)
 
         exhaustion = classify_position_pressure(
             smart_money=_smart_pressure(),
@@ -260,6 +262,7 @@ class PositionPressureClassifierTests(unittest.TestCase):
             settings={"phase": "shadow"},
         )
         self.assertEqual(exhaustion["state"], "exhaustion")
+        self.assertGreater(exhaustion["shadow_risk_strength"], active["shadow_risk_strength"])
 
         downside = classify_position_pressure(
             smart_money=_smart_pressure(
@@ -284,6 +287,43 @@ class PositionPressureClassifierTests(unittest.TestCase):
         )
         self.assertEqual(downside["state"], "active_squeeze")
         self.assertEqual(downside["driver"], "long_liquidation")
+
+    def test_display_phase_only_exposes_validated_risk_states(self) -> None:
+        settings = {
+            "policy_version": "position-pressure-v2-display-risk-holdout",
+            "phase": "display",
+            "display_enabled": True,
+            "display_states": ["active_squeeze", "exhaustion", "position_control"],
+            "risk_enabled": False,
+            "confirmation_enabled": False,
+        }
+        pre_squeeze = classify_position_pressure(
+            smart_money=_smart_pressure(),
+            liquidation_v2={"tracking": True},
+            derivatives=_derivatives_up(),
+            latest={"direction": "up", "change_pct": 2.0},
+            settings=settings,
+        )
+        active = classify_position_pressure(
+            smart_money=_smart_pressure(),
+            liquidation_v2={
+                "tracking": True,
+                "micro_short_liq_usdt_1m": 80_000.0,
+                "micro_long_liq_usdt_1m": 5_000.0,
+            },
+            derivatives=_derivatives_up(oi_amount_change_pct_15m=0.0),
+            latest={"direction": "up", "change_pct": 3.0},
+            settings=settings,
+        )
+
+        self.assertTrue(pre_squeeze["display_enabled"])
+        self.assertFalse(pre_squeeze["display_allowed"])
+        self.assertEqual(_position_pressure_line(pre_squeeze), "")
+        self.assertTrue(active["display_allowed"])
+        self.assertIn("强平进行", _position_pressure_line(active))
+        self.assertFalse(active["risk_enabled"])
+        self.assertFalse(active["confirmation_enabled"])
+        self.assertEqual(active["risk_modifier"], 0.0)
 
 
 class LiquidationCollectionTests(unittest.IsolatedAsyncioTestCase):
@@ -468,6 +508,9 @@ class ShadowCompatibilityTests(unittest.TestCase):
             self.assertEqual(summary["coverage_pct"]["smart_money"], 50.0)
             self.assertEqual(summary["coverage_pct"]["liquidation_v2"], 100.0)
             self.assertEqual(summary["review_gate"]["status"], "READY_FOR_REVIEW")
+            self.assertEqual(summary["policy_version"], "position-pressure-v2-display-risk-holdout")
+            self.assertIsNotNone(summary["policy_started_at"])
+            self.assertGreaterEqual(summary["policy_elapsed_days"], 0.0)
             self.assertTrue(Path(runtime_dir, "position_pressure_readiness.json").exists())
 
     def test_missing_first_push_stays_in_coverage_denominator(self) -> None:
@@ -526,7 +569,7 @@ class ShadowCompatibilityTests(unittest.TestCase):
             self.assertEqual(summary["coverage_pct"]["liquidation_v2"], 50.0)
             self.assertEqual(summary["review_gate"]["status"], "READY_FOR_REVIEW")
 
-    def test_production_config_is_shadow_only(self) -> None:
+    def test_production_config_is_display_only(self) -> None:
         backend_root = Path(__file__).resolve().parents[1]
         config_path = backend_root / "config" / "config.json"
         if not config_path.exists():
@@ -538,8 +581,17 @@ class ShadowCompatibilityTests(unittest.TestCase):
         self.assertTrue(strategy["position_pressure_shadow_enabled"])
         self.assertFalse(strategy["position_pressure_risk_enabled"])
         self.assertFalse(strategy["position_pressure_confirmation_enabled"])
-        self.assertEqual(pressure["phase"], "shadow")
-        self.assertFalse(pressure["display_enabled"])
+        self.assertEqual(
+            strategy["position_pressure_policy_version"],
+            "position-pressure-v2-display-risk-holdout",
+        )
+        self.assertEqual(pressure["policy_version"], "position-pressure-v2-display-risk-holdout")
+        self.assertEqual(pressure["phase"], "display")
+        self.assertTrue(pressure["display_enabled"])
+        self.assertEqual(
+            pressure["display_states"],
+            ["active_squeeze", "exhaustion", "position_control"],
+        )
         self.assertFalse(pressure["risk_enabled"])
         self.assertFalse(pressure["confirmation_enabled"])
         self.assertTrue(micro["global_liquidation_enabled"])

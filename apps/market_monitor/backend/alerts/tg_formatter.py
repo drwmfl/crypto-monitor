@@ -172,6 +172,18 @@ def _position_pressure_line(pressure: Dict[str, Any]) -> str:
     state = str(pressure.get("state") or "unknown").strip().lower()
     if state in {"unknown", "neutral", "no_active_pressure"}:
         return ""
+    raw_display_states = pressure.get("display_states")
+    display_states = (
+        {
+            str(item).strip().lower()
+            for item in raw_display_states
+            if str(item).strip()
+        }
+        if isinstance(raw_display_states, (list, tuple, set))
+        else {"active_squeeze", "exhaustion", "position_control"}
+    )
+    if state not in display_states or pressure.get("display_allowed") is False:
+        return ""
     state_labels = {
         "position_control": "持仓方控制",
         "crowded": "仓位拥挤",

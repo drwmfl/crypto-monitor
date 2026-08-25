@@ -315,7 +315,12 @@ class RecorderAndCompatibilityTests(unittest.TestCase):
         self.assertEqual(data_feed["ws_realtime_processing_concurrency"], 8)
         self.assertEqual(data_feed["ws_realtime_max_pending_evaluations"], 128)
         position_pressure = strategy["confirmation_factors"]["position_pressure"]
-        self.assertFalse(position_pressure["display_enabled"])
+        self.assertEqual(position_pressure["phase"], "display")
+        self.assertTrue(position_pressure["display_enabled"])
+        self.assertEqual(
+            position_pressure["display_states"],
+            ["active_squeeze", "exhaustion", "position_control"],
+        )
         self.assertFalse(position_pressure["risk_enabled"])
         self.assertFalse(position_pressure["confirmation_enabled"])
 

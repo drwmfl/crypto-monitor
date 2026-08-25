@@ -3,6 +3,14 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 
+POLICY_VERSION = "position-pressure-v2-display-risk-holdout"
+DEFAULT_DISPLAY_STATES = (
+    "active_squeeze",
+    "exhaustion",
+    "position_control",
+)
+
+
 DEFAULT_THRESHOLDS: Dict[str, float] = {
     "crowded_share": 0.70,
     "extreme_share": 0.82,
@@ -51,6 +59,8 @@ def classify_position_pressure(
     phase = str(raw_settings.get("phase") or "shadow").strip().lower()
     if phase not in {"shadow", "display", "risk", "confirm"}:
         phase = "shadow"
+    policy_version = str(raw_settings.get("policy_version") or POLICY_VERSION).strip() or POLICY_VERSION
+    display_states = _display_states(raw_settings.get("display_states"))
     display_enabled = _parse_bool(raw_settings.get("display_enabled"), False) and phase in {
         "display",
         "risk",
@@ -72,6 +82,8 @@ def classify_position_pressure(
             display_enabled=False,
             risk_enabled=False,
             confirmation_enabled=False,
+            policy_version=policy_version,
+            display_states=display_states,
         )
 
     smart_available = bool(smart.get("data_available") and smart.get("is_fresh", True))
@@ -89,6 +101,8 @@ def classify_position_pressure(
             display_enabled=display_enabled,
             risk_enabled=risk_enabled,
             confirmation_enabled=confirmation_enabled,
+            policy_version=policy_version,
+            display_states=display_states,
         )
 
     side = "short" if direction == "up" else "long"
@@ -242,6 +256,17 @@ def classify_position_pressure(
         confidence = 42.0
 
     conflict = state == "position_control"
+    shadow_risk_strength, shadow_risk_components = _shadow_risk_strength(
+        state=state,
+        liquidation_available=liquidation_available,
+        target_liquidation_usdt=target_liq,
+        liquidation_volume_ratio=liq_volume_ratio,
+        liquidation_oi_ratio=liq_oi_ratio,
+        oi_change=oi_change,
+        abs_change=abs_change,
+        market_flow_available=_market_flow_available(deriv),
+        market_flow_aligned=market_flow_aligned,
+    )
     result = _result(
         direction=direction,
         state=state,
@@ -254,6 +279,8 @@ def classify_position_pressure(
         display_enabled=display_enabled,
         risk_enabled=risk_enabled,
         confirmation_enabled=confirmation_enabled,
+        policy_version=policy_version,
+        display_states=display_states,
     )
     result.update(
         {
@@ -274,6 +301,8 @@ def classify_position_pressure(
             "conflict_with_price_direction": conflict,
             "shadow_confirmation_passed": confirmation_passed,
             "shadow_risk_modifier": risk_modifier,
+            "shadow_risk_strength": shadow_risk_strength,
+            "shadow_risk_components": shadow_risk_components,
             "confirmation_passed": bool(confirmation_enabled and confirmation_passed),
             "risk_modifier": risk_modifier if risk_enabled else 0.0,
         }
@@ -294,9 +323,11 @@ def _result(
     display_enabled: bool,
     risk_enabled: bool,
     confirmation_enabled: bool,
+    policy_version: str,
+    display_states: tuple[str, ...],
 ) -> Dict[str, Any]:
     return {
-        "policy_version": "position-pressure-v1-shadow",
+        "policy_version": policy_version,
         "phase": phase,
         "direction": direction,
         "state": state,
@@ -307,13 +338,101 @@ def _result(
         "liquidation_v2_available": liquidation_available,
         "data_valid": bool(smart_available or liquidation_available),
         "display_enabled": display_enabled,
+        "display_states": list(display_states),
+        "display_allowed": bool(display_enabled and state in display_states),
         "risk_enabled": risk_enabled,
         "confirmation_enabled": confirmation_enabled,
         "shadow_confirmation_passed": False,
         "shadow_risk_modifier": 0.0,
+        "shadow_risk_strength": 0.0,
+        "shadow_risk_components": {
+            "liquidation": 0.0,
+            "oi_decline": 0.0,
+            "price_extension": 0.0,
+            "flow_conflict": 0.0,
+            "state_floor": 0.0,
+        },
         "confirmation_passed": False,
         "risk_modifier": 0.0,
     }
+
+
+def _shadow_risk_strength(
+    *,
+    state: str,
+    liquidation_available: bool,
+    target_liquidation_usdt: float,
+    liquidation_volume_ratio: float,
+    liquidation_oi_ratio: float,
+    oi_change: float,
+    abs_change: float,
+    market_flow_available: bool,
+    market_flow_aligned: bool,
+) -> tuple[float, Dict[str, float]]:
+    liquidation_intensity = 0.0
+    if liquidation_available:
+        liquidation_intensity = max(
+            _clamp01(target_liquidation_usdt / 100_000.0),
+            _clamp01(liquidation_volume_ratio / 0.03),
+            _clamp01(liquidation_oi_ratio / 0.001),
+        )
+    liquidation_score = 35.0 * liquidation_intensity
+    oi_decline_score = 25.0 * _clamp01(-oi_change / 0.05)
+    price_extension_score = 20.0 * _clamp01((abs_change - 3.0) / 12.0)
+    flow_conflict_score = 20.0 if market_flow_available and not market_flow_aligned else 0.0
+    state_floor = {
+        "crowded": 20.0,
+        "active_squeeze": 50.0,
+        "position_control": 65.0,
+        "exhaustion": 75.0,
+    }.get(state, 0.0)
+    raw_score = liquidation_score + oi_decline_score + price_extension_score + flow_conflict_score
+    score = max(state_floor, min(100.0, raw_score))
+    return round(score, 2), {
+        "liquidation": round(liquidation_score, 2),
+        "oi_decline": round(oi_decline_score, 2),
+        "price_extension": round(price_extension_score, 2),
+        "flow_conflict": round(flow_conflict_score, 2),
+        "state_floor": round(state_floor, 2),
+    }
+
+
+def _market_flow_available(derivatives: Dict[str, Any]) -> bool:
+    return any(
+        derivatives.get(key) is not None
+        for key in (
+            "cvd_usdt_1m",
+            "cvd_usdt_3m",
+            "buy_aggressor_ratio_1m",
+            "taker_buy_ratio",
+            "buy_aggressor_ratio_3m",
+        )
+    )
+
+
+def _display_states(value: Any) -> tuple[str, ...]:
+    allowed = {
+        "position_control",
+        "crowded",
+        "pre_squeeze",
+        "active_squeeze",
+        "exhaustion",
+        "organic_continuation",
+    }
+    if not isinstance(value, (list, tuple, set)):
+        return DEFAULT_DISPLAY_STATES
+    states = tuple(
+        dict.fromkeys(
+            str(item).strip().lower()
+            for item in value
+            if str(item).strip().lower() in allowed
+        )
+    )
+    return states or DEFAULT_DISPLAY_STATES
+
+
+def _clamp01(value: Any) -> float:
+    return max(0.0, min(1.0, _safe_float(value, 0.0)))
 
 
 def _liquidation_available(payload: Dict[str, Any]) -> bool:

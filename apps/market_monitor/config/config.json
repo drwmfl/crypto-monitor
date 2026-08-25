@@ -261,7 +261,7 @@
     "position_pressure_shadow_file": "position_pressure_shadow.jsonl",
     "position_pressure_summary_file": "position_pressure_readiness.json",
     "position_pressure_state_file": "position_pressure_state.json",
-    "position_pressure_policy_version": "position-pressure-v1-shadow",
+    "position_pressure_policy_version": "position-pressure-v2-display-risk-holdout",
     "position_pressure_review_min_days": 7.0,
     "position_pressure_review_min_first_push_samples": 100,
     "position_pressure_review_min_smart_money_coverage_pct": 50.0,
@@ -566,8 +566,14 @@
       },
       "position_pressure": {
         "enabled": true,
-        "phase": "shadow",
-        "display_enabled": false,
+        "policy_version": "position-pressure-v2-display-risk-holdout",
+        "phase": "display",
+        "display_enabled": true,
+        "display_states": [
+          "active_squeeze",
+          "exhaustion",
+          "position_control"
+        ],
         "risk_enabled": false,
         "confirmation_enabled": false,
         "thresholds": {

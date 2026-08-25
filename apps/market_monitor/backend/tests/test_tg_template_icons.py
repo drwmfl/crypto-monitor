@@ -75,10 +75,12 @@ class StrategyTemplateIconTests(unittest.TestCase):
             },
             position_pressure={
                 "display_enabled": True,
+                "display_allowed": True,
+                "display_states": ["active_squeeze", "exhaustion", "position_control"],
                 "data_valid": True,
                 "confidence": 68.0,
-                "state": "pre_squeeze",
-                "driver": "crowded_shorts",
+                "state": "active_squeeze",
+                "driver": "short_cover",
             },
             accumulation={
                 "in_accumulation_pool": True,

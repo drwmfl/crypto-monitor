@@ -553,7 +553,7 @@ class AlertStrategyPipeline:
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "policy_version": pressure.get("policy_version")
                 or self.settings.get("position_pressure_policy_version")
-                or "position-pressure-v1-shadow",
+                or "position-pressure-v2-display-risk-holdout",
                 "symbol": candidate.symbol,
                 "base_asset": getattr(candidate, "base_asset", ""),
                 "candidate_id": candidate.candidate_id,
