@@ -61,7 +61,6 @@ def format_strategy_alert(
             change=change,
             rvol=_fmt_x(latest.get("rvol")),
             price=price,
-            alert_type=decision.alert_type,
         ),
     ]
     oi_line = _oi_summary_line(derivatives)
@@ -117,12 +116,8 @@ def _market_line(
     change: str,
     rvol: str,
     price: str,
-    alert_type: str,
 ) -> str:
-    if alert_type == "strong_direct_alert":
-        icon = "⚡"
-    else:
-        icon = {"上涨": "📈", "下跌": "📉"}.get(direction, "📊")
+    icon = {"上涨": "📈", "下跌": "📉"}.get(direction, "📊")
     return f"{icon} 异动：{window}{direction} {change} | RVOL {rvol} | 现价 {price}"
 
 

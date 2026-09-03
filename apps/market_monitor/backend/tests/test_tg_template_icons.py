@@ -130,7 +130,7 @@ class StrategyTemplateIconTests(unittest.TestCase):
                 for prefix in ("📊 OI：", "⚖️ 仓位：", "🧲 收筹："):
                     self.assertTrue(any(line.startswith(prefix) for line in lines), prefix)
                 self.assertTrue(lines[-1].startswith("🔗 https://www.binance.com/futures/"))
-                self.assertEqual(lines[1].startswith("⚡ 异动："), alert_type == "strong_direct_alert")
+                self.assertTrue(lines[1].startswith("📈 异动："))
                 self.assertEqual(any(line.startswith("✅ 确认：") for line in lines), alert_type == "actionable_alert")
                 self.assertEqual(any(line.startswith("⚠️ 风险：") for line in lines), alert_type == "risk_alert")
                 self.assertEqual(any(line.startswith("🚀 启动：") for line in lines), alert_type == "startup_alert")
@@ -184,6 +184,20 @@ class StrategyTemplateIconTests(unittest.TestCase):
 
         self.assertNotIn("📊 OI：", message)
         self.assertNotIn("⚖️ 仓位：", message)
+
+    def test_strong_direct_market_icon_follows_direction(self) -> None:
+        candidate = self._candidate()
+        candidate.latest_features["direction"] = "down"
+        candidate.latest_features["change_pct"] = -7.6
+
+        message = format_strategy_alert(
+            candidate,
+            AlertDecision(True, alert_type="strong_direct_alert", reason="accepted"),
+        )
+
+        lines = message.splitlines()
+        self.assertTrue(lines[0].startswith("**⚡ 急速异动 |"))
+        self.assertTrue(lines[1].startswith("📉 异动：1m下跌 -7.60%"))
 
     def test_verbose_optional_lines_keep_semantic_icons(self) -> None:
         message = format_strategy_alert(
