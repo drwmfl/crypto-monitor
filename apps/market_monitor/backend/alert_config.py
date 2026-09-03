@@ -489,6 +489,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "runtime_dir": "",
                 "pool_file": "accumulation_pool.json",
                 "history_file": "accumulation_pool_history.jsonl",
+                "report_ledger_file": "accumulation_pool_report_ledger.jsonl",
+                "shadow_enabled": True,
+                "shadow_policy_version": "accumulation-pool-shadow-v1",
                 "max_age_hours": 36,
                 "cache_ttl_sec": 60,
                 "scan": {
@@ -2911,6 +2914,22 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
             accumulation_defaults.get("history_file", "accumulation_pool_history.jsonl"),
         )
     ).strip() or "accumulation_pool_history.jsonl"
+    accumulation_factors["report_ledger_file"] = str(
+        accumulation_factors.get(
+            "report_ledger_file",
+            accumulation_defaults.get("report_ledger_file", "accumulation_pool_report_ledger.jsonl"),
+        )
+    ).strip() or "accumulation_pool_report_ledger.jsonl"
+    accumulation_factors["shadow_enabled"] = _parse_bool(
+        accumulation_factors.get("shadow_enabled"),
+        default=bool(accumulation_defaults.get("shadow_enabled", True)),
+    )
+    accumulation_factors["shadow_policy_version"] = str(
+        accumulation_factors.get(
+            "shadow_policy_version",
+            accumulation_defaults.get("shadow_policy_version", "accumulation-pool-shadow-v1"),
+        )
+    ).strip() or "accumulation-pool-shadow-v1"
     accumulation_factors["max_age_hours"] = max(
         1.0,
         _to_float(accumulation_factors.get("max_age_hours"), _to_float(accumulation_defaults.get("max_age_hours"), 36)),

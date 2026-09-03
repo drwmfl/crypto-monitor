@@ -39,6 +39,16 @@ EXCLUDED_BASE_ASSETS = {
     "USDM",
 }
 
+SHADOW_POLICY_VERSION = "accumulation-pool-shadow-v1"
+STRUCTURE_COMPONENT_KEYS = (
+    "sideways_days",
+    "range_compression",
+    "flatness",
+    "quiet_volume",
+    "market_cap",
+)
+STRUCTURE_MAX_SCORE = 85.0
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build the daily accumulation pool from Binance daily candles.")
@@ -109,6 +119,34 @@ async def main_async() -> int:
         logger.info("Scanning accumulation pool: symbols=%s concurrency=%s", len(symbols), settings["concurrency"])
         results = await _scan_symbols(session, symbols, settings, market_caps, proxy=proxy)
 
+        shadow_tickers: Dict[str, Dict[str, float]] = {}
+        shadow_error = ""
+        shadow_observed_at = datetime.now(timezone.utc).isoformat()
+        if settings["shadow_enabled"]:
+            try:
+                ticker_payload = await _get_json(
+                    session,
+                    settings["base_url"],
+                    "/fapi/v1/ticker/24hr",
+                    {},
+                    proxy=proxy,
+                )
+                shadow_tickers = _parse_24h_tickers(ticker_payload)
+            except Exception as exc:
+                shadow_error = f"ticker_24h_unavailable:{type(exc).__name__}"
+                logger.warning("Accumulation shadow ticker unavailable; legacy scan remains valid: %s", exc)
+
+        _attach_shadow_metrics(
+            results,
+            shadow_tickers,
+            observed_at=shadow_observed_at,
+            policy_version=settings["shadow_policy_version"],
+            enabled=settings["shadow_enabled"],
+            source_error=shadow_error,
+            warming_vol_ratio=float(settings["warming_vol_ratio"]),
+            ready_vol_ratio=float(settings["ready_vol_ratio"]),
+        )
+
     results.sort(key=lambda item: float(item.get("score") or 0.0), reverse=True)
     generated_at = datetime.now(timezone.utc).isoformat()
     payload = {
@@ -119,6 +157,13 @@ async def main_async() -> int:
         "count": len(results),
         "symbols": {item["symbol"]: item for item in results},
         "top": [item["symbol"] for item in results[:50]],
+        "shadow": _shadow_payload_summary(
+            results,
+            observed_at=shadow_observed_at,
+            policy_version=settings["shadow_policy_version"],
+            enabled=settings["shadow_enabled"],
+            source_error=shadow_error,
+        ),
     }
 
     _print_summary(results)
@@ -144,6 +189,15 @@ async def main_async() -> int:
                 "recent_vol_ratio_7d": item["recent_vol_ratio_7d"],
             }
             for item in results[:30]
+        ],
+        "shadow_top": [
+            {
+                "symbol": item["symbol"],
+                "status": item["status"],
+                "score": item["score"],
+                "shadow": item.get("shadow", {}),
+            }
+            for item in sorted(results, key=_shadow_sort_key)[:30]
         ],
     }
     with history_path.open("a", encoding="utf-8") as f:
@@ -317,7 +371,240 @@ def _score_sideways_window(
         "market_cap": round(market_cap, 2) if market_cap > 0 else 0.0,
         "market_cap_source": market_cap_source,
         "data_quality": "ok" if market_cap_source != "estimated" and avg_quote_vol >= float(settings["min_avg_quote_vol_usdt"]) else "estimated",
+        "daily_data_cutoff_at": _timestamp_ms_to_iso(latest.get("close_time")),
         "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def _parse_24h_tickers(payload: Any) -> Dict[str, Dict[str, float]]:
+    items = payload if isinstance(payload, list) else [payload]
+    result: Dict[str, Dict[str, float]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        symbol = normalize_symbol(str(item.get("symbol") or ""))
+        current_price = _safe_float(item.get("lastPrice"), 0.0)
+        quote_volume = _safe_float(item.get("quoteVolume"), -1.0)
+        if not symbol or current_price <= 0 or quote_volume < 0:
+            continue
+        result[symbol] = {
+            "current_price": current_price,
+            "rolling_24h_quote_volume": quote_volume,
+            "close_time": float(_safe_int(item.get("closeTime"), 0)),
+        }
+    return result
+
+
+def _attach_shadow_metrics(
+    results: Sequence[Dict[str, Any]],
+    tickers: Dict[str, Dict[str, float]],
+    *,
+    observed_at: str,
+    policy_version: str = SHADOW_POLICY_VERSION,
+    enabled: bool = True,
+    source_error: str = "",
+    warming_vol_ratio: float = 1.5,
+    ready_vol_ratio: float = 2.5,
+) -> None:
+    for item in results:
+        ticker = tickers.get(normalize_symbol(str(item.get("symbol") or ""))) if enabled else None
+        item["shadow"] = _shadow_metrics_for_item(
+            item,
+            ticker,
+            observed_at=observed_at,
+            policy_version=policy_version,
+            enabled=enabled,
+            source_error=source_error,
+            warming_vol_ratio=warming_vol_ratio,
+            ready_vol_ratio=ready_vol_ratio,
+        )
+
+    for rank, item in enumerate(sorted(results, key=_shadow_sort_key), start=1):
+        shadow = item.get("shadow")
+        if isinstance(shadow, dict):
+            shadow["rank"] = rank
+
+
+def _shadow_metrics_for_item(
+    item: Dict[str, Any],
+    ticker: Optional[Dict[str, float]],
+    *,
+    observed_at: str,
+    policy_version: str,
+    enabled: bool,
+    source_error: str,
+    warming_vol_ratio: float,
+    ready_vol_ratio: float,
+) -> Dict[str, Any]:
+    components = item.get("component_scores")
+    if not isinstance(components, dict):
+        components = {}
+    structure_raw = sum(_safe_float(components.get(key), 0.0) for key in STRUCTURE_COMPONENT_KEYS)
+    structure_score = min(100.0, max(0.0, structure_raw / STRUCTURE_MAX_SCORE * 100.0))
+    base = {
+        "version": policy_version,
+        "observed_at": observed_at,
+        "daily_data_cutoff_at": str(item.get("daily_data_cutoff_at") or ""),
+        "structure_score": round(structure_score, 2),
+        "structure_score_raw": round(structure_raw, 2),
+        "rank": None,
+    }
+    if not enabled:
+        return {
+            **base,
+            "fresh_data_status": "disabled",
+            "fresh_data_error": "",
+            "current_price": None,
+            "market_data_cutoff_at": "",
+            "range_position": None,
+            "rolling_24h_quote_volume": None,
+            "volume_ratio_24h": None,
+            "activation_score": None,
+            "risk_score": None,
+            "risk_state": "unavailable",
+        }
+    if not ticker:
+        return {
+            **base,
+            "fresh_data_status": "unavailable",
+            "fresh_data_error": source_error or "symbol_ticker_missing",
+            "current_price": None,
+            "market_data_cutoff_at": "",
+            "range_position": None,
+            "rolling_24h_quote_volume": None,
+            "volume_ratio_24h": None,
+            "activation_score": None,
+            "risk_score": None,
+            "risk_state": "unavailable",
+        }
+
+    current_price = _safe_float(ticker.get("current_price"), 0.0)
+    quote_volume = max(0.0, _safe_float(ticker.get("rolling_24h_quote_volume"), 0.0))
+    range_low = _safe_float(item.get("range_low"), 0.0)
+    range_high = _safe_float(item.get("range_high"), 0.0)
+    avg_quote_volume = _safe_float(item.get("avg_quote_vol_usdt"), 0.0)
+    if current_price <= 0 or range_low <= 0 or range_high <= range_low or avg_quote_volume <= 0:
+        return {
+            **base,
+            "fresh_data_status": "unavailable",
+            "fresh_data_error": "invalid_shadow_inputs",
+            "current_price": current_price or None,
+            "market_data_cutoff_at": _timestamp_ms_to_iso(ticker.get("close_time")),
+            "range_position": None,
+            "rolling_24h_quote_volume": round(quote_volume, 2),
+            "volume_ratio_24h": None,
+            "activation_score": None,
+            "risk_score": None,
+            "risk_state": "unavailable",
+        }
+
+    range_position = (current_price - range_low) / (range_high - range_low)
+    range_position = max(-1.0, min(2.0, range_position))
+    volume_ratio = quote_volume / avg_quote_volume
+    activation_score = _shadow_activation_score(
+        range_position,
+        volume_ratio,
+        ready_vol_ratio=max(1.0, ready_vol_ratio),
+    )
+    risk_score = _shadow_risk_score(range_position, volume_ratio)
+    risk_state = _shadow_risk_state(
+        range_position,
+        volume_ratio,
+        warming_vol_ratio=max(1.0, warming_vol_ratio),
+        ready_vol_ratio=max(1.0, ready_vol_ratio),
+    )
+    return {
+        **base,
+        "fresh_data_status": "ok",
+        "fresh_data_error": "",
+        "current_price": current_price,
+        "market_data_cutoff_at": _timestamp_ms_to_iso(ticker.get("close_time")),
+        "range_position": round(range_position, 4),
+        "rolling_24h_quote_volume": round(quote_volume, 2),
+        "volume_ratio_24h": round(volume_ratio, 4),
+        "activation_score": round(activation_score, 2),
+        "risk_score": round(risk_score, 2),
+        "risk_state": risk_state,
+    }
+
+
+def _shadow_activation_score(range_position: float, volume_ratio: float, *, ready_vol_ratio: float) -> float:
+    volume_part = min(max(volume_ratio, 0.0) / ready_vol_ratio, 1.0) * 65.0
+    if range_position <= 0:
+        position_part = 0.0
+    elif range_position < 0.55:
+        position_part = range_position / 0.55 * 15.0
+    elif range_position <= 1.0:
+        position_part = 15.0 + (range_position - 0.55) / 0.45 * 20.0
+    else:
+        position_part = 35.0
+    return min(100.0, max(0.0, volume_part + position_part))
+
+
+def _shadow_risk_score(range_position: float, volume_ratio: float) -> float:
+    position_risk = 0.0
+    if range_position < 0:
+        position_risk = min(abs(range_position) / 0.25, 1.0) * 50.0
+    elif range_position > 1.0:
+        position_risk = min((range_position - 1.0) / 0.5, 1.0) * 60.0
+    volume_risk = min(max(volume_ratio - 5.0, 0.0) / 5.0, 1.0) * 40.0
+    return min(100.0, position_risk + volume_risk)
+
+
+def _shadow_risk_state(
+    range_position: float,
+    volume_ratio: float,
+    *,
+    warming_vol_ratio: float,
+    ready_vol_ratio: float,
+) -> str:
+    if range_position < 0:
+        return "below_range"
+    if range_position > 1.2 or volume_ratio > 8.0:
+        return "overheated"
+    if range_position > 1.0 or volume_ratio > 5.0:
+        return "elevated"
+    if volume_ratio >= ready_vol_ratio and range_position >= 0.55:
+        return "active"
+    if volume_ratio >= warming_vol_ratio:
+        return "warming"
+    return "quiet"
+
+
+def _shadow_sort_key(item: Dict[str, Any]) -> tuple[float, float, float, str]:
+    shadow = item.get("shadow") if isinstance(item.get("shadow"), dict) else {}
+    activation = shadow.get("activation_score")
+    risk = shadow.get("risk_score")
+    return (
+        -_safe_float(shadow.get("structure_score"), 0.0),
+        -_safe_float(activation, -1.0),
+        _safe_float(risk, 101.0),
+        str(item.get("symbol") or ""),
+    )
+
+
+def _shadow_payload_summary(
+    results: Sequence[Dict[str, Any]],
+    *,
+    observed_at: str,
+    policy_version: str,
+    enabled: bool,
+    source_error: str,
+) -> Dict[str, Any]:
+    available_count = sum(
+        1
+        for item in results
+        if isinstance(item.get("shadow"), dict) and item["shadow"].get("fresh_data_status") == "ok"
+    )
+    return {
+        "enabled": bool(enabled),
+        "version": policy_version,
+        "observed_at": observed_at,
+        "source": "binance_futures_24h_ticker",
+        "source_error": source_error,
+        "candidate_count": len(results),
+        "available_count": available_count,
+        "coverage_pct": round(available_count / len(results) * 100.0, 2) if results else 0.0,
     }
 
 
@@ -570,6 +857,10 @@ def _normalized_scan_settings(factor_settings: Dict[str, Any], scan_settings: Di
         "request_delay_sec": max(0.0, _safe_float(scan_settings.get("request_delay_sec"), 0.15)),
         "market_cap_api_enabled": _parse_bool(scan_settings.get("market_cap_api_enabled"), True),
         "pool_file": str(factor_settings.get("pool_file") or "accumulation_pool.json"),
+        "shadow_enabled": _parse_bool(factor_settings.get("shadow_enabled"), True),
+        "shadow_policy_version": str(
+            factor_settings.get("shadow_policy_version") or SHADOW_POLICY_VERSION
+        ).strip() or SHADOW_POLICY_VERSION,
     }
 
 
@@ -580,6 +871,16 @@ def _public_settings(settings: Dict[str, Any]) -> Dict[str, Any]:
 def _runtime_path(runtime_dir: Path, value: str) -> Path:
     path = Path(value)
     return path if path.is_absolute() else runtime_dir / path
+
+
+def _timestamp_ms_to_iso(value: Any) -> str:
+    timestamp_ms = _safe_float(value, 0.0)
+    if timestamp_ms <= 0:
+        return ""
+    try:
+        return datetime.fromtimestamp(timestamp_ms / 1000.0, tz=timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return ""
 
 
 def _print_summary(results: Sequence[Dict[str, Any]]) -> None:

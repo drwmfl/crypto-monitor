@@ -601,6 +601,9 @@
         "runtime_dir": "",
         "pool_file": "accumulation_pool.json",
         "history_file": "accumulation_pool_history.jsonl",
+        "report_ledger_file": "accumulation_pool_report_ledger.jsonl",
+        "shadow_enabled": true,
+        "shadow_policy_version": "accumulation-pool-shadow-v1",
         "max_age_hours": 36,
         "cache_ttl_sec": 60,
         "scan": {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
 import html
 import json
 import logging
@@ -107,6 +108,8 @@ async def main_async() -> int:
         print(message)
         if not args.no_send:
             sent = await _send_telegram(message)
+            if sent:
+                _record_sent_report(payload, pool_path, args.summary_limit, message, args.config_path)
             return 0 if sent else 1
         return 0
 
@@ -150,6 +153,7 @@ async def _run_cycle(args: argparse.Namespace) -> bool:
                     return True
                 sent = await _send_telegram(message)
                 if sent:
+                    _record_sent_report(payload, pool_path, args.summary_limit, message, args.config_path)
                     logger.info("Accumulation summary sent successfully.")
                     return True
                 last_error = "telegram_send_failed"
@@ -206,14 +210,7 @@ async def _run_scan_subprocess(args: argparse.Namespace) -> Tuple[bool, str]:
 
 
 def _load_pool_payload(config_path: str = "") -> Tuple[Dict[str, Any], Path]:
-    config = load_alert_config(config_path=config_path or None).raw
-    factor_settings = (
-        config.get("alert_strategy", {})
-        .get("confirmation_factors", {})
-        .get("accumulation_pool", {})
-    )
-    if not isinstance(factor_settings, dict):
-        factor_settings = {}
+    factor_settings = _accumulation_settings(config_path)
     runtime_dir = resolve_runtime_dir(factor_settings)
     pool_file = str(factor_settings.get("pool_file") or "accumulation_pool.json")
     pool_path = Path(pool_file)
@@ -245,7 +242,7 @@ def _validate_fresh_payload(payload: Dict[str, Any], cycle_started_at: datetime)
     return True, ""
 
 
-def _build_summary_message(payload: Dict[str, Any], pool_path: Path, limit: int) -> str:
+def _select_summary_items(payload: Dict[str, Any], limit: int) -> Dict[str, Any]:
     symbols = payload.get("symbols")
     if not isinstance(symbols, dict):
         symbols = {}
@@ -271,6 +268,25 @@ def _build_summary_message(payload: Dict[str, Any], pool_path: Path, limit: int)
     backup_cap = max(0, remaining_cap - risk_cap)
     backup_items = backup_candidates[:backup_cap]
     risk_items = risk_candidates[:risk_cap]
+    return {
+        "symbols": symbols,
+        "items": items,
+        "status_counts": status_counts,
+        "focus_items": focus_items,
+        "backup_items": backup_items,
+        "risk_items": risk_items,
+        "hidden_count": max(0, len(items) - len(focus_items) - len(backup_items) - len(risk_items)),
+    }
+
+
+def _build_summary_message(payload: Dict[str, Any], pool_path: Path, limit: int) -> str:
+    selection = _select_summary_items(payload, limit)
+    symbols = selection["symbols"]
+    items = selection["items"]
+    status_counts = selection["status_counts"]
+    focus_items = selection["focus_items"]
+    backup_items = selection["backup_items"]
+    risk_items = selection["risk_items"]
 
     generated_at = _format_beijing_time(str(payload.get("generated_at") or ""))
     total_count = int(payload.get("count") or len(symbols))
@@ -311,10 +327,175 @@ def _build_summary_message(payload: Dict[str, Any], pool_path: Path, limit: int)
         for idx, item in enumerate(risk_items, start=1):
             lines.append(_compact_item_line(idx, item, include_flags=True))
 
-    hidden_count = max(0, len(items) - len(focus_items) - len(backup_items) - len(risk_items))
+    hidden_count = selection["hidden_count"]
     if hidden_count:
         lines.extend(["", f"ℹ️ 其余 {hidden_count} 个放量/升温标的已收起，避免日报噪音过多。"])
     return "\n".join(lines)
+
+
+def _accumulation_settings(config_path: str = "") -> Dict[str, Any]:
+    config = load_alert_config(config_path=config_path or None).raw
+    factor_settings = (
+        config.get("alert_strategy", {})
+        .get("confirmation_factors", {})
+        .get("accumulation_pool", {})
+    )
+    return factor_settings if isinstance(factor_settings, dict) else {}
+
+
+def _record_sent_report(
+    payload: Dict[str, Any],
+    pool_path: Path,
+    limit: int,
+    message: str,
+    config_path: str = "",
+) -> bool:
+    try:
+        settings = _accumulation_settings(config_path)
+        runtime_dir = resolve_runtime_dir(settings)
+        ledger_file = str(settings.get("report_ledger_file") or "accumulation_pool_report_ledger.jsonl")
+        ledger_path = Path(ledger_file)
+        if not ledger_path.is_absolute():
+            ledger_path = runtime_dir / ledger_path
+        row = _build_report_record(payload, pool_path, limit, message)
+        appended = _append_report_ledger(ledger_path, row)
+        if appended:
+            logger.info("Recorded sent accumulation report: %s report_id=%s", ledger_path, row["report_id"])
+        else:
+            logger.info("Accumulation report already recorded: report_id=%s", row["report_id"])
+        return True
+    except Exception:
+        logger.exception("Failed to record sent accumulation report; Telegram delivery remains successful.")
+        return False
+
+
+def _build_report_record(
+    payload: Dict[str, Any],
+    pool_path: Path,
+    limit: int,
+    message: str,
+    *,
+    sent_at: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    selection = _select_summary_items(payload, limit)
+    sent_time = sent_at or datetime.now(timezone.utc)
+    generated_at = str(payload.get("generated_at") or "")
+    message_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
+    report_id = hashlib.sha256(f"{generated_at}|{message_hash}".encode("utf-8")).hexdigest()[:24]
+    eligible_ranks = {
+        _symbol_key(item): rank
+        for rank, item in enumerate(selection["items"], start=1)
+    }
+
+    displayed: List[Dict[str, Any]] = []
+    display_order = 0
+    for group, group_items in (
+        ("focus", selection["focus_items"]),
+        ("backup", selection["backup_items"]),
+        ("risk", selection["risk_items"]),
+    ):
+        for group_rank, item in enumerate(group_items, start=1):
+            display_order += 1
+            displayed.append(
+                _report_item(
+                    item,
+                    group=group,
+                    group_rank=group_rank,
+                    display_order=display_order,
+                    legacy_rank=eligible_ranks.get(_symbol_key(item)),
+                )
+            )
+
+    shadow_summary = payload.get("shadow") if isinstance(payload.get("shadow"), dict) else {}
+    return {
+        "report_id": report_id,
+        "policy_version": str(shadow_summary.get("version") or "accumulation-pool-shadow-v1"),
+        "send_status": "sent",
+        "generated_at": generated_at,
+        "sent_at": sent_time.astimezone(timezone.utc).isoformat(),
+        "report_date_beijing": sent_time.astimezone(BEIJING_TZ).date().isoformat(),
+        "source_pool_file": pool_path.name,
+        "source_payload_version": payload.get("version"),
+        "daily_data_cutoff_at": _latest_item_timestamp(displayed, "daily_data_cutoff_at"),
+        "market_data_cutoff_at": _latest_item_timestamp(displayed, "market_data_cutoff_at"),
+        "shadow_observed_at": str(shadow_summary.get("observed_at") or ""),
+        "summary_limit": max(1, int(limit)),
+        "pool_count": int(payload.get("count") or len(selection["symbols"])),
+        "eligible_count": len(selection["items"]),
+        "displayed_count": len(displayed),
+        "hidden_count": selection["hidden_count"],
+        "group_counts": {
+            "focus": len(selection["focus_items"]),
+            "backup": len(selection["backup_items"]),
+            "risk": len(selection["risk_items"]),
+        },
+        "status_counts": selection["status_counts"],
+        "displayed_symbols": [_symbol_key(item) for item in displayed],
+        "items": displayed,
+        "message_sha256": message_hash,
+        "message_html": message,
+    }
+
+
+def _report_item(
+    item: Dict[str, Any],
+    *,
+    group: str,
+    group_rank: int,
+    display_order: int,
+    legacy_rank: Optional[int],
+) -> Dict[str, Any]:
+    components = item.get("component_scores") if isinstance(item.get("component_scores"), dict) else {}
+    shadow = item.get("shadow") if isinstance(item.get("shadow"), dict) else {}
+    return {
+        "symbol": _symbol_key(item),
+        "base_asset": str(item.get("base_asset") or _base_from_symbol(_symbol_key(item)) or "").upper(),
+        "group": group,
+        "group_rank": group_rank,
+        "display_order": display_order,
+        "legacy_rank": legacy_rank,
+        "status": _status(item),
+        "score": _safe_float(item.get("score")),
+        "component_scores": dict(components),
+        "sideways_days": _safe_int(item.get("sideways_days")),
+        "range_pct": _safe_float(item.get("range_pct")),
+        "range_position": _safe_float(item.get("range_position")),
+        "recent_vol_ratio_7d": _safe_float(item.get("recent_vol_ratio_7d")),
+        "market_cap": _safe_float(item.get("market_cap")),
+        "data_quality": str(item.get("data_quality") or ""),
+        "daily_data_cutoff_at": str(item.get("daily_data_cutoff_at") or shadow.get("daily_data_cutoff_at") or ""),
+        "market_data_cutoff_at": str(shadow.get("market_data_cutoff_at") or ""),
+        "shadow": dict(shadow),
+    }
+
+
+def _latest_item_timestamp(items: Sequence[Dict[str, Any]], key: str) -> str:
+    timestamps = [
+        parsed
+        for parsed in (_parse_datetime(str(item.get(key) or "")) for item in items)
+        if parsed is not None
+    ]
+    return max(timestamps).isoformat() if timestamps else ""
+
+
+def _append_report_ledger(path: Path, row: Dict[str, Any]) -> bool:
+    report_id = str(row.get("report_id") or "")
+    if not report_id:
+        raise ValueError("report_id is required")
+    if path.exists():
+        with path.open("r", encoding="utf-8") as existing:
+            for line in existing:
+                try:
+                    prior = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if isinstance(prior, dict) and str(prior.get("report_id") or "") == report_id:
+                    return False
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as output:
+        output.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+    return True
 
 
 def _summary_sort_key(item: Any) -> tuple[float, float, float, str]:
