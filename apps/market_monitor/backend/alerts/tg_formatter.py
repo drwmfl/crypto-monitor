@@ -34,27 +34,6 @@ ACCUMULATION_STATUS_LABELS = {
     "dormant": "沉睡",
 }
 
-OI_REGIME_SHORT_LABELS = {
-    "new_longs": "新多",
-    "short_cover": "挤空",
-    "new_shorts": "新空",
-    "deleveraging": "去杠杆",
-    "accumulation": "潜伏",
-    "churn": "换手",
-    "neutral": "中性",
-    "unknown": "未知",
-}
-
-MICRO_REGIME_SHORT_LABELS = {
-    "breakout_continuation": "延续",
-    "new_longs": "新多",
-    "absorption_reversal": "吸收",
-    "short_cover": "挤空",
-    "churn": "换手",
-    "unknown": "未知",
-}
-
-
 def format_strategy_alert(
     candidate: Candidate,
     decision: AlertDecision,
@@ -76,25 +55,29 @@ def format_strategy_alert(
 
     lines = [
         f"**{alert_icon} {alert_label} | {token_name}（触发{trigger_count}次）{title_badge}**",
-        f"🧭 状态：OI {_oi_state_label(derivatives)} | Micro {_micro_state_label(derivatives)} | {direction} {windows}",
-        f"💵 价格：{change} | {price} | 评分/风险 {candidate.score:.1f}/{candidate.risk_score:.1f}",
+        _market_line(
+            direction=direction,
+            window=str(latest.get("window") or windows or "N/A"),
+            change=change,
+            rvol=_fmt_x(latest.get("rvol")),
+            price=price,
+            alert_type=decision.alert_type,
+        ),
     ]
-    completeness_line = _factor_completeness_line(candidate.factor_snapshot or {})
-    if completeness_line:
-        lines.append(completeness_line)
+    oi_line = _oi_summary_line(derivatives)
+    if oi_line:
+        lines.append(oi_line)
+    if decision.alert_type == "actionable_alert":
+        confirmation_line = _actionable_confirmation_line(candidate)
+        if confirmation_line:
+            lines.append(confirmation_line)
+    if decision.alert_type == "risk_alert":
+        risk_line = _risk_reason_line(candidate)
+        if risk_line:
+            lines.append(risk_line)
     pressure_line = _position_pressure_line(candidate.position_pressure or {})
     if pressure_line:
         lines.append(pressure_line)
-    lines.extend(
-        [
-            f"📊 OI: {_oi_matrix(derivatives)}",
-            f"🔬 微结构: {_micro_matrix(derivatives)}",
-            f"💰 资金: {_funding_matrix(derivatives)}",
-        ]
-    )
-    strong_direct_line = _strong_direct_line(latest, decision.alert_type)
-    if strong_direct_line:
-        lines.append(strong_direct_line)
 
     startup_line = _startup_line(latest, decision.alert_type)
     if startup_line:
@@ -127,28 +110,157 @@ def _token_name(symbol: str) -> str:
     return text or "UNKNOWN"
 
 
-def _oi_state_label(derivatives: Dict[str, Any]) -> str:
+def _market_line(
+    *,
+    direction: str,
+    window: str,
+    change: str,
+    rvol: str,
+    price: str,
+    alert_type: str,
+) -> str:
+    if alert_type == "strong_direct_alert":
+        icon = "⚡"
+    else:
+        icon = {"上涨": "📈", "下跌": "📉"}.get(direction, "📊")
+    return f"{icon} 异动：{window}{direction} {change} | RVOL {rvol} | 现价 {price}"
+
+
+def _oi_summary_line(derivatives: Dict[str, Any]) -> str:
     if not _has_oi_data(derivatives):
-        return "预热中"
-    level = str(derivatives.get("oi_signal_level") or "none").upper()
-    regime = _oi_regime_short_label(str(derivatives.get("oi_regime") or "unknown"))
-    return f"{level} {regime}"
+        return ""
+    regime = str(derivatives.get("oi_regime") or "unknown").strip().lower()
+    if regime in {"unknown", "neutral", "none", ""}:
+        return ""
+    level = str(derivatives.get("oi_signal_level") or "none").strip().upper()
+    strong = level in {"L2", "L3"}
+    phrases = {
+        "new_longs": "新多明显增仓" if strong else "新多开始增仓",
+        "short_cover": "空头快速回补" if strong else "空头回补",
+        "new_shorts": "新空明显增仓" if strong else "新空开始增仓",
+        "deleveraging": "多头快速去杠杆" if strong else "多头去杠杆",
+        "accumulation": "横盘明显增仓" if strong else "横盘增仓",
+        "churn": "持仓换手，方向不明",
+    }
+    phrase = phrases.get(regime)
+    return f"📊 OI：{phrase}" if phrase else ""
 
 
-def _micro_state_label(derivatives: Dict[str, Any]) -> str:
-    if not _has_micro_data(derivatives):
-        return "预热中"
-    level = str(derivatives.get("micro_signal_level") or "L0").upper()
-    regime = _micro_regime_short_label(str(derivatives.get("micro_regime") or "unknown"))
-    return f"{level} {regime}"
+def _actionable_confirmation_line(candidate: Candidate) -> str:
+    confirmation = candidate.confirmation or {}
+    checks = confirmation.get("checks") if isinstance(confirmation, dict) else []
+    if not isinstance(checks, list):
+        return ""
+    direction = str((candidate.latest_features or {}).get("direction") or "").strip().lower()
+    labels: list[str] = []
+    for check in checks:
+        if not isinstance(check, dict) or not check.get("passed"):
+            continue
+        key = str(check.get("key") or "").strip()
+        if key == "price_persistence":
+            value = check.get("value") if isinstance(check.get("value"), dict) else {}
+            windows = value.get("windows") if isinstance(value.get("windows"), list) else []
+            labels.append("多周期持续触发" if len(windows) >= 2 else "走势持续触发")
+        elif key == "flow":
+            labels.append("主动买盘增强" if direction == "up" else "主动卖盘增强")
+        elif key == "orderbook":
+            labels.append("盘口买方占优" if direction == "up" else "盘口卖方占优")
+        elif key == "liquidation":
+            labels.append("空头强平配合" if direction == "up" else "多头强平配合")
+        elif key == "position_pressure":
+            labels.append("仓位压力确认")
+        elif key == "oi" and not _oi_summary_line(candidate.derivatives or {}):
+            labels.append("OI状态确认")
+    labels = list(dict.fromkeys(labels))
+    return f"✅ 确认：{' | '.join(labels[:2])}" if labels else ""
 
 
-def _oi_regime_short_label(regime: str) -> str:
-    return OI_REGIME_SHORT_LABELS.get(str(regime or "unknown"), str(regime or "unknown"))
+def _risk_reason_line(candidate: Candidate) -> str:
+    breakdown = candidate.risk_breakdown or {}
+    if not isinstance(breakdown, dict):
+        return "⚠️ 风险：多项风险条件叠加"
+    latest = candidate.latest_features or {}
+    direction = str(latest.get("direction") or "").strip().lower()
+    window = str(latest.get("window") or "短时").strip() or "短时"
+    reasons: list[tuple[float, str]] = []
+
+    overheat = _safe_float(breakdown.get("overheat"), 0.0)
+    if overheat > 0:
+        move = "涨幅过热" if direction == "up" else "跌幅过大" if direction == "down" else "波动过热"
+        reasons.append((overheat, f"{window}{move}"))
+    component_labels = {
+        "direction_conflict": "多周期方向冲突",
+        "single_factor": "仅单次/单周期触发",
+        "crowding_noise": "短时反复触发过多",
+        "open_candle": "K线尚未收盘",
+        "liquidation_risk": "短时爆仓金额较大",
+        "accumulation_risk": "吸筹标的流动性或区间异常",
+        "position_pressure_risk": "仓位压力风险",
+    }
+    for key, label in component_labels.items():
+        weight = _safe_float(breakdown.get(key), 0.0)
+        if weight > 0:
+            reasons.append((weight, label))
+
+    weak = _safe_float(breakdown.get("weak_confirmation"), 0.0)
+    if weak > 0:
+        raw = breakdown.get("raw") if isinstance(breakdown.get("raw"), dict) else {}
+        label = "量能确认偏弱" if _safe_float(raw.get("rvol"), 0.0) <= 1.2 else "基础确认偏弱"
+        reasons.append((weak, label))
+
+    derivatives_risk = _safe_float(breakdown.get("derivatives_risk"), 0.0)
+    if derivatives_risk > 0:
+        reasons.append((derivatives_risk, _derivatives_risk_label(candidate)))
+    orderbook_risk = _safe_float(breakdown.get("orderbook_risk"), 0.0)
+    if orderbook_risk > 0:
+        reasons.append((orderbook_risk, _orderbook_risk_label(candidate)))
+
+    selected: list[str] = []
+    for _, label in sorted(reasons, key=lambda item: item[0], reverse=True):
+        if label and label not in selected:
+            selected.append(label)
+        if len(selected) >= 2:
+            break
+    return f"⚠️ 风险：{' | '.join(selected)}" if selected else "⚠️ 风险：多项风险条件叠加"
 
 
-def _micro_regime_short_label(regime: str) -> str:
-    return MICRO_REGIME_SHORT_LABELS.get(str(regime or "unknown"), str(regime or "unknown"))
+def _derivatives_risk_label(candidate: Candidate) -> str:
+    derivatives = candidate.derivatives or {}
+    latest = candidate.latest_features or {}
+    direction = str(latest.get("direction") or "").strip().lower()
+    funding_rate = abs(_safe_float(derivatives.get("funding_rate"), 0.0))
+    oi_regime = str(derivatives.get("oi_regime") or "").strip().lower()
+    micro_regime = str(derivatives.get("micro_regime") or "").strip().lower()
+    taker_buy_ratio = _safe_float(derivatives.get("taker_buy_ratio"), 0.0)
+    cvd_1m = _safe_float(derivatives.get("cvd_usdt_1m"), 0.0)
+    if funding_rate >= 0.0015:
+        return "资金费率过热"
+    if direction == "up" and (oi_regime == "short_cover" or micro_regime == "short_cover"):
+        return "上涨主要由空头回补推动"
+    if direction == "up" and ((0 < taker_buy_ratio < 0.48) or cvd_1m < 0):
+        return "上涨与主动买盘背离"
+    if direction == "down" and oi_regime == "new_shorts":
+        return "新空增仓压力"
+    if direction == "down" and oi_regime == "deleveraging":
+        return "多头快速去杠杆"
+    if oi_regime == "churn" or micro_regime == "churn":
+        return "短线换手噪音偏高"
+    return "衍生品信号存在冲突"
+
+
+def _orderbook_risk_label(candidate: Candidate) -> str:
+    orderbook = candidate.orderbook or {}
+    spread_bps = _safe_float(orderbook.get("spread_bps"), 0.0)
+    bid_notional = _safe_float(orderbook.get("bid_notional"), 0.0)
+    ask_notional = _safe_float(orderbook.get("ask_notional"), 0.0)
+    imbalance = abs(_safe_float(orderbook.get("imbalance"), 0.0))
+    if 0 < bid_notional + ask_notional < 100000:
+        return "盘口流动性偏低"
+    if spread_bps > 15:
+        return "买卖价差过大"
+    if imbalance >= 0.75:
+        return "盘口挂单严重失衡"
+    return "盘口条件存在异常"
 
 
 def _accumulation_line(accumulation: Dict[str, Any]) -> str:
@@ -205,7 +317,7 @@ def _position_pressure_line(pressure: Dict[str, Any]) -> str:
     label = state_labels.get(state, state)
     raw_driver = str(pressure.get("driver") or "")
     driver = driver_labels.get(raw_driver, raw_driver or "未知")
-    return f"⚖️ 仓位：{label} | {driver} | 可信度 {confidence:.0f}"
+    return f"⚖️ 仓位：{label} | {driver}"
 
 
 def _startup_line(latest: Dict[str, Any], alert_type: str) -> str:
@@ -213,73 +325,23 @@ def _startup_line(latest: Dict[str, Any], alert_type: str) -> str:
         return ""
     window = str(latest.get("startup_window") or "").strip() or "N/A"
     change = _fmt_pct(latest.get("startup_change_pct"))
-    rvol = _fmt_x(latest.get("startup_rvol"))
-    breakout = _fmt_pct(latest.get("startup_breakout_distance_pct"))
-    return f"🚀 启动: {window}累计 {change} | RVOL {rvol} | 距60m高点 {breakout} | 高波动仅观察"
-
-
-def _strong_direct_line(latest: Dict[str, Any], alert_type: str) -> str:
-    if alert_type != "strong_direct_alert":
-        return ""
-    direction = str(latest.get("direction") or "").strip().lower()
-    if direction == "down":
-        return "💡 提示: 急速下杀/风险释放，偏短线观察；非做多入场信号"
-    if direction == "up":
-        return "💡 提示: 急速拉升已过滤过热，仍属短线波动雷达；不建议无脑追涨"
-    return "💡 提示: 急速波动，仅观察，不代表入场"
+    breakout = _safe_optional_float(latest.get("startup_breakout_distance_pct"))
+    if breakout is None:
+        return f"🚀 启动：{window}累计 {change}"
+    if breakout > 0.005:
+        position = f"收盘突破60m高点 +{breakout:.2f}%"
+    elif breakout >= -0.005:
+        position = "收盘触及60m高点"
+    elif breakout >= -0.15:
+        position = f"距60m高点还差 {abs(breakout):.2f}%"
+    else:
+        position = f"盘中突破后回落，现低于60m高点 {abs(breakout):.2f}%"
+    return f"🚀 启动：{window}累计 {change} | {position}"
 
 
 def _accumulation_status_label(status: Any) -> str:
     key = str(status or "unknown").strip().lower()
     return ACCUMULATION_STATUS_LABELS.get(key, key)
-
-
-def _oi_matrix(derivatives: Dict[str, Any]) -> str:
-    if not _has_oi_data(derivatives):
-        return "预热中"
-    return (
-        f"5m {_fmt_ratio_pct(derivatives.get('oi_change_pct_5m'))} | "
-        f"15m {_fmt_ratio_pct(derivatives.get('oi_change_pct_15m'))} | "
-        f"1h {_fmt_ratio_pct(derivatives.get('oi_change_pct_1h'))} | "
-        f"4h {_fmt_ratio_pct(derivatives.get('oi_change_pct_4h'))}"
-    )
-
-
-def _micro_matrix(derivatives: Dict[str, Any]) -> str:
-    if not _has_micro_data(derivatives):
-        return "预热中"
-
-    regime = str(derivatives.get("micro_regime") or "unknown")
-    if regime == "absorption_reversal":
-        return (
-            f"CVD {_fmt_signed_usd(derivatives.get('cvd_usdt_10s'))}/"
-            f"{_fmt_signed_usd(derivatives.get('cvd_usdt_30s'))}/"
-            f"{_fmt_signed_usd(derivatives.get('cvd_usdt_1m'))} | "
-            f"买方 {_fmt_ratio_pct(derivatives.get('buy_aggressor_ratio_10s'))}/"
-            f"{_fmt_ratio_pct(derivatives.get('buy_aggressor_ratio_30s'))}/"
-            f"{_fmt_ratio_pct(derivatives.get('buy_aggressor_ratio_1m'))} | "
-            f"强平差 {_fmt_signed_usd(derivatives.get('micro_liq_imbalance_usdt_1m'))}"
-        )
-
-    return (
-        f"CVD {_fmt_signed_usd(derivatives.get('cvd_usdt_1m'))}/"
-        f"{_fmt_signed_usd(derivatives.get('cvd_usdt_3m'))}/"
-        f"{_fmt_signed_usd(derivatives.get('cvd_usdt_5m'))} | "
-        f"买方 {_fmt_ratio_pct(derivatives.get('buy_aggressor_ratio_1m'))}/"
-        f"{_fmt_ratio_pct(derivatives.get('buy_aggressor_ratio_3m'))}/"
-        f"{_fmt_ratio_pct(derivatives.get('buy_aggressor_ratio_5m'))} | "
-        f"强平差 {_fmt_signed_usd(derivatives.get('micro_liq_imbalance_usdt_1m'))}"
-    )
-
-
-def _funding_matrix(derivatives: Dict[str, Any]) -> str:
-    if not _has_funding_data(derivatives):
-        return "预热中"
-    return (
-        f"主动买 {_fmt_ratio_pct(derivatives.get('taker_buy_ratio'))} | "
-        f"费率 {_fmt_ratio_pct(derivatives.get('funding_rate'))} | "
-        f"OI {_fmt_compact_usd(derivatives.get('oi_usdt'))}"
-    )
 
 
 def _has_oi_data(derivatives: Dict[str, Any]) -> bool:
@@ -291,63 +353,6 @@ def _has_oi_data(derivatives: Dict[str, Any]) -> bool:
         "oi_change_pct_4h",
     )
     return _has_any_value(derivatives, keys)
-
-
-def _has_micro_data(derivatives: Dict[str, Any]) -> bool:
-    keys = (
-        "cvd_usdt_10s",
-        "cvd_usdt_30s",
-        "cvd_usdt_1m",
-        "cvd_usdt_3m",
-        "cvd_usdt_5m",
-        "buy_aggressor_ratio_10s",
-        "buy_aggressor_ratio_30s",
-        "buy_aggressor_ratio_1m",
-        "buy_aggressor_ratio_3m",
-        "buy_aggressor_ratio_5m",
-        "micro_liq_imbalance_usdt_1m",
-    )
-    return _has_any_value(derivatives, keys)
-
-
-def _has_funding_data(derivatives: Dict[str, Any]) -> bool:
-    return _has_any_value(derivatives, ("taker_buy_ratio", "funding_rate", "oi_usdt"))
-
-
-def _factor_completeness_line(snapshot: Dict[str, Any]) -> str:
-    completeness = snapshot.get("factor_completeness") if isinstance(snapshot, dict) else {}
-    if not isinstance(completeness, dict):
-        return ""
-    available = int(_safe_float(completeness.get("available"), 0.0))
-    total = int(_safe_float(completeness.get("total"), 0.0))
-    pct = _safe_optional_float(completeness.get("pct"))
-    if total <= 0 or pct is None:
-        return ""
-    statuses = completeness.get("statuses")
-    liquidation_status = ""
-    if isinstance(statuses, dict):
-        liquidation_status = str(statuses.get("liquidation") or "").strip().lower()
-    status_suffix = " | 爆仓近5m无强平" if liquidation_status == "none_recent" else ""
-    if available >= total:
-        return f"🧩 数据：衍生品完整 {available}/{total}{status_suffix}"
-    missing = completeness.get("missing")
-    missing_labels = _factor_group_labels(missing if isinstance(missing, list) else [])
-    prefix = "🧩 数据：衍生品不足" if pct < 50.0 else "🧩 数据：衍生品"
-    missing_suffix = f" | 缺 {missing_labels}" if missing_labels else ""
-    return f"{prefix} {available}/{total} {pct:.0f}%{missing_suffix}{status_suffix}"
-
-
-def _factor_group_labels(groups: list[Any]) -> str:
-    labels = {
-        "oi": "OI",
-        "funding": "费率",
-        "taker_flow": "主动流",
-        "micro": "微结构",
-        "orderbook": "盘口",
-        "liquidation": "爆仓",
-    }
-    result = [labels.get(str(item), str(item)) for item in groups if str(item)]
-    return "/".join(result[:4])
 
 
 def _has_any_value(payload: Dict[str, Any], keys: tuple[str, ...]) -> bool:
@@ -389,13 +394,6 @@ def _fmt_pct_plain(value: Any) -> str:
     return f"{numeric:.2f}%"
 
 
-def _fmt_ratio_pct(value: Any) -> str:
-    numeric = _safe_optional_float(value)
-    if numeric is None:
-        return "N/A"
-    return f"{numeric * 100.0:+.2f}%"
-
-
 def _fmt_float(value: Any, digits: int = 2) -> str:
     numeric = _safe_optional_float(value)
     if numeric is None:
@@ -431,18 +429,6 @@ def _fmt_compact_usd(value: Any) -> str:
     if abs_value >= 1_000:
         return f"${numeric / 1_000:.2f}K"
     return f"${numeric:.2f}"
-
-
-def _fmt_signed_usd(value: Any) -> str:
-    numeric = _safe_optional_float(value)
-    if numeric is None:
-        return "N/A"
-    abs_value = abs(numeric)
-    if abs_value >= 1_000_000:
-        return f"{numeric / 1_000_000:+.2f}M"
-    if abs_value >= 1_000:
-        return f"{numeric / 1_000:+.1f}K"
-    return f"{numeric:+.0f}"
 
 
 def _normalize_detail_level(value: Any) -> str:

@@ -36,6 +36,7 @@ class StrategyTemplateIconTests(unittest.TestCase):
                 "window": "1m",
                 "price": 0.07239,
                 "change_pct": 4.17,
+                "rvol": 7.2,
                 "source": "ws",
                 "event_type": "early_start",
                 "startup_window": "15m",
@@ -73,6 +74,23 @@ class StrategyTemplateIconTests(unittest.TestCase):
                     "statuses": {"liquidation": "none_recent"},
                 }
             },
+            confirmation={
+                "checks": [
+                    {
+                        "key": "price_persistence",
+                        "passed": True,
+                        "value": {"event_count": 2, "windows": ["1m", "5m"]},
+                    },
+                    {"key": "flow", "passed": True},
+                    {"key": "orderbook", "passed": False},
+                ]
+            },
+            risk_breakdown={
+                "overheat": 20.85,
+                "derivatives_risk": 9.0,
+                "weak_confirmation": 3.0,
+                "raw": {"rvol": 7.2},
+            },
             position_pressure={
                 "display_enabled": True,
                 "display_allowed": True,
@@ -93,9 +111,8 @@ class StrategyTemplateIconTests(unittest.TestCase):
             },
         )
 
-    def test_each_strategy_category_has_its_own_title_icon(self) -> None:
+    def test_each_strategy_category_has_its_own_compact_content(self) -> None:
         expected = {
-            "watchlist_alert": "**👀 观察候选 |",
             "actionable_alert": "**💎 高价值候选 |",
             "risk_alert": "**🚨 高风险提醒 |",
             "strong_direct_alert": "**⚡ 急速异动 |",
@@ -110,11 +127,63 @@ class StrategyTemplateIconTests(unittest.TestCase):
                 )
                 lines = message.splitlines()
                 self.assertTrue(lines[0].startswith(title_prefix))
-                for prefix in ("🧭 状态：", "💵 价格：", "🧩 数据：", "⚖️ 仓位：", "📊 OI:", "🔬 微结构:", "💰 资金:", "🧲 收筹："):
+                for prefix in ("📊 OI：", "⚖️ 仓位：", "🧲 收筹："):
                     self.assertTrue(any(line.startswith(prefix) for line in lines), prefix)
                 self.assertTrue(lines[-1].startswith("🔗 https://www.binance.com/futures/"))
-                self.assertEqual(any(line.startswith("💡 提示:") for line in lines), alert_type == "strong_direct_alert")
-                self.assertEqual(any(line.startswith("🚀 启动:") for line in lines), alert_type == "startup_alert")
+                self.assertEqual(lines[1].startswith("⚡ 异动："), alert_type == "strong_direct_alert")
+                self.assertEqual(any(line.startswith("✅ 确认：") for line in lines), alert_type == "actionable_alert")
+                self.assertEqual(any(line.startswith("⚠️ 风险：") for line in lines), alert_type == "risk_alert")
+                self.assertEqual(any(line.startswith("🚀 启动：") for line in lines), alert_type == "startup_alert")
+                for removed_prefix in ("🧭 状态：", "💵 价格：", "🧩 数据：", "🔬 微结构:", "💰 资金:", "💡 提示:"):
+                    self.assertFalse(any(line.startswith(removed_prefix) for line in lines), removed_prefix)
+
+    def test_strategy_specific_lines_are_concise_and_semantic(self) -> None:
+        actionable = format_strategy_alert(
+            self._candidate(),
+            AlertDecision(True, alert_type="actionable_alert", reason="accepted"),
+        )
+        risk = format_strategy_alert(
+            self._candidate(),
+            AlertDecision(True, alert_type="risk_alert", reason="accepted"),
+        )
+
+        self.assertIn("📈 异动：1m上涨 +4.17% | RVOL 7.20x | 现价 0.07239000", actionable)
+        self.assertIn("📊 OI：新多明显增仓", actionable)
+        self.assertIn("✅ 确认：多周期持续触发 | 主动买盘增强", actionable)
+        self.assertNotIn("⚠️ 风险：", actionable)
+        self.assertIn("⚠️ 风险：1m涨幅过热 | 上涨与主动买盘背离", risk)
+        self.assertNotIn("✅ 确认：", risk)
+        self.assertIn(
+            "🧲 收筹：升温 78.5 | 横盘 96天 | 区间 22.40% | Vol 2.30x | 市值 $125.00M",
+            actionable,
+        )
+
+    def test_startup_breakout_wording_covers_close_positions(self) -> None:
+        candidate = self._candidate()
+        decision = AlertDecision(True, alert_type="startup_alert", reason="accepted")
+
+        above = format_strategy_alert(candidate, decision)
+        candidate.latest_features["startup_breakout_distance_pct"] = -0.1
+        near = format_strategy_alert(candidate, decision)
+        candidate.latest_features["startup_breakout_distance_pct"] = -0.5
+        intrabar_reversal = format_strategy_alert(candidate, decision)
+
+        self.assertIn("收盘突破60m高点 +0.64%", above)
+        self.assertIn("距60m高点还差 0.10%", near)
+        self.assertIn("盘中突破后回落，现低于60m高点 0.50%", intrabar_reversal)
+
+    def test_neutral_oi_and_normal_position_pressure_are_hidden(self) -> None:
+        candidate = self._candidate()
+        candidate.derivatives["oi_regime"] = "neutral"
+        candidate.position_pressure["state"] = "no_active_pressure"
+
+        message = format_strategy_alert(
+            candidate,
+            AlertDecision(True, alert_type="strong_direct_alert", reason="accepted"),
+        )
+
+        self.assertNotIn("📊 OI：", message)
+        self.assertNotIn("⚖️ 仓位：", message)
 
     def test_verbose_optional_lines_keep_semantic_icons(self) -> None:
         message = format_strategy_alert(
@@ -155,7 +224,7 @@ class OtherTelegramTemplateIconTests(unittest.TestCase):
 
         lines = notifier.build_message(event, daily_push_count=1).splitlines()
 
-        self.assertTrue(lines[0].startswith("**📣 TAKE（今日第1次推送）⚠️"))
+        self.assertTrue(lines[0].startswith("**📣 TAKE（今日第1次推送）1️⃣"))
         for prefix in ("💵 核心变化：", "🕒 1h/24h：", "💰 MC/FDV：", "⏰ 时间：", "🎯 触发依据：", "📊 周期变化：", "🔁 1m同向连发：", "🧾 合并更新："):
             self.assertTrue(any(line.startswith(prefix) for line in lines), prefix)
         self.assertTrue(lines[-1].startswith("🔗 https://www.binance.com/futures/"))

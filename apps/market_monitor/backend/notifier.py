@@ -30,7 +30,7 @@ except ModuleNotFoundError:
 logger = logging.getLogger(__name__)
 VALID_LEVELS = {"low", "medium", "high"}
 BEIJING_TZ = timezone(timedelta(hours=8))
-FIRST_DAILY_PUSH_WARNING = "⚠️"
+FIRST_DAILY_PUSH_WARNING = "1️⃣"
 DEFAULT_PUSH_POLICY: Dict[str, Any] = {
     "repeat_window_minutes": 10,
     "merge_window_minutes": 8,
@@ -1422,7 +1422,10 @@ class AlertNotifier:
             count = max(1, int(daily_push_count or 0))
         except (TypeError, ValueError):
             return message
-        pattern = rf"（(?:今日第\d+次推送|触发\d+次)）(?:{re.escape(FIRST_DAILY_PUSH_WARNING)})?"
+        marker_pattern = "|".join(
+            re.escape(marker) for marker in (FIRST_DAILY_PUSH_WARNING, "⚠️")
+        )
+        pattern = rf"（(?:今日第\d+次推送|触发\d+次)）(?:(?:{marker_pattern}))?"
         first_push_warning = FIRST_DAILY_PUSH_WARNING if count == 1 else ""
         replacement = f"（今日第{count}次推送）{first_push_warning}"
         updated, replaced = re.subn(pattern, replacement, message, count=1)

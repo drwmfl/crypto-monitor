@@ -78,7 +78,7 @@ class BinanceInstrumentTypeTests(unittest.TestCase):
         final_message = AlertNotifier._apply_daily_push_title(message, 1)
         self.assertEqual(
             final_message.splitlines()[0],
-            "**🚀 启动预警 | SOXS（今日第1次推送）⚠️ | 📊 股票合约**",
+            "**🚀 启动预警 | SOXS（今日第1次推送）1️⃣ | 📊 股票合约**",
         )
 
 
