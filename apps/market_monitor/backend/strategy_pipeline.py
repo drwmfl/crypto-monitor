@@ -76,6 +76,7 @@ class AlertStrategyPipeline:
         self.position_pressure_shadow_recorder = PositionPressureShadowRecorder(self.settings)
         self._prewarm_last_ts: Dict[str, float] = {}
         self._prewarm_tasks: set[asyncio.Task] = set()
+        self._symbol_locks: Dict[str, asyncio.Lock] = {}
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "AlertStrategyPipeline":
@@ -106,6 +107,21 @@ class AlertStrategyPipeline:
 
     async def process_event(self, payload: Dict[str, Any], *, source: str, notifier: Any) -> StrategyProcessResult:
         raw_event = RawEvent.from_alert_payload(payload, source=source)
+        symbol_lock = self._symbol_locks.setdefault(raw_event.symbol, asyncio.Lock())
+        async with symbol_lock:
+            return await self._process_event_serialized(
+                payload,
+                raw_event=raw_event,
+                notifier=notifier,
+            )
+
+    async def _process_event_serialized(
+        self,
+        payload: Dict[str, Any],
+        *,
+        raw_event: RawEvent,
+        notifier: Any,
+    ) -> StrategyProcessResult:
         self.event_store.append(raw_event)
 
         candidate = self.candidate_engine.update_candidate(raw_event)
@@ -127,6 +143,14 @@ class AlertStrategyPipeline:
                 self._recalculate_candidate(candidate)
             self._apply_trade_confirmation(candidate)
             self.candidate_engine.save()
+
+            primary_decision = self.policy.decide(candidate)
+            if primary_decision.should_send and primary_decision.alert_type in {"actionable_alert", "risk_alert"}:
+                return await self._process_primary_candidate(
+                    candidate,
+                    notifier=notifier,
+                    decision=primary_decision,
+                )
 
             startup_allowed, startup_reason = self._startup_allowed(candidate)
             alert_sent = False
@@ -273,7 +297,16 @@ class AlertStrategyPipeline:
         self._apply_trade_confirmation(candidate)
         self.candidate_engine.save()
 
-        decision = self.policy.decide(candidate)
+        return await self._process_primary_candidate(candidate, notifier=notifier)
+
+    async def _process_primary_candidate(
+        self,
+        candidate: Any,
+        *,
+        notifier: Any,
+        decision: Optional[AlertDecision] = None,
+    ) -> StrategyProcessResult:
+        decision = decision or self.policy.decide(candidate)
         alert_sent = False
         dedupe_decision = None
         if decision.should_send:

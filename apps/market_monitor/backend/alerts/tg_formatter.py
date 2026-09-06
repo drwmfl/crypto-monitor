@@ -316,7 +316,9 @@ def _position_pressure_line(pressure: Dict[str, Any]) -> str:
 
 
 def _startup_line(latest: Dict[str, Any], alert_type: str) -> str:
-    if alert_type != "startup_alert":
+    if alert_type not in {"startup_alert", "actionable_alert", "risk_alert"}:
+        return ""
+    if alert_type != "startup_alert" and str(latest.get("event_type") or "").strip() != "early_start":
         return ""
     window = str(latest.get("startup_window") or "").strip() or "N/A"
     change = _fmt_pct(latest.get("startup_change_pct"))

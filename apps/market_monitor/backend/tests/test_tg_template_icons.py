@@ -133,7 +133,10 @@ class StrategyTemplateIconTests(unittest.TestCase):
                 self.assertTrue(lines[1].startswith("📈 异动："))
                 self.assertEqual(any(line.startswith("✅ 确认：") for line in lines), alert_type == "actionable_alert")
                 self.assertEqual(any(line.startswith("⚠️ 风险：") for line in lines), alert_type == "risk_alert")
-                self.assertEqual(any(line.startswith("🚀 启动：") for line in lines), alert_type == "startup_alert")
+                self.assertEqual(
+                    any(line.startswith("🚀 启动：") for line in lines),
+                    alert_type in {"startup_alert", "actionable_alert", "risk_alert"},
+                )
                 for removed_prefix in ("🧭 状态：", "💵 价格：", "🧩 数据：", "🔬 微结构:", "💰 资金:", "💡 提示:"):
                     self.assertFalse(any(line.startswith(removed_prefix) for line in lines), removed_prefix)
 
