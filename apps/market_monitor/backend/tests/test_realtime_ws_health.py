@@ -277,6 +277,35 @@ class RealtimeWebSocketHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received[0][0]["window"], "1m")
         self.assertEqual(received[0][1], "ws")
 
+    async def test_closed_one_minute_candle_is_aggregated_before_change_prefilter(self) -> None:
+        watcher = _watcher()
+        watcher.local_agg_enabled = True
+        watcher.local_agg_windows = ["5m"]
+        watcher.prefilter_pct_by_window = {"1m": 999.0}
+        started = asyncio.Event()
+
+        async def record_aggregation(**_kwargs) -> None:
+            started.set()
+
+        watcher._on_closed_1m_candle = record_aggregation
+        await watcher._handle_message(json.dumps({
+            "e": "kline",
+            "s": "BTCUSDT",
+            "k": {
+                "i": "1m",
+                "t": 1,
+                "T": 60000,
+                "o": "100",
+                "h": "101",
+                "l": "99",
+                "c": "100.5",
+                "v": "10",
+                "x": True,
+            },
+        }))
+
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+
     def test_five_minute_local_bucket_closes_on_fifth_one_minute_candle(self) -> None:
         watcher = _watcher()
         watcher._agg_state = {}

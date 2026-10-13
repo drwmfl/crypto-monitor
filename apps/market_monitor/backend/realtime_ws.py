@@ -566,6 +566,16 @@ class RealtimeKlineWatcher:
                 volume=volume,
                 is_closed=is_closed,
             )
+            if self.local_agg_enabled and is_closed:
+                self._schedule_closed_1m_aggregation(
+                    symbol=symbol,
+                    candle_start_ms=candle_start_ms,
+                    open_price=open_price,
+                    high_price=high_price,
+                    low_price=low_price,
+                    close_price=close_price,
+                    volume=volume,
+                )
 
         change_pct = abs((close_price - open_price) / open_price * 100.0)
         prefilter_pct = self.prefilter_pct_by_window.get(window, 0.0)
@@ -589,17 +599,6 @@ class RealtimeKlineWatcher:
             close_price=close_price,
             volume=volume,
         )
-
-        if self.local_agg_enabled and window == "1m" and is_closed:
-            self._schedule_closed_1m_aggregation(
-                symbol=symbol,
-                candle_start_ms=candle_start_ms,
-                open_price=open_price,
-                high_price=high_price,
-                low_price=low_price,
-                close_price=close_price,
-                volume=volume,
-            )
 
     def _schedule_realtime_evaluation(
         self,
