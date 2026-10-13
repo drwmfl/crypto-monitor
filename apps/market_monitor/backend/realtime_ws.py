@@ -153,6 +153,7 @@ class RealtimeKlineWatcher:
         self._agg_bootstrap_semaphore = asyncio.Semaphore(self.local_agg_bootstrap_concurrency)
         self._evaluation_semaphore = asyncio.Semaphore(self.processing_concurrency)
         self._evaluation_tasks: Dict[Tuple[str, str], asyncio.Task] = {}
+        self._local_agg_tasks: Set[asyncio.Task] = set()
         self._dropped_evaluations = 0
 
     def is_enabled(self) -> bool:
@@ -545,17 +546,6 @@ class RealtimeKlineWatcher:
                 is_closed=is_closed,
             )
 
-        if self.local_agg_enabled and window == "1m" and is_closed:
-            await self._on_closed_1m_candle(
-                symbol=symbol,
-                candle_start_ms=candle_start_ms,
-                open_price=open_price,
-                high_price=high_price,
-                low_price=low_price,
-                close_price=close_price,
-                volume=volume,
-            )
-
         change_pct = abs((close_price - open_price) / open_price * 100.0)
         prefilter_pct = self.prefilter_pct_by_window.get(window, 0.0)
         if change_pct < prefilter_pct:
@@ -578,6 +568,17 @@ class RealtimeKlineWatcher:
             close_price=close_price,
             volume=volume,
         )
+
+        if self.local_agg_enabled and window == "1m" and is_closed:
+            self._schedule_closed_1m_aggregation(
+                symbol=symbol,
+                candle_start_ms=candle_start_ms,
+                open_price=open_price,
+                high_price=high_price,
+                low_price=low_price,
+                close_price=close_price,
+                volume=volume,
+            )
 
     def _schedule_realtime_evaluation(
         self,
@@ -728,6 +729,27 @@ class RealtimeKlineWatcher:
             if closed_row is None:
                 continue
             await self._evaluate_local_agg_closed(symbol=symbol, window=agg_window, closed_row=closed_row)
+
+    def _schedule_closed_1m_aggregation(self, **kwargs: Any) -> None:
+        task = asyncio.create_task(self._on_closed_1m_candle(**kwargs))
+        tasks = getattr(self, "_local_agg_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._local_agg_tasks = tasks
+        tasks.add(task)
+
+        def _finish(done: asyncio.Task) -> None:
+            tasks.discard(done)
+            if done.cancelled():
+                return
+            error = done.exception()
+            if error is not None:
+                logger.error(
+                    "Local 1m aggregation failed",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(_finish)
 
     def _update_local_agg_bucket(
         self,
@@ -965,7 +987,15 @@ class RealtimeKlineWatcher:
         event["trigger_source"] = trigger_source
         event["scan_source"] = trigger_source
         event["candle_state"] = candle_state
-        event = await self.feed.enrich_event_trend(event=event, snapshot=snapshot)
+        is_extreme_fast = False
+        if self.strategy is not None and getattr(self.strategy, "enabled", False):
+            fast_check = getattr(self.strategy, "_is_extreme_fast_event", None)
+            if callable(fast_check):
+                is_extreme_fast = bool(fast_check(event))
+        if is_extreme_fast:
+            event.update(self.feed.symbol_instrument_metadata.get(str(event["symbol"]).upper(), {}))
+        else:
+            event = await self.feed.enrich_event_trend(event=event, snapshot=snapshot)
         confidence_score = _safe_optional_float(event.get("confidence"), default=None)
         confidence_band = self.config.confidence_band_for(confidence_score)
         event["confidence_band"] = confidence_band.get("label")

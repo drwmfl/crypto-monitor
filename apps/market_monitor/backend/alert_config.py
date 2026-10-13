@@ -235,6 +235,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "factor_prewarm_cooldown_sec": 180.0,
         "factor_prewarm_candidate_age_minutes": 60.0,
         "strong_direct_enabled": True,
+        "extreme_fast_alert_enabled": True,
+        "extreme_fast_change_pct": {"1m": 8.0, "5m": 10.0},
+        "extreme_fast_min_rvol": 4.0,
+        "extreme_fast_recent_alert_suppress_minutes": 45,
         "strong_direct_windows": ["1m"],
         "strong_direct_direct_windows": ["1m"],
         "strong_direct_change_pct": {
@@ -584,7 +588,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "ws_realtime_max_pending_evaluations": 128,
         "ws_realtime_url": FUTURES_MARKET_STREAM_URL,
         "ws_local_agg_enabled": True,
-        "ws_local_agg_windows": ["15m", "30m", "1h"],
+        "ws_local_agg_windows": ["5m", "15m", "30m", "1h"],
         "ws_local_agg_skip_poll_windows": True,
         "ws_local_agg_bootstrap_concurrency": 2,
         "ws_local_agg_history_limit": 200,
@@ -2090,6 +2094,40 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
             strategy_defaults.get("factor_prewarm_candidate_age_minutes", 60.0),
         ),
     )
+    alert_strategy["extreme_fast_alert_enabled"] = _parse_bool(
+        alert_strategy.get("extreme_fast_alert_enabled"),
+        default=bool(strategy_defaults.get("extreme_fast_alert_enabled", True)),
+    )
+    extreme_fast_change = alert_strategy.get("extreme_fast_change_pct", {})
+    if not isinstance(extreme_fast_change, dict):
+        extreme_fast_change = {}
+    default_extreme_fast_change = strategy_defaults.get("extreme_fast_change_pct", {"1m": 8.0, "5m": 10.0})
+    if not isinstance(default_extreme_fast_change, dict):
+        default_extreme_fast_change = {"1m": 8.0, "5m": 10.0}
+    alert_strategy["extreme_fast_change_pct"] = {
+        window: max(
+            0.0,
+            _to_float(
+                extreme_fast_change.get(window),
+                default=_to_float(default_extreme_fast_change.get(window), default=0.0),
+            ),
+        )
+        for window in ("1m", "5m")
+    }
+    alert_strategy["extreme_fast_min_rvol"] = max(
+        0.0,
+        _to_float(
+            alert_strategy.get("extreme_fast_min_rvol"),
+            strategy_defaults.get("extreme_fast_min_rvol", 4.0),
+        ),
+    )
+    alert_strategy["extreme_fast_recent_alert_suppress_minutes"] = max(
+        0.0,
+        _to_float(
+            alert_strategy.get("extreme_fast_recent_alert_suppress_minutes"),
+            strategy_defaults.get("extreme_fast_recent_alert_suppress_minutes", 45),
+        ),
+    )
     alert_strategy["strong_direct_enabled"] = _parse_bool(
         alert_strategy.get("strong_direct_enabled"),
         default=bool(strategy_defaults.get("strong_direct_enabled", True)),
@@ -3140,7 +3178,7 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         if str(w).strip() in {"5m", "15m", "30m", "1h"}
     ]
     if not normalized_local_agg_windows and data_feed["ws_local_agg_enabled"]:
-        default_local_agg_windows = DEFAULT_CONFIG["data_feed"].get("ws_local_agg_windows", ["15m", "30m", "1h"])
+        default_local_agg_windows = DEFAULT_CONFIG["data_feed"].get("ws_local_agg_windows", ["5m", "15m", "30m", "1h"])
         if not isinstance(default_local_agg_windows, list):
             default_local_agg_windows = ["15m", "30m", "1h"]
         normalized_local_agg_windows = [

@@ -208,6 +208,32 @@ class RealtimeWebSocketHealthTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         await asyncio.gather(*list(watcher._evaluation_tasks.values()))
 
+    async def test_local_aggregation_runs_outside_ws_message_handler(self) -> None:
+        watcher = _watcher()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_aggregation(**_kwargs) -> None:
+            started.set()
+            await release.wait()
+
+        watcher._on_closed_1m_candle = slow_aggregation
+        watcher._schedule_closed_1m_aggregation(
+            symbol="BTCUSDT",
+            candle_start_ms=1,
+            open_price=100.0,
+            high_price=101.0,
+            low_price=99.0,
+            close_price=100.5,
+            volume=1.0,
+        )
+
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        self.assertEqual(len(watcher._local_agg_tasks), 1)
+        release.set()
+        await asyncio.gather(*list(watcher._local_agg_tasks))
+        self.assertFalse(watcher._local_agg_tasks)
+
     def test_local_aggregation_keeps_polling_until_each_window_is_ready(self) -> None:
         watcher = _watcher()
         watcher.local_agg_enabled = True

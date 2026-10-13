@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import time
@@ -136,6 +137,13 @@ class AlertStrategyPipeline:
         candidate.risk_breakdown = risk_breakdown
         self.candidate_engine.save()
         self._schedule_hot_pool_prewarm(candidate, base_score=score)
+
+        # The fast path gives the existing strong-direct alert an early send.
+        # It does not fetch factors; a suppressed fast event continues through normal rules.
+        if self._is_extreme_fast_event(payload):
+            fast_result = await self._process_extreme_fast_candidate(candidate, notifier=notifier)
+            if fast_result.alert_sent:
+                return fast_result
 
         if self._is_startup_event(payload):
             if self.factor_enricher.should_enrich(candidate, base_score=score):
@@ -952,6 +960,101 @@ class AlertStrategyPipeline:
         if level and level != "high":
             return False
         return True
+
+    def _is_extreme_fast_event(self, payload: Dict[str, Any]) -> bool:
+        if not _parse_bool(self.settings.get("extreme_fast_alert_enabled"), True):
+            return False
+        if str(payload.get("trigger_source") or payload.get("scan_source") or "").strip().lower() != "ws":
+            return False
+        if str(payload.get("rule_name") or "").strip() != "short_breakout":
+            return False
+
+        window = str(payload.get("window") or "").strip()
+        threshold_map = self.settings.get("extreme_fast_change_pct", {})
+        if not isinstance(threshold_map, dict):
+            return False
+        threshold = _to_float(threshold_map.get(window), 0.0)
+        if threshold <= 0 or abs(_to_float(payload.get("change_pct"), 0.0)) < threshold:
+            return False
+        rvol = _to_float(payload.get("rvol"), 0.0)
+        return rvol >= max(0.0, _to_float(self.settings.get("extreme_fast_min_rvol"), 4.0))
+
+    async def _process_extreme_fast_candidate(self, candidate: Any, *, notifier: Any) -> StrategyProcessResult:
+        alert_type = "strong_direct_alert"
+        suppress_minutes = max(
+            0.0,
+            _to_float(self.settings.get("extreme_fast_recent_alert_suppress_minutes"), 45.0),
+        )
+        recent_alert = None
+        recently_sent_any = getattr(self.policy, "recently_sent_any", None)
+        if suppress_minutes > 0 and callable(recently_sent_any):
+            recent_alert = recently_sent_any(
+                candidate.symbol,
+                ["startup_alert", "strong_direct_alert", "risk_alert", "actionable_alert", "watchlist_alert"],
+                within_minutes=suppress_minutes,
+            )
+
+        alert_sent = False
+        dedupe_decision = None
+        if recent_alert:
+            decision = AlertDecision(False, alert_type=alert_type, reason=f"recent_alert_suppressed:{recent_alert}")
+        else:
+            decision = self.policy.allow_alert_type(
+                candidate.symbol,
+                alert_type,
+                cooldown_minutes=self._strong_direct_cooldown_minutes(),
+            )
+            if decision.should_send:
+                dedupe_decision = self.event_deduper.decide(candidate, alert_type=alert_type)
+                if dedupe_decision.should_send:
+                    send_candidate = copy.copy(candidate)
+                    for field_name in (
+                        "derivatives",
+                        "orderbook",
+                        "liquidation",
+                        "liquidation_v2",
+                        "smart_money",
+                        "position_pressure",
+                        "accumulation",
+                        "confirmation",
+                        "factor_snapshot",
+                    ):
+                        setattr(send_candidate, field_name, {})
+                    alert_sent = await self._send_strong_direct(notifier=notifier, candidate=send_candidate)
+                    if alert_sent:
+                        self.event_deduper.mark_sent(candidate, alert_type=alert_type)
+                        self.policy.mark_sent(candidate.symbol, alert_type)
+
+        logger.info(
+            "Extreme fast alert processed: symbol=%s window=%s change=%.2f rvol=%.2f sent=%s reason=%s dedupe=%s",
+            candidate.symbol,
+            (candidate.latest_features or {}).get("window"),
+            abs(_to_float((candidate.latest_features or {}).get("change_pct"), 0.0)),
+            _to_float((candidate.latest_features or {}).get("rvol"), 0.0),
+            alert_sent,
+            decision.reason,
+            dedupe_decision.reason if dedupe_decision else "not_checked",
+        )
+        self._record_derivatives_shadow(
+            candidate,
+            decision=decision,
+            alert_sent=alert_sent,
+            dedupe_reason=dedupe_decision.reason if dedupe_decision else "not_checked",
+        )
+        self._record_position_pressure_shadow(
+            candidate,
+            decision=decision,
+            alert_sent=alert_sent,
+            dedupe_reason=dedupe_decision.reason if dedupe_decision else "not_checked",
+        )
+        return StrategyProcessResult(
+            candidate_id=candidate.candidate_id,
+            alert_sent=alert_sent,
+            alert_type=alert_type,
+            reason=dedupe_decision.reason if dedupe_decision and not dedupe_decision.should_send else decision.reason,
+            candidate_score=candidate.score,
+            risk_score=candidate.risk_score,
+        )
 
     def _apply_trade_confirmation(self, candidate: Any) -> None:
         confirmation = evaluate_trade_confirmation(candidate, self.settings)

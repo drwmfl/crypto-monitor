@@ -328,6 +328,13 @@
     "factor_prewarm_cooldown_sec": 180.0,
     "factor_prewarm_candidate_age_minutes": 60.0,
     "strong_direct_enabled": true,
+    "extreme_fast_alert_enabled": true,
+    "extreme_fast_change_pct": {
+      "1m": 8.0,
+      "5m": 10.0
+    },
+    "extreme_fast_min_rvol": 4.0,
+    "extreme_fast_recent_alert_suppress_minutes": 45,
     "strong_direct_windows": [
       "1m"
     ],
@@ -704,6 +711,7 @@
     "ws_realtime_url": "wss://fstream.binance.com/market/stream",
     "ws_local_agg_enabled": true,
     "ws_local_agg_windows": [
+      "5m",
       "15m",
       "30m",
       "1h"
