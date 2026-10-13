@@ -996,7 +996,7 @@ class AlertStrategyPipeline:
 
         alert_sent = False
         dedupe_decision = None
-        if recent_alert:
+        if recent_alert and not self._extreme_fast_is_upgrade(candidate):
             decision = AlertDecision(False, alert_type=alert_type, reason=f"recent_alert_suppressed:{recent_alert}")
         else:
             decision = self.policy.allow_alert_type(
@@ -1055,6 +1055,30 @@ class AlertStrategyPipeline:
             candidate_score=candidate.score,
             risk_score=candidate.risk_score,
         )
+
+    def _extreme_fast_is_upgrade(self, candidate: Any) -> bool:
+        recent_events = list(getattr(candidate, "recent_events", []) or [])
+        if len(recent_events) < 2:
+            return False
+        current = recent_events[-1]
+        previous = recent_events[:-1]
+        previous_max = max(
+            abs(_to_float(item.get("change_pct"), 0.0))
+            for item in previous
+            if isinstance(item, dict)
+        ) if previous else 0.0
+        current_change = abs(_to_float(current.get("change_pct"), 0.0))
+        if previous_max <= 0 or current_change <= previous_max:
+            return False
+        min_delta = max(
+            0.0,
+            _to_float(self.settings.get("event_dedupe_min_abs_change_delta_pct"), 3.0),
+        )
+        min_relative = max(
+            0.0,
+            _to_float(self.settings.get("event_dedupe_min_relative_change_delta"), 0.35),
+        )
+        return (current_change - previous_max) >= max(min_delta, previous_max * min_relative)
 
     def _apply_trade_confirmation(self, candidate: Any) -> None:
         confirmation = evaluate_trade_confirmation(candidate, self.settings)
