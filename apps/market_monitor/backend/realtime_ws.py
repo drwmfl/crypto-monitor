@@ -154,6 +154,10 @@ class RealtimeKlineWatcher:
         self._evaluation_semaphore = asyncio.Semaphore(self.processing_concurrency)
         self._evaluation_tasks: Dict[Tuple[str, str], asyncio.Task] = {}
         self._local_agg_tasks: Set[asyncio.Task] = set()
+        self._fast_evaluation_tasks: Dict[Tuple[str, str], asyncio.Task] = {}
+        self._fast_check_state: Dict[str, int] = {}
+        self._realtime_1m_volume_history: Dict[str, List[float]] = {}
+        self._realtime_1m_last_closed_start: Dict[str, int] = {}
         self._dropped_evaluations = 0
 
     def is_enabled(self) -> bool:
@@ -546,6 +550,23 @@ class RealtimeKlineWatcher:
                 is_closed=is_closed,
             )
 
+        if window == "1m":
+            self._schedule_extreme_fast_from_1m(
+                symbol=symbol,
+                candle_start_ms=candle_start_ms,
+                event_time_ms=candle_close_ms or candle_start_ms,
+                open_price=open_price,
+                close_price=close_price,
+                volume=volume,
+                is_closed=is_closed,
+            )
+            self._update_realtime_1m_volume_history(
+                symbol=symbol,
+                candle_start_ms=candle_start_ms,
+                volume=volume,
+                is_closed=is_closed,
+            )
+
         change_pct = abs((close_price - open_price) / open_price * 100.0)
         prefilter_pct = self.prefilter_pct_by_window.get(window, 0.0)
         if change_pct < prefilter_pct:
@@ -635,6 +656,117 @@ class RealtimeKlineWatcher:
     ) -> None:
         if self._evaluation_tasks.get(state_key) is task:
             self._evaluation_tasks.pop(state_key, None)
+
+    def _update_realtime_1m_volume_history(
+        self,
+        *,
+        symbol: str,
+        candle_start_ms: int,
+        volume: float,
+        is_closed: bool,
+    ) -> None:
+        if not is_closed or candle_start_ms <= 0 or volume <= 0:
+            return
+        last_closed = getattr(self, "_realtime_1m_last_closed_start", {})
+        if last_closed.get(symbol, 0) == candle_start_ms:
+            return
+        last_closed[symbol] = candle_start_ms
+        self._realtime_1m_last_closed_start = last_closed
+        volume_history = getattr(self, "_realtime_1m_volume_history", {})
+        history = volume_history.setdefault(symbol, [])
+        self._realtime_1m_volume_history = volume_history
+        history.append(float(volume))
+        limit = max(20, int(getattr(self.feed, "volume_lookback", 20) or 20))
+        if len(history) > limit:
+            del history[:-limit]
+
+    def _realtime_1m_rvol(self, symbol: str, volume: float) -> Optional[float]:
+        history = getattr(self, "_realtime_1m_volume_history", {}).get(symbol) or []
+        if not history or volume <= 0:
+            return None
+        baseline = sum(history) / len(history)
+        if baseline <= 0:
+            return None
+        return float(volume) / baseline
+
+    def _schedule_extreme_fast_from_1m(
+        self,
+        *,
+        symbol: str,
+        candle_start_ms: int,
+        event_time_ms: int,
+        open_price: float,
+        close_price: float,
+        volume: float,
+        is_closed: bool,
+    ) -> None:
+        strategy = getattr(self, "strategy", None)
+        if strategy is None or not getattr(strategy, "enabled", False) or getattr(strategy, "direct_tg_enabled", False):
+            return
+        if candle_start_ms <= 0 or open_price <= 0 or close_price <= 0:
+            return
+        change_pct = (close_price - open_price) / open_price * 100.0
+        rvol = self._realtime_1m_rvol(symbol, volume)
+        payload = {
+            "symbol": symbol,
+            "rule_name": "short_breakout",
+            "direction": "up" if change_pct > 0 else "down",
+            "window": "1m",
+            "change_pct": change_pct,
+            "price": close_price,
+            "rvol": rvol,
+            "level": "high",
+            "trigger_source": "ws",
+            "scan_source": "ws",
+            "candle_state": "closed" if is_closed else "open",
+            "event_time": datetime.fromtimestamp(event_time_ms / 1000.0) if event_time_ms > 0 else datetime.now(),
+            "reasons": [f"1m实时异动 {abs(change_pct):.2f}% + RVOL {rvol:.2f}x"] if rvol is not None else [],
+        }
+        fast_check = getattr(strategy, "_is_extreme_fast_event", None)
+        if not callable(fast_check) or not fast_check(payload):
+            return
+        fast_check_state = getattr(self, "_fast_check_state", {})
+        if fast_check_state.get(symbol) == candle_start_ms:
+            return
+        fast_check_state[symbol] = candle_start_ms
+        self._fast_check_state = fast_check_state
+        self._schedule_extreme_fast_evaluation(payload)
+
+    def _schedule_extreme_fast_evaluation(self, payload: Dict[str, Any]) -> bool:
+        symbol = str(payload.get("symbol") or "").upper().strip()
+        if not symbol or getattr(self, "strategy", None) is None:
+            return False
+        state_key = (symbol, "1m-fast")
+        fast_tasks = getattr(self, "_fast_evaluation_tasks", {})
+        self._fast_evaluation_tasks = fast_tasks
+        current = fast_tasks.get(state_key)
+        if current is not None and not current.done():
+            return False
+        task = asyncio.create_task(
+            self._run_extreme_fast_evaluation(payload),
+            name=f"realtime_fast_eval_{symbol}",
+        )
+        fast_tasks[state_key] = task
+        task.add_done_callback(
+            lambda done, key=state_key: self._finish_extreme_fast_evaluation(key, done)
+        )
+        return True
+
+    def _finish_extreme_fast_evaluation(self, state_key: Tuple[str, str], task: asyncio.Task) -> None:
+        fast_tasks = getattr(self, "_fast_evaluation_tasks", {})
+        if fast_tasks.get(state_key) is task:
+            fast_tasks.pop(state_key, None)
+
+    async def _run_extreme_fast_evaluation(self, payload: Dict[str, Any]) -> None:
+        try:
+            await self.strategy.process_event(payload, source="ws", notifier=self.notifier)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "Realtime extreme fast evaluation failed: symbol=%s",
+                payload.get("symbol"),
+            )
 
     async def _run_realtime_evaluation(self, **kwargs: Any) -> None:
         try:
@@ -788,6 +920,20 @@ class RealtimeKlineWatcher:
             state["close"] = float(one_minute_row[4])
             state["volume"] = float(state.get("volume", 0.0)) + float(one_minute_row[5])
             state["count"] = float(state.get("count", 0.0)) + 1.0
+
+            bucket_minutes = bucket_ms // WINDOW_MS["1m"]
+            is_bucket_end = minute_start_ms + WINDOW_MS["1m"] == bucket_start_ms + bucket_ms
+            if bucket_minutes > 1 and is_bucket_end and int(state["count"]) >= bucket_minutes:
+                closed_row = [
+                    current_bucket_start,
+                    float(state.get("open", one_minute_row[1])),
+                    float(state.get("high", one_minute_row[2])),
+                    float(state.get("low", one_minute_row[3])),
+                    float(state.get("close", one_minute_row[4])),
+                    float(state.get("volume", one_minute_row[5])),
+                ]
+                self._agg_state.pop(key, None)
+                return closed_row
             return None
 
         closed_row = [
@@ -826,6 +972,9 @@ class RealtimeKlineWatcher:
         if snapshot is None:
             return
 
+        if window == "5m":
+            self._schedule_extreme_fast_from_snapshot(snapshot)
+
         events = evaluate_snapshot(snapshot, self.config)
         if not events:
             return
@@ -836,6 +985,30 @@ class RealtimeKlineWatcher:
                 trigger_source="ws",
                 candle_state="closed",
             )
+
+    def _schedule_extreme_fast_from_snapshot(self, snapshot: MarketSnapshot) -> None:
+        strategy = getattr(self, "strategy", None)
+        if strategy is None or not getattr(strategy, "enabled", False) or getattr(strategy, "direct_tg_enabled", False):
+            return
+        rvol = _safe_optional_float(snapshot.indicators.get("rvol"), default=None)
+        payload = {
+            "symbol": snapshot.symbol,
+            "rule_name": "short_breakout",
+            "direction": snapshot.direction,
+            "window": "5m",
+            "change_pct": snapshot.change_pct,
+            "price": snapshot.close_price,
+            "rvol": rvol,
+            "level": "high",
+            "trigger_source": "ws",
+            "scan_source": "ws",
+            "candle_state": "closed",
+            "event_time": snapshot.event_time,
+            "reasons": [f"5m实时异动 {abs(snapshot.change_pct):.2f}% + RVOL {rvol:.2f}x"] if rvol is not None else [],
+        }
+        fast_check = getattr(strategy, "_is_extreme_fast_event", None)
+        if callable(fast_check) and fast_check(payload):
+            self._schedule_extreme_fast_evaluation(payload)
 
     def _append_history_row(self, key: Tuple[str, str], row: List[float]) -> None:
         history = self._agg_history.get(key)

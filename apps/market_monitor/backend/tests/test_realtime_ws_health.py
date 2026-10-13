@@ -234,6 +234,63 @@ class RealtimeWebSocketHealthTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*list(watcher._local_agg_tasks))
         self.assertFalse(watcher._local_agg_tasks)
 
+    async def test_one_minute_extreme_fast_path_uses_ws_without_rest_snapshot(self) -> None:
+        watcher = _watcher()
+        watcher.prefilter_pct_by_window = {"1m": 999.0}
+        watcher._realtime_1m_volume_history = {"BTCUSDT": [10.0] * 20}
+        watcher._realtime_1m_last_closed_start = {}
+        watcher._fast_check_state = {}
+        watcher._fast_evaluation_tasks = {}
+        received = []
+
+        class _Strategy:
+            enabled = True
+            direct_tg_enabled = False
+
+            @staticmethod
+            def _is_extreme_fast_event(payload):
+                return abs(float(payload.get("change_pct", 0.0))) >= 8.0 and float(payload.get("rvol") or 0.0) >= 4.0
+
+            async def process_event(self, payload, *, source, notifier):
+                received.append((payload, source, notifier))
+
+        watcher.strategy = _Strategy()
+        watcher.notifier = object()
+        await watcher._handle_message(json.dumps({
+            "e": "kline",
+            "s": "BTCUSDT",
+            "k": {
+                "i": "1m",
+                "t": 1,
+                "T": 60000,
+                "o": "100",
+                "h": "109",
+                "l": "99",
+                "c": "109",
+                "v": "50",
+                "x": True,
+            },
+        }))
+        await asyncio.gather(*list(watcher._fast_evaluation_tasks.values()))
+
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0][0]["window"], "1m")
+        self.assertEqual(received[0][1], "ws")
+
+    def test_five_minute_local_bucket_closes_on_fifth_one_minute_candle(self) -> None:
+        watcher = _watcher()
+        watcher._agg_state = {}
+        rows = []
+        for minute in range(5):
+            row = [minute * 60000, 100.0, 101.0 + minute, 99.0, 100.0 + minute, 10.0]
+            closed = watcher._update_local_agg_bucket("BTCUSDT", "5m", row)
+            rows.append(closed)
+
+        self.assertEqual(sum(item is not None for item in rows), 1)
+        self.assertEqual(rows[-1][0], 0)
+        self.assertEqual(rows[-1][4], 104.0)
+        self.assertEqual(rows[-1][5], 50.0)
+
     def test_local_aggregation_keeps_polling_until_each_window_is_ready(self) -> None:
         watcher = _watcher()
         watcher.local_agg_enabled = True
