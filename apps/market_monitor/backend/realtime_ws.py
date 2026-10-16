@@ -20,6 +20,7 @@ except Exception:  # pragma: no cover
 
 try:
     from alert_config import AlertConfig
+    from alerts.discovery import DiscoveryShadow
     from binance_ws_routes import FUTURES_MARKET_STREAM_URL, normalize_market_stream_url
     from cooldown import AlertCooldownManager
     from data_feed import BinanceKlineDataFeed
@@ -28,6 +29,7 @@ try:
     from rule_engine import MarketSnapshot, evaluate_snapshot
 except ModuleNotFoundError:
     from apps.market_monitor.backend.alert_config import AlertConfig
+    from apps.market_monitor.backend.alerts.discovery import DiscoveryShadow
     from apps.market_monitor.backend.binance_ws_routes import (
         FUTURES_MARKET_STREAM_URL,
         normalize_market_stream_url,
@@ -47,7 +49,7 @@ WINDOW_MS = {
     "1h": 3_600_000,
 }
 AGGREGATABLE_WINDOWS = {"5m", "15m", "30m", "1h"}
-RUNUP_LOOKBACK_MINUTES = 30
+RUNUP_LOOKBACK_MINUTES = 60
 
 
 class RealtimeDataStalled(RuntimeError):
@@ -159,7 +161,21 @@ class RealtimeKlineWatcher:
         self._fast_check_state: Dict[str, int] = {}
         self._realtime_1m_volume_history: Dict[str, List[float]] = {}
         self._realtime_1m_range_history: Dict[str, List[Tuple[int, float, float]]] = {}
+        self._realtime_1m_range_extremes: Dict[str, Tuple[int, float, float, int]] = {}
         self._realtime_1m_last_closed_start: Dict[str, int] = {}
+        self.discovery = DiscoveryShadow.from_config(config.raw)
+        if self.discovery.enabled:
+            logger.info(
+                "Discovery shadow enabled: t1=%.1f%% rvol>=%.1f t2=%.1f%% thread=%sh upgrade=%.1f%% cap=%s directions=%s file=%s",
+                self.discovery.t1_change_pct,
+                self.discovery.t1_min_rvol,
+                self.discovery.t2_runup_pct,
+                self.discovery.thread_ms / 3600000,
+                self.discovery.upgrade_pct,
+                self.discovery.daily_cap,
+                sorted(self.discovery.directions),
+                self.discovery.shadow_path,
+            )
         self._dropped_evaluations = 0
 
     def is_enabled(self) -> bool:
@@ -564,6 +580,14 @@ class RealtimeKlineWatcher:
                 high_price=high_price,
                 low_price=low_price,
             )
+            self._observe_discovery(
+                symbol=symbol,
+                open_price=open_price,
+                high_price=high_price,
+                low_price=low_price,
+                close_price=close_price,
+                volume=volume,
+            )
             self._update_realtime_1m_volume_history(
                 symbol=symbol,
                 candle_start_ms=candle_start_ms,
@@ -709,6 +733,25 @@ class RealtimeKlineWatcher:
         history.append((int(candle_start_ms), float(high_price), float(low_price)))
         if len(history) > RUNUP_LOOKBACK_MINUTES:
             del history[:-RUNUP_LOOKBACK_MINUTES]
+        # The 1m stream updates every symbol several times a second; cache the closed-candle
+        # extremes so each update only compares against the live candle.
+        extremes = getattr(self, "_realtime_1m_range_extremes", {})
+        self._realtime_1m_range_extremes = extremes
+        extremes[symbol] = (
+            history[-1][0],
+            max(row[1] for row in history),
+            min(row[2] for row in history),
+            len(history),
+        )
+
+    def _closed_range_extremes(self, symbol: str) -> Tuple[Optional[float], Optional[float], int]:
+        history = getattr(self, "_realtime_1m_range_history", {}).get(symbol) or []
+        if not history:
+            return None, None, 0
+        cached = getattr(self, "_realtime_1m_range_extremes", {}).get(symbol)
+        if cached and cached[0] == history[-1][0] and cached[3] == len(history):
+            return cached[1], cached[2], cached[3]
+        return max(row[1] for row in history), min(row[2] for row in history), len(history)
 
     def _realtime_runup(
         self,
@@ -722,10 +765,10 @@ class RealtimeKlineWatcher:
         """Move from the recent extreme to `price`, over closed 1m candles plus the current one."""
         if price <= 0:
             return None, 0
-        history = getattr(self, "_realtime_1m_range_history", {}).get(symbol) or []
-        highs = [row[1] for row in history] + ([current_high] if current_high > 0 else [])
-        lows = [row[2] for row in history] + ([current_low] if current_low > 0 else [])
-        minutes = len(history) + 1
+        closed_high, closed_low, closed_count = self._closed_range_extremes(symbol)
+        highs = [v for v in (closed_high, current_high) if v and v > 0]
+        lows = [v for v in (closed_low, current_low) if v and v > 0]
+        minutes = closed_count + 1
         if direction == "up" and lows:
             base = min(lows)
         elif direction == "down" and highs:
@@ -735,6 +778,39 @@ class RealtimeKlineWatcher:
         if base <= 0:
             return None, 0
         return (price - base) / base * 100.0, minutes
+
+    def _observe_discovery(
+        self,
+        *,
+        symbol: str,
+        open_price: float,
+        high_price: float,
+        low_price: float,
+        close_price: float,
+        volume: float,
+    ) -> None:
+        discovery = getattr(self, "discovery", None)
+        if discovery is None or not discovery.enabled or open_price <= 0:
+            return
+        try:
+            runup_up, minutes = self._realtime_runup(
+                symbol, direction="up", price=close_price, current_high=high_price, current_low=low_price
+            )
+            runup_down, _ = self._realtime_runup(
+                symbol, direction="down", price=close_price, current_high=high_price, current_low=low_price
+            )
+            discovery.observe(
+                symbol=symbol,
+                now_ms=int(time.time() * 1000),
+                price=close_price,
+                change_1m_pct=(close_price - open_price) / open_price * 100.0,
+                rvol=self._realtime_1m_rvol(symbol, volume),
+                runup_up_pct=runup_up,
+                runup_down_pct=runup_down,
+                runup_minutes=minutes,
+            )
+        except Exception:
+            logger.exception("Discovery shadow observe failed: symbol=%s", symbol)
 
     def _realtime_1m_rvol(self, symbol: str, volume: float) -> Optional[float]:
         history = getattr(self, "_realtime_1m_volume_history", {}).get(symbol) or []

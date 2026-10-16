@@ -162,6 +162,22 @@ DEFAULT_CONFIG: Dict[str, Any] = {
             {"label": "C", "min_score": 60.0, "cooldown_adjust_minutes": 2},
         ],
     },
+    # Discovery triggers (T1 fast spike, T2 steady run) with per-symbol move threads.
+    # mode "shadow" records what would be pushed to discovery_shadow.jsonl and sends nothing.
+    "discovery": {
+        "enabled": False,
+        "mode": "shadow",
+        "t1_change_pct": 4.0,
+        "t1_min_rvol": 1.2,
+        "t2_runup_pct": 8.0,
+        "thread_hours": 4.0,
+        "upgrade_pct": 15.0,
+        "daily_cap": 3,
+        "directions": ["up", "down"],
+        "timezone_offset_hours": 8,
+        "shadow_file": "discovery_shadow.jsonl",
+        "state_file": "discovery_state.json",
+    },
     "alert_strategy": {
         "enabled": True,
         "direct_tg_enabled": False,

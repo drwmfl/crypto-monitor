@@ -81,6 +81,14 @@ class ConfigNormalizationTests(unittest.TestCase):
         self.assertEqual(strategy["startup_alert_min_confirmations"], 3)
         self.assertEqual(strategy["actionable_allowed_directions"], ["up"])
 
+    def test_repo_config_runs_discovery_in_shadow_mode(self) -> None:
+        discovery = load_alert_config(config_path=str(CONFIG_PATH)).raw["discovery"]
+
+        self.assertTrue(discovery["enabled"])
+        self.assertEqual(discovery["mode"], "shadow")
+        self.assertEqual((discovery["t1_change_pct"], discovery["t2_runup_pct"]), (4.0, 8.0))
+        self.assertEqual((discovery["thread_hours"], discovery["upgrade_pct"], discovery["daily_cap"]), (4.0, 15.0, 3))
+
     def test_invalid_directions_fall_back_to_both(self) -> None:
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
         raw["alert_strategy"]["actionable_allowed_directions"] = ["sideways"]

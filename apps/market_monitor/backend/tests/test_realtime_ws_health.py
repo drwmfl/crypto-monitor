@@ -310,6 +310,38 @@ class RealtimeWebSocketHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received[0]["runup_minutes"], 3)
         self.assertEqual(watcher._realtime_1m_range_history["BTCUSDT"][-1], (1, 109.0, 99.0))
 
+    async def test_one_minute_message_feeds_discovery_shadow(self) -> None:
+        watcher = _watcher()
+        watcher._realtime_1m_volume_history = {"BTCUSDT": [10.0] * 20}
+        watcher._realtime_1m_range_history = {"BTCUSDT": [(-60000, 101.0, 90.0)]}
+        watcher._realtime_1m_last_closed_start = {}
+        watcher._fast_check_state = {}
+        watcher._fast_evaluation_tasks = {}
+        watcher.strategy = None
+        observed = []
+
+        class _Discovery:
+            enabled = True
+
+            @staticmethod
+            def observe(**kwargs):
+                observed.append(kwargs)
+                return []
+
+        watcher.discovery = _Discovery()
+        await watcher._handle_message(json.dumps({
+            "e": "kline",
+            "s": "BTCUSDT",
+            "k": {"i": "1m", "t": 1, "T": 60000, "o": "100", "h": "104", "l": "99", "c": "103", "v": "30", "x": False},
+        }))
+
+        self.assertEqual(len(observed), 1)
+        self.assertAlmostEqual(observed[0]["change_1m_pct"], 3.0)
+        self.assertAlmostEqual(observed[0]["runup_up_pct"], (103 / 90 - 1) * 100)
+        self.assertAlmostEqual(observed[0]["runup_down_pct"], (103 / 104 - 1) * 100)
+        self.assertAlmostEqual(observed[0]["rvol"], 3.0)
+        self.assertEqual(observed[0]["runup_minutes"], 2)
+
     def test_runup_for_down_move_uses_recent_high(self) -> None:
         watcher = _watcher()
         watcher._realtime_1m_range_history = {"BTCUSDT": [(1, 120.0, 110.0)]}

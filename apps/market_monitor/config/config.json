@@ -727,5 +727,22 @@
     "ws_local_agg_skip_poll_windows": true,
     "ws_local_agg_bootstrap_concurrency": 2,
     "ws_local_agg_history_limit": 200
+  },
+  "discovery": {
+    "enabled": true,
+    "mode": "shadow",
+    "t1_change_pct": 4.0,
+    "t1_min_rvol": 1.2,
+    "t2_runup_pct": 8.0,
+    "thread_hours": 4.0,
+    "upgrade_pct": 15.0,
+    "daily_cap": 3,
+    "directions": [
+      "up",
+      "down"
+    ],
+    "timezone_offset_hours": 8,
+    "shadow_file": "discovery_shadow.jsonl",
+    "state_file": "discovery_state.json"
   }
 }
