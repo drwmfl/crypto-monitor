@@ -45,6 +45,7 @@ DEFAULT_ALERT_POLICY: Dict[str, Any] = {
     "actionable_edge_required_confirmation_keys_any": ["flow", "orderbook"],
     "actionable_policy_version": "edge3-shadow-v1",
     "actionable_shadow_legacy_edge_min_confirmations": 4,
+    "actionable_allowed_directions": ["up", "down"],
     "require_confirmation_for_actionable": True,
     "min_actionable_confirmations": 3,
 }
@@ -83,6 +84,8 @@ class AlertPolicy:
             return AlertDecision(False, reason="below_threshold")
         if alert_type == "watchlist_alert" and not _parse_bool(self.settings.get("watchlist_tg_enabled"), False):
             return AlertDecision(False, alert_type=alert_type, reason="watchlist_tg_disabled")
+        if alert_type == "actionable_alert" and not self._actionable_direction_allowed(candidate):
+            return AlertDecision(False, alert_type=alert_type, reason="actionable_direction_disabled")
         if alert_type == "actionable_alert" and not self._actionable_factor_complete(candidate):
             return AlertDecision(False, alert_type=alert_type, reason="actionable_factor_incomplete")
 
@@ -94,6 +97,18 @@ class AlertPolicy:
             return AlertDecision(False, alert_type=alert_type, reason="symbol_cooldown")
 
         return AlertDecision(True, alert_type=alert_type, reason="accepted")
+
+    def _actionable_direction_allowed(self, candidate: Candidate) -> bool:
+        allowed = self.settings.get("actionable_allowed_directions", ["up", "down"])
+        if isinstance(allowed, str):
+            allowed = [item.strip() for item in allowed.split(",")]
+        if not isinstance(allowed, list):
+            allowed = ["up", "down"]
+        allowed_set = {str(item).strip().lower() for item in allowed if str(item).strip()}
+        direction = str((candidate.latest_features or {}).get("direction") or "").strip().lower()
+        if direction not in {"up", "down"}:
+            return True
+        return direction in allowed_set
 
     def _actionable_factor_complete(self, candidate: Candidate) -> bool:
         if not _parse_bool(self.settings.get("actionable_require_factor_completeness"), True):

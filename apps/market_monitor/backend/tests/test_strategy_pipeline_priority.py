@@ -273,7 +273,15 @@ class StrategyPipelinePriorityTests(unittest.IsolatedAsyncioTestCase):
     async def test_extreme_fast_sends_existing_type_without_enrichment_or_confirmation_gates(self) -> None:
         candidate = self._candidate()
         candidate.latest_features.update(
-            {"event_type": "short_breakout", "rule_name": "short_breakout", "window": "1m", "change_pct": 8.2, "rvol": 4.5}
+            {
+                "event_type": "short_breakout",
+                "rule_name": "short_breakout",
+                "window": "1m",
+                "change_pct": 8.2,
+                "rvol": 4.5,
+                "runup_pct": 21.6,
+                "runup_minutes": 30,
+            }
         )
         candidate.derivatives = {"oi_regime": "new_longs"}
         pipeline = self._pipeline(candidate, AlertDecision(False, alert_type="none", reason="below_threshold"))
@@ -309,7 +317,8 @@ class StrategyPipelinePriorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.alert_type, "strong_direct_alert")
         notifier.notify_text.assert_awaited_once()
         message = notifier.notify_text.await_args.args[0]
-        self.assertIn("**⚡ 急速异动 | MET", message)
+        self.assertIn("**⚡ 急速异动·未确认 | MET", message)
+        self.assertIn("📏 已涨幅：近30分钟 +21.60%", message)
         self.assertNotIn("📊 OI：", message)
         self.assertEqual(pipeline.event_deduper.sent, [("METUSDT", "strong_direct_alert")])
         self.assertEqual(pipeline.policy.sent, [("METUSDT", "strong_direct_alert")])
@@ -349,6 +358,133 @@ class StrategyPipelinePriorityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(result.alert_sent)
         notifier.notify_text.assert_not_awaited()
+
+    async def test_extreme_fast_shadow_only_records_verdict_without_sending(self) -> None:
+        candidate = self._candidate()
+        candidate.latest_features.update(
+            {"event_type": "short_breakout", "rule_name": "short_breakout", "window": "1m", "change_pct": 8.2, "rvol": 4.5}
+        )
+        pipeline = self._pipeline(candidate, AlertDecision(False, alert_type="none", reason="below_threshold"))
+        pipeline.settings.update(
+            {
+                "extreme_fast_alert_enabled": True,
+                "extreme_fast_shadow_only": True,
+                "extreme_fast_change_pct": {"1m": 8.0, "5m": 10.0},
+                "extreme_fast_min_rvol": 4.0,
+                "extreme_fast_recent_alert_suppress_minutes": 45,
+            }
+        )
+        notifier = SimpleNamespace(notify_text=AsyncMock(return_value=True))
+
+        with patch.object(strategy_pipeline_module, "score_candidate", return_value=(40.0, {}, "medium")), patch.object(
+            strategy_pipeline_module,
+            "score_risk",
+            return_value=(80.0, "high", {}),
+        ):
+            result = await pipeline.process_event(
+                {
+                    "symbol": "METUSDT",
+                    "rule_name": "short_breakout",
+                    "direction": "up",
+                    "window": "1m",
+                    "change_pct": 8.2,
+                    "rvol": 4.5,
+                    "trigger_source": "ws",
+                },
+                source="ws",
+                notifier=notifier,
+            )
+
+        self.assertFalse(result.alert_sent)
+        notifier.notify_text.assert_not_awaited()
+        self.assertEqual(pipeline.policy.sent, [])
+        self.assertEqual(pipeline.event_deduper.sent, [])
+        shadow_decisions = [
+            call.kwargs["decision"].reason for call in pipeline._record_derivatives_shadow.call_args_list
+        ]
+        self.assertIn("extreme_fast_shadow:would_send", shadow_decisions)
+
+    async def test_extreme_fast_sends_followup_after_delay(self) -> None:
+        candidate = self._candidate()
+        candidate.latest_features.update(
+            {"event_type": "short_breakout", "rule_name": "short_breakout", "window": "1m", "change_pct": 8.2, "rvol": 4.5, "price": 100.0}
+        )
+        pipeline = self._pipeline(candidate, AlertDecision(False, alert_type="none", reason="below_threshold"))
+        pipeline.settings.update(
+            {
+                "extreme_fast_alert_enabled": True,
+                "extreme_fast_change_pct": {"1m": 8.0, "5m": 10.0},
+                "extreme_fast_min_rvol": 4.0,
+                "extreme_fast_followup_enabled": True,
+                "extreme_fast_followup_minutes": 15,
+            }
+        )
+        pipeline._followup_delay_sec = lambda minutes: 0.0
+        pipeline.followup_client = SimpleNamespace(
+            fetch_1m_bars=AsyncMock(return_value=[[0, 100.0, 107.0, 99.0, 106.0], [60000, 106.0, 107.0, 104.0, 105.0]])
+        )
+        notifier = SimpleNamespace(notify_text=AsyncMock(return_value=True))
+
+        with patch.object(strategy_pipeline_module, "score_candidate", return_value=(40.0, {}, "medium")), patch.object(
+            strategy_pipeline_module,
+            "score_risk",
+            return_value=(80.0, "high", {}),
+        ):
+            result = await pipeline.process_event(
+                {
+                    "symbol": "METUSDT",
+                    "rule_name": "short_breakout",
+                    "direction": "up",
+                    "window": "1m",
+                    "change_pct": 8.2,
+                    "rvol": 4.5,
+                    "trigger_source": "ws",
+                },
+                source="ws",
+                notifier=notifier,
+            )
+            await asyncio.gather(*list(pipeline._followup_tasks))
+
+        self.assertTrue(result.alert_sent)
+        self.assertEqual(notifier.notify_text.await_count, 2)
+        followup = notifier.notify_text.await_args_list[1]
+        self.assertIn("**⏱ 急速异动跟进 | MET（15分钟后）", followup.args[0])
+        self.assertIn("推送价 100 → 现价 105（+5.00%）", followup.args[0])
+        self.assertIn("✅ 状态：上涨延续", followup.args[0])
+        self.assertNotIn("symbol", followup.kwargs)
+        pipeline.followup_client.fetch_1m_bars.assert_awaited_once()
+
+    async def test_startup_requires_min_confirmations(self) -> None:
+        candidate = self._candidate()
+        candidate.confirmation = {"passed_count": 2, "stage": "tracking"}
+        pipeline = self._pipeline(
+            candidate,
+            AlertDecision(False, alert_type="watchlist_alert", reason="watchlist_tg_disabled"),
+        )
+        pipeline.settings["startup_alert_min_confirmations"] = 3
+        notifier = SimpleNamespace(notify_text=AsyncMock(return_value=True))
+        payload = {
+            "symbol": "METUSDT",
+            "rule_name": "early_start",
+            "direction": "up",
+            "window": "15m",
+            "change_pct": 6.68,
+        }
+
+        with patch.object(strategy_pipeline_module, "score_candidate", return_value=(60.0, {}, "medium")), patch.object(
+            strategy_pipeline_module,
+            "score_risk",
+            return_value=(30.0, "low", {}),
+        ):
+            pending = await pipeline.process_event(payload, source="ws", notifier=notifier)
+            candidate.confirmation = {"passed_count": 3, "stage": "confirmed"}
+            accepted = await pipeline.process_event(payload, source="ws", notifier=notifier)
+
+        self.assertFalse(pending.alert_sent)
+        self.assertEqual(pending.reason, "startup_confirmation_pending")
+        self.assertTrue(accepted.alert_sent)
+        self.assertEqual(accepted.alert_type, "startup_alert")
+        notifier.notify_text.assert_awaited_once()
 
 
 if __name__ == "__main__":

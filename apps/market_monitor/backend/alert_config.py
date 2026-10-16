@@ -221,6 +221,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "actionable_policy_shadow_enabled": True,
         "actionable_policy_version": "edge3-shadow-v1",
         "actionable_shadow_legacy_edge_min_confirmations": 4,
+        "actionable_allowed_directions": ["up", "down"],
         "factor_retry_enabled": True,
         "factor_retry_delay_sec": 4.0,
         "factor_retry_min_completeness_pct": 80.0,
@@ -239,6 +240,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "extreme_fast_change_pct": {"1m": 8.0, "5m": 10.0},
         "extreme_fast_min_rvol": 4.0,
         "extreme_fast_recent_alert_suppress_minutes": 45,
+        "extreme_fast_shadow_only": False,
+        "extreme_fast_followup_enabled": False,
+        "extreme_fast_followup_minutes": 15,
+        "extreme_fast_followup_hold_pct": 1.0,
         "strong_direct_windows": ["1m"],
         "strong_direct_direct_windows": ["1m"],
         "strong_direct_change_pct": {
@@ -259,6 +264,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "strong_direct_down_min_confirmations": 3,
         "startup_alert_enabled": True,
         "startup_alert_min_score": 45.0,
+        "startup_alert_min_confirmations": 0,
         "startup_suppress_after_primary_alert_enabled": True,
         "startup_suppress_after_primary_alert_minutes": 15,
         "startup_suppress_after_primary_alert_types": ["actionable_alert", "risk_alert"],
@@ -1989,6 +1995,19 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         for item in edge_reject_regimes
         if str(item).strip()
     ]
+    actionable_directions = alert_strategy.get("actionable_allowed_directions")
+    if isinstance(actionable_directions, str):
+        actionable_directions = _parse_csv_list(actionable_directions)
+    if not isinstance(actionable_directions, list):
+        actionable_directions = []
+    normalized_directions = [
+        str(item).strip().lower()
+        for item in actionable_directions
+        if str(item).strip().lower() in {"up", "down"}
+    ]
+    alert_strategy["actionable_allowed_directions"] = normalized_directions or list(
+        strategy_defaults.get("actionable_allowed_directions", ["up", "down"])
+    )
     edge_required_checks = alert_strategy.get("actionable_edge_required_confirmation_keys_any")
     if isinstance(edge_required_checks, str):
         edge_required_checks = _parse_csv_list(edge_required_checks)
@@ -2128,6 +2147,31 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
             strategy_defaults.get("extreme_fast_recent_alert_suppress_minutes", 45),
         ),
     )
+    alert_strategy["extreme_fast_shadow_only"] = _parse_bool(
+        alert_strategy.get("extreme_fast_shadow_only"),
+        default=bool(strategy_defaults.get("extreme_fast_shadow_only", False)),
+    )
+    alert_strategy["extreme_fast_followup_enabled"] = _parse_bool(
+        alert_strategy.get("extreme_fast_followup_enabled"),
+        default=bool(strategy_defaults.get("extreme_fast_followup_enabled", False)),
+    )
+    alert_strategy["extreme_fast_followup_minutes"] = max(
+        1,
+        min(
+            120,
+            _to_int(
+                alert_strategy.get("extreme_fast_followup_minutes"),
+                strategy_defaults.get("extreme_fast_followup_minutes", 15),
+            ),
+        ),
+    )
+    alert_strategy["extreme_fast_followup_hold_pct"] = max(
+        0.0,
+        _to_float(
+            alert_strategy.get("extreme_fast_followup_hold_pct"),
+            strategy_defaults.get("extreme_fast_followup_hold_pct", 1.0),
+        ),
+    )
     alert_strategy["strong_direct_enabled"] = _parse_bool(
         alert_strategy.get("strong_direct_enabled"),
         default=bool(strategy_defaults.get("strong_direct_enabled", True)),
@@ -2245,6 +2289,13 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
                 alert_strategy.get("startup_alert_min_score"),
                 strategy_defaults.get("startup_alert_min_score", 45.0),
             ),
+        ),
+    )
+    alert_strategy["startup_alert_min_confirmations"] = max(
+        0,
+        _to_int(
+            alert_strategy.get("startup_alert_min_confirmations"),
+            strategy_defaults.get("startup_alert_min_confirmations", 0),
         ),
     )
     alert_strategy["startup_suppress_after_primary_alert_enabled"] = _parse_bool(

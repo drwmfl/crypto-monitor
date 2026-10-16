@@ -79,6 +79,8 @@ class RawEvent:
             "startup_rvol": _safe_float(payload.get("startup_rvol")),
             "startup_breakout_high": _safe_float(payload.get("startup_breakout_high")),
             "startup_breakout_distance_pct": _safe_float(payload.get("startup_breakout_distance_pct")),
+            "runup_pct": _safe_float(payload.get("runup_pct")),
+            "runup_minutes": payload.get("runup_minutes"),
             "reasons": [str(item) for item in (payload.get("reasons") or [])],
         }
 

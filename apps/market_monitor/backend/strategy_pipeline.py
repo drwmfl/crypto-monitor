@@ -14,7 +14,8 @@ try:
     from alerts.position_pressure_shadow_recorder import PositionPressureShadowRecorder
     from alerts.event_deduper import EventDeduper
     from alerts.alert_policy import AlertDecision, AlertPolicy
-    from alerts.tg_formatter import format_strategy_alert
+    from alerts.fast_followup import FastFollowUpClient, format_fast_followup, summarize_followup
+    from alerts.tg_formatter import UNCONFIRMED_FAST_REASON, format_strategy_alert
     from alerts.trade_confirmation import confirmation_count, confirmation_stage, evaluate_trade_confirmation
     from candidates.candidate_engine import CandidateEngine
     from candidates.event_store import RawEventStore
@@ -27,7 +28,12 @@ except ModuleNotFoundError:
     from apps.market_monitor.backend.alerts.position_pressure_shadow_recorder import PositionPressureShadowRecorder
     from apps.market_monitor.backend.alerts.event_deduper import EventDeduper
     from apps.market_monitor.backend.alerts.alert_policy import AlertDecision, AlertPolicy
-    from apps.market_monitor.backend.alerts.tg_formatter import format_strategy_alert
+    from apps.market_monitor.backend.alerts.fast_followup import (
+        FastFollowUpClient,
+        format_fast_followup,
+        summarize_followup,
+    )
+    from apps.market_monitor.backend.alerts.tg_formatter import UNCONFIRMED_FAST_REASON, format_strategy_alert
     from apps.market_monitor.backend.alerts.trade_confirmation import (
         confirmation_count,
         confirmation_stage,
@@ -77,6 +83,11 @@ class AlertStrategyPipeline:
         self.position_pressure_shadow_recorder = PositionPressureShadowRecorder(self.settings)
         self._prewarm_last_ts: Dict[str, float] = {}
         self._prewarm_tasks: set[asyncio.Task] = set()
+        self._followup_tasks: set[asyncio.Task] = set()
+        binance_settings = factor_settings.get("binance") if isinstance(factor_settings.get("binance"), dict) else {}
+        self.followup_client = FastFollowUpClient(
+            base_url=str(binance_settings.get("base_url") or "https://fapi.binance.com"),
+        )
         self._symbol_locks: Dict[str, asyncio.Lock] = {}
 
     @classmethod
@@ -97,8 +108,9 @@ class AlertStrategyPipeline:
         self.factor_enricher.start_background_tasks()
 
     async def close(self) -> None:
-        tasks = list(self._prewarm_tasks)
+        tasks = list(self._prewarm_tasks) + list(getattr(self, "_followup_tasks", set()))
         self._prewarm_tasks.clear()
+        getattr(self, "_followup_tasks", set()).clear()
         for task in tasks:
             if not task.done():
                 task.cancel()
@@ -895,6 +907,9 @@ class AlertStrategyPipeline:
         min_score = _to_float(self.settings.get("startup_alert_min_score"), 45.0)
         if float(candidate.score or 0.0) < min_score:
             return False, "startup_score_below_min"
+        min_confirmations = max(0, _to_int(self.settings.get("startup_alert_min_confirmations"), 0))
+        if min_confirmations > 0 and confirmation_count(candidate) < min_confirmations:
+            return False, "startup_confirmation_pending"
         return True, "accepted"
 
     def _startup_cooldown_minutes(self) -> int:
@@ -996,6 +1011,7 @@ class AlertStrategyPipeline:
 
         alert_sent = False
         dedupe_decision = None
+        shadow_only = _parse_bool(self.settings.get("extreme_fast_shadow_only"), False)
         if recent_alert and not self._extreme_fast_is_upgrade(candidate):
             decision = AlertDecision(False, alert_type=alert_type, reason=f"recent_alert_suppressed:{recent_alert}")
         else:
@@ -1006,7 +1022,11 @@ class AlertStrategyPipeline:
             )
             if decision.should_send:
                 dedupe_decision = self.event_deduper.decide(candidate, alert_type=alert_type)
-                if dedupe_decision.should_send:
+                if dedupe_decision.should_send and shadow_only:
+                    # Shadow mode keeps the would-send verdict for review; the event
+                    # then continues through the factor-confirmed strong-direct path.
+                    decision = AlertDecision(False, alert_type=alert_type, reason="extreme_fast_shadow:would_send")
+                elif dedupe_decision.should_send:
                     send_candidate = copy.copy(candidate)
                     for field_name in (
                         "derivatives",
@@ -1020,17 +1040,23 @@ class AlertStrategyPipeline:
                         "factor_snapshot",
                     ):
                         setattr(send_candidate, field_name, {})
-                    alert_sent = await self._send_strong_direct(notifier=notifier, candidate=send_candidate)
+                    alert_sent = await self._send_strong_direct(
+                        notifier=notifier,
+                        candidate=send_candidate,
+                        fast_path=True,
+                    )
                     if alert_sent:
                         self.event_deduper.mark_sent(candidate, alert_type=alert_type)
                         self.policy.mark_sent(candidate.symbol, alert_type)
+                        self._schedule_fast_followup(candidate, notifier=notifier)
 
         logger.info(
-            "Extreme fast alert processed: symbol=%s window=%s change=%.2f rvol=%.2f sent=%s reason=%s dedupe=%s",
+            "Extreme fast alert processed: symbol=%s window=%s change=%.2f rvol=%.2f shadow_only=%s sent=%s reason=%s dedupe=%s",
             candidate.symbol,
             (candidate.latest_features or {}).get("window"),
             abs(_to_float((candidate.latest_features or {}).get("change_pct"), 0.0)),
             _to_float((candidate.latest_features or {}).get("rvol"), 0.0),
+            shadow_only,
             alert_sent,
             decision.reason,
             dedupe_decision.reason if dedupe_decision else "not_checked",
@@ -1169,9 +1195,10 @@ class AlertStrategyPipeline:
             return _to_int(self.settings.get(directional_key), default)
         return _to_int(self.settings.get(fallback_key), default)
 
-    async def _send_strong_direct(self, *, notifier: Any, candidate: Any) -> bool:
+    async def _send_strong_direct(self, *, notifier: Any, candidate: Any, fast_path: bool = False) -> bool:
         detail_level = str(self.settings.get("telegram_detail_level") or "compact")
-        decision = AlertDecision(True, alert_type="strong_direct_alert", reason="strong_direct")
+        reason = UNCONFIRMED_FAST_REASON if fast_path else "strong_direct"
+        decision = AlertDecision(True, alert_type="strong_direct_alert", reason=reason)
         message = format_strategy_alert(candidate, decision, detail_level=detail_level)
         if hasattr(notifier, "notify_text"):
             sent = await notifier.notify_text(
@@ -1187,13 +1214,91 @@ class AlertStrategyPipeline:
                     "confirmation_stage": confirmation_stage(candidate),
                     "alert_type": "strong_direct_alert",
                     "strong_direct": True,
+                    "fast_path": fast_path,
                 },
             )
             if sent:
-                self._record_factor_quality(candidate, "strong_direct_alert", "strong_direct")
+                self._record_factor_quality(candidate, "strong_direct_alert", reason)
             return sent
         logger.warning("Notifier does not support notify_text; strong direct alert dropped: %s", candidate.symbol)
         return False
+
+    def _schedule_fast_followup(self, candidate: Any, *, notifier: Any) -> None:
+        if not _parse_bool(self.settings.get("extreme_fast_followup_enabled"), False):
+            return
+        latest = candidate.latest_features or {}
+        entry_price = _to_float(latest.get("price"), 0.0)
+        direction = str(latest.get("direction") or "").strip().lower()
+        if entry_price <= 0 or direction not in {"up", "down"}:
+            return
+        task = asyncio.create_task(
+            self._run_fast_followup(
+                symbol=candidate.symbol,
+                token=str(candidate.base_asset or candidate.symbol),
+                direction=direction,
+                entry_price=entry_price,
+                sent_ms=int(time.time() * 1000),
+                notifier=notifier,
+            ),
+            name=f"fast_followup_{candidate.symbol}",
+        )
+        tasks = getattr(self, "_followup_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._followup_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    @staticmethod
+    def _followup_delay_sec(minutes: int) -> float:
+        return float(minutes * 60)
+
+    async def _run_fast_followup(
+        self,
+        *,
+        symbol: str,
+        token: str,
+        direction: str,
+        entry_price: float,
+        sent_ms: int,
+        notifier: Any,
+    ) -> None:
+        minutes = max(1, _to_int(self.settings.get("extreme_fast_followup_minutes"), 15))
+        hold_pct = max(0.0, _to_float(self.settings.get("extreme_fast_followup_hold_pct"), 1.0))
+        try:
+            await asyncio.sleep(self._followup_delay_sec(minutes))
+            start_ms = sent_ms - sent_ms % 60000
+            bars = await self.followup_client.fetch_1m_bars(symbol, start_ms=start_ms, limit=minutes + 1)
+            summary = summarize_followup(bars, entry_price=entry_price, direction=direction, hold_pct=hold_pct)
+            if summary is None:
+                logger.warning("Fast follow-up skipped, no candles: symbol=%s", symbol)
+                return
+            message = format_fast_followup(
+                token=token,
+                symbol=symbol,
+                direction=direction,
+                minutes=minutes,
+                summary=summary,
+            )
+            # No symbol here: a follow-up must not bump the daily push counter in the title.
+            sent = await notifier.notify_text(
+                message,
+                rule_name="strategy_fast_followup",
+                level="medium",
+                metadata={"symbol": symbol, "alert_type": "fast_followup", "status": summary["status"]},
+            )
+            logger.info(
+                "Fast follow-up processed: symbol=%s minutes=%s change=%.2f status=%s sent=%s",
+                symbol,
+                minutes,
+                summary["change_pct"],
+                summary["status"],
+                sent,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Fast follow-up failed: symbol=%s", symbol)
 
 
 def _parse_bool(value: Any, default: bool) -> bool:

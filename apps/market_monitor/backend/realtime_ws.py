@@ -47,6 +47,7 @@ WINDOW_MS = {
     "1h": 3_600_000,
 }
 AGGREGATABLE_WINDOWS = {"5m", "15m", "30m", "1h"}
+RUNUP_LOOKBACK_MINUTES = 30
 
 
 class RealtimeDataStalled(RuntimeError):
@@ -157,6 +158,7 @@ class RealtimeKlineWatcher:
         self._fast_evaluation_tasks: Dict[Tuple[str, str], asyncio.Task] = {}
         self._fast_check_state: Dict[str, int] = {}
         self._realtime_1m_volume_history: Dict[str, List[float]] = {}
+        self._realtime_1m_range_history: Dict[str, List[Tuple[int, float, float]]] = {}
         self._realtime_1m_last_closed_start: Dict[str, int] = {}
         self._dropped_evaluations = 0
 
@@ -559,11 +561,20 @@ class RealtimeKlineWatcher:
                 close_price=close_price,
                 volume=volume,
                 is_closed=is_closed,
+                high_price=high_price,
+                low_price=low_price,
             )
             self._update_realtime_1m_volume_history(
                 symbol=symbol,
                 candle_start_ms=candle_start_ms,
                 volume=volume,
+                is_closed=is_closed,
+            )
+            self._update_realtime_1m_range_history(
+                symbol=symbol,
+                candle_start_ms=candle_start_ms,
+                high_price=high_price,
+                low_price=low_price,
                 is_closed=is_closed,
             )
             if self.local_agg_enabled and is_closed:
@@ -679,6 +690,52 @@ class RealtimeKlineWatcher:
         if len(history) > limit:
             del history[:-limit]
 
+    def _update_realtime_1m_range_history(
+        self,
+        *,
+        symbol: str,
+        candle_start_ms: int,
+        high_price: float,
+        low_price: float,
+        is_closed: bool,
+    ) -> None:
+        if not is_closed or candle_start_ms <= 0 or high_price <= 0 or low_price <= 0:
+            return
+        range_history = getattr(self, "_realtime_1m_range_history", {})
+        self._realtime_1m_range_history = range_history
+        history = range_history.setdefault(symbol, [])
+        if history and history[-1][0] >= candle_start_ms:
+            return
+        history.append((int(candle_start_ms), float(high_price), float(low_price)))
+        if len(history) > RUNUP_LOOKBACK_MINUTES:
+            del history[:-RUNUP_LOOKBACK_MINUTES]
+
+    def _realtime_runup(
+        self,
+        symbol: str,
+        *,
+        direction: str,
+        price: float,
+        current_high: float = 0.0,
+        current_low: float = 0.0,
+    ) -> Tuple[Optional[float], int]:
+        """Move from the recent extreme to `price`, over closed 1m candles plus the current one."""
+        if price <= 0:
+            return None, 0
+        history = getattr(self, "_realtime_1m_range_history", {}).get(symbol) or []
+        highs = [row[1] for row in history] + ([current_high] if current_high > 0 else [])
+        lows = [row[2] for row in history] + ([current_low] if current_low > 0 else [])
+        minutes = len(history) + 1
+        if direction == "up" and lows:
+            base = min(lows)
+        elif direction == "down" and highs:
+            base = max(highs)
+        else:
+            return None, 0
+        if base <= 0:
+            return None, 0
+        return (price - base) / base * 100.0, minutes
+
     def _realtime_1m_rvol(self, symbol: str, volume: float) -> Optional[float]:
         history = getattr(self, "_realtime_1m_volume_history", {}).get(symbol) or []
         if not history or volume <= 0:
@@ -698,6 +755,8 @@ class RealtimeKlineWatcher:
         close_price: float,
         volume: float,
         is_closed: bool,
+        high_price: float = 0.0,
+        low_price: float = 0.0,
     ) -> None:
         strategy = getattr(self, "strategy", None)
         if strategy is None or not getattr(strategy, "enabled", False) or getattr(strategy, "direct_tg_enabled", False):
@@ -706,10 +765,18 @@ class RealtimeKlineWatcher:
             return
         change_pct = (close_price - open_price) / open_price * 100.0
         rvol = self._realtime_1m_rvol(symbol, volume)
+        direction = "up" if change_pct > 0 else "down"
+        runup_pct, runup_minutes = self._realtime_runup(
+            symbol,
+            direction=direction,
+            price=close_price,
+            current_high=high_price or max(open_price, close_price),
+            current_low=low_price or min(open_price, close_price),
+        )
         payload = {
             "symbol": symbol,
             "rule_name": "short_breakout",
-            "direction": "up" if change_pct > 0 else "down",
+            "direction": direction,
             "window": "1m",
             "change_pct": change_pct,
             "price": close_price,
@@ -720,6 +787,8 @@ class RealtimeKlineWatcher:
             "candle_state": "closed" if is_closed else "open",
             "event_time": datetime.fromtimestamp(event_time_ms / 1000.0) if event_time_ms > 0 else datetime.now(),
             "reasons": [f"1m实时异动 {abs(change_pct):.2f}% + RVOL {rvol:.2f}x"] if rvol is not None else [],
+            "runup_pct": runup_pct,
+            "runup_minutes": runup_minutes,
         }
         fast_check = getattr(strategy, "_is_extreme_fast_event", None)
         if not callable(fast_check) or not fast_check(payload):
@@ -990,6 +1059,11 @@ class RealtimeKlineWatcher:
         if strategy is None or not getattr(strategy, "enabled", False) or getattr(strategy, "direct_tg_enabled", False):
             return
         rvol = _safe_optional_float(snapshot.indicators.get("rvol"), default=None)
+        runup_pct, runup_minutes = self._realtime_runup(
+            snapshot.symbol,
+            direction=snapshot.direction,
+            price=snapshot.close_price,
+        )
         payload = {
             "symbol": snapshot.symbol,
             "rule_name": "short_breakout",
@@ -1004,6 +1078,8 @@ class RealtimeKlineWatcher:
             "candle_state": "closed",
             "event_time": snapshot.event_time,
             "reasons": [f"5m实时异动 {abs(snapshot.change_pct):.2f}% + RVOL {rvol:.2f}x"] if rvol is not None else [],
+            "runup_pct": runup_pct,
+            "runup_minutes": runup_minutes,
         }
         fast_check = getattr(strategy, "_is_extreme_fast_event", None)
         if callable(fast_check) and fast_check(payload):

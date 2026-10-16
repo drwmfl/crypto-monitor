@@ -27,6 +27,8 @@ ALERT_TYPE_ICONS = {
     "startup_alert": "🚀",
 }
 
+UNCONFIRMED_FAST_REASON = "extreme_fast_unconfirmed"
+
 DETAIL_LEVELS = {"compact", "full", "verbose"}
 ACCUMULATION_STATUS_LABELS = {
     "ready": "放量",
@@ -52,6 +54,8 @@ def format_strategy_alert(
     change = _fmt_pct(latest.get("change_pct"))
     badge = instrument_badge(latest.get("instrument_type"))
     title_badge = f" | {badge}" if badge else ""
+    if decision.reason == UNCONFIRMED_FAST_REASON:
+        alert_label = f"{alert_label}·未确认"
 
     lines = [
         f"**{alert_icon} {alert_label} | {token_name}（触发{trigger_count}次）{title_badge}**",
@@ -63,6 +67,9 @@ def format_strategy_alert(
             price=price,
         ),
     ]
+    runup_line = _runup_line(latest)
+    if runup_line:
+        lines.append(runup_line)
     oi_line = _oi_summary_line(derivatives)
     if oi_line:
         lines.append(oi_line)
@@ -119,6 +126,15 @@ def _market_line(
 ) -> str:
     icon = {"上涨": "📈", "下跌": "📉"}.get(direction, "📊")
     return f"{icon} 异动：{window}{direction} {change} | RVOL {rvol} | 现价 {price}"
+
+
+def _runup_line(latest: Dict[str, Any]) -> str:
+    runup = _safe_optional_float(latest.get("runup_pct"))
+    if runup is None:
+        return ""
+    minutes = max(1, int(_safe_float(latest.get("runup_minutes"), 1.0)))
+    label = "已涨幅" if runup >= 0 else "已跌幅"
+    return f"📏 {label}：近{minutes}分钟 {runup:+.2f}%"
 
 
 def _oi_summary_line(derivatives: Dict[str, Any]) -> str:

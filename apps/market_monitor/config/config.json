@@ -309,6 +309,9 @@
     "actionable_policy_shadow_enabled": true,
     "actionable_policy_version": "edge3-shadow-v1",
     "actionable_shadow_legacy_edge_min_confirmations": 4,
+    "actionable_allowed_directions": [
+      "up"
+    ],
     "factor_retry_enabled": true,
     "factor_retry_delay_sec": 4.0,
     "factor_retry_min_completeness_pct": 80.0,
@@ -335,6 +338,10 @@
     },
     "extreme_fast_min_rvol": 4.0,
     "extreme_fast_recent_alert_suppress_minutes": 45,
+    "extreme_fast_shadow_only": false,
+    "extreme_fast_followup_enabled": true,
+    "extreme_fast_followup_minutes": 15,
+    "extreme_fast_followup_hold_pct": 1.0,
     "strong_direct_windows": [
       "1m"
     ],
@@ -359,6 +366,7 @@
     "strong_direct_down_min_confirmations": 3,
     "startup_alert_enabled": true,
     "startup_alert_min_score": 45.0,
+    "startup_alert_min_confirmations": 3,
     "startup_suppress_after_primary_alert_enabled": true,
     "startup_suppress_after_primary_alert_minutes": 15,
     "startup_suppress_after_primary_alert_types": [

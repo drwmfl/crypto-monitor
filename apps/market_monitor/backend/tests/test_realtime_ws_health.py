@@ -277,6 +277,48 @@ class RealtimeWebSocketHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(received[0][0]["window"], "1m")
         self.assertEqual(received[0][1], "ws")
 
+    async def test_one_minute_fast_payload_carries_runup_from_recent_low(self) -> None:
+        watcher = _watcher()
+        watcher._realtime_1m_volume_history = {"BTCUSDT": [10.0] * 20}
+        watcher._realtime_1m_range_history = {"BTCUSDT": [(-120000, 95.0, 90.0), (-60000, 101.0, 94.0)]}
+        watcher._realtime_1m_last_closed_start = {}
+        watcher._fast_check_state = {}
+        watcher._fast_evaluation_tasks = {}
+        received = []
+
+        class _Strategy:
+            enabled = True
+            direct_tg_enabled = False
+
+            @staticmethod
+            def _is_extreme_fast_event(payload):
+                return True
+
+            async def process_event(self, payload, *, source, notifier):
+                received.append(payload)
+
+        watcher.strategy = _Strategy()
+        watcher.notifier = object()
+        await watcher._handle_message(json.dumps({
+            "e": "kline",
+            "s": "BTCUSDT",
+            "k": {"i": "1m", "t": 1, "T": 60000, "o": "100", "h": "109", "l": "99", "c": "108", "v": "50", "x": True},
+        }))
+        await asyncio.gather(*list(watcher._fast_evaluation_tasks.values()))
+
+        self.assertAlmostEqual(received[0]["runup_pct"], 20.0)
+        self.assertEqual(received[0]["runup_minutes"], 3)
+        self.assertEqual(watcher._realtime_1m_range_history["BTCUSDT"][-1], (1, 109.0, 99.0))
+
+    def test_runup_for_down_move_uses_recent_high(self) -> None:
+        watcher = _watcher()
+        watcher._realtime_1m_range_history = {"BTCUSDT": [(1, 120.0, 110.0)]}
+
+        runup, minutes = watcher._realtime_runup("BTCUSDT", direction="down", price=90.0, current_high=100.0)
+
+        self.assertAlmostEqual(runup, -25.0)
+        self.assertEqual(minutes, 2)
+
     async def test_closed_one_minute_candle_is_aggregated_before_change_prefilter(self) -> None:
         watcher = _watcher()
         watcher.local_agg_enabled = True
