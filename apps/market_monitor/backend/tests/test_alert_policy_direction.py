@@ -84,10 +84,18 @@ class ConfigNormalizationTests(unittest.TestCase):
     def test_repo_config_runs_discovery_in_shadow_mode(self) -> None:
         discovery = load_alert_config(config_path=str(CONFIG_PATH)).raw["discovery"]
 
+        raw = load_alert_config(config_path=str(CONFIG_PATH)).raw
+
         self.assertTrue(discovery["enabled"])
-        self.assertEqual(discovery["mode"], "shadow")
         self.assertEqual((discovery["t1_change_pct"], discovery["t2_runup_pct"]), (4.0, 8.0))
+        self.assertTrue(discovery["t2_confirm_on_close"])
+        self.assertEqual(discovery["push_directions"], ["up"])
+        self.assertEqual(discovery["directions"], ["up", "down"])
+        self.assertEqual(discovery["instrument_types"], ["crypto"])
         self.assertEqual((discovery["thread_hours"], discovery["upgrade_pct"], discovery["daily_cap"]), (4.0, 15.0, 3))
+        self.assertEqual(raw["data_feed"]["ws_fallback_batch_size"], 60)
+        self.assertEqual(raw["data_feed"]["poll_cycle_budget_sec"], 120)
+        self.assertEqual(raw["data_feed"]["snapshot_timeout_sec"], 20)
 
     def test_invalid_directions_fall_back_to_both(self) -> None:
         raw = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))

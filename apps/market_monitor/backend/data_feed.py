@@ -39,6 +39,7 @@ class BinanceKlineDataFeed:
         self.volume_lookback = int(config.data_feed.get("volume_lookback", 20))
         self.close_candle_only = bool(config.data_feed.get("close_candle_only", True))
         self.max_concurrent_requests = int(config.data_feed.get("max_concurrent_requests", 8))
+        self.snapshot_timeout_sec = max(1.0, float(config.data_feed.get("snapshot_timeout_sec", 20.0)))
         self._semaphore = asyncio.Semaphore(self.max_concurrent_requests)
         self._refresh_lock = asyncio.Lock()
         self.indicators_cfg = dict(config.indicators or {})
@@ -247,12 +248,16 @@ class BinanceKlineDataFeed:
         self.mark_scan_attempt(alert_symbol, window, scan_source)
         async with self._semaphore:
             try:
-                snapshot = await asyncio.to_thread(
-                    self._fetch_snapshot_sync,
-                    alert_symbol,
-                    ccxt_symbol,
-                    window,
-                    use_open_candle,
+                # A stuck request must not hold the poll cycle; the worker thread finishes on ccxt's own timeout.
+                snapshot = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._fetch_snapshot_sync,
+                        alert_symbol,
+                        ccxt_symbol,
+                        window,
+                        use_open_candle,
+                    ),
+                    timeout=self.snapshot_timeout_sec,
                 )
                 self.mark_scan_result(
                     alert_symbol,
@@ -263,7 +268,7 @@ class BinanceKlineDataFeed:
                 )
                 return snapshot
             except Exception as exc:
-                message = str(exc)
+                message = str(exc) or type(exc).__name__
                 self.mark_scan_result(alert_symbol, window, scan_source, success=False, error=message[:200])
                 if "-1003" in message or "I'm a teapot" in message:
                     self._update_ban_until_from_error(message)
@@ -294,13 +299,16 @@ class BinanceKlineDataFeed:
         self.mark_scan_attempt(alert_symbol, window, scan_source)
         async with self._semaphore:
             try:
-                snapshots = await asyncio.to_thread(
-                    self._fetch_recent_closed_snapshots_sync,
-                    alert_symbol,
-                    ccxt_symbol,
-                    window,
-                    max(1, int(backfill_closed_bars or 1)),
-                    previous_event_time_ms,
+                snapshots = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self._fetch_recent_closed_snapshots_sync,
+                        alert_symbol,
+                        ccxt_symbol,
+                        window,
+                        max(1, int(backfill_closed_bars or 1)),
+                        previous_event_time_ms,
+                    ),
+                    timeout=self.snapshot_timeout_sec,
                 )
                 latest_event_time = snapshots[-1].event_time if snapshots else None
                 self.mark_scan_result(
@@ -312,7 +320,7 @@ class BinanceKlineDataFeed:
                 )
                 return snapshots
             except Exception as exc:
-                message = str(exc)
+                message = str(exc) or type(exc).__name__
                 self.mark_scan_result(alert_symbol, window, scan_source, success=False, error=message[:200])
                 if "-1003" in message or "I'm a teapot" in message:
                     self._update_ban_until_from_error(message)

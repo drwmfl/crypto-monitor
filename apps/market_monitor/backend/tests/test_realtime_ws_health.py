@@ -4,6 +4,7 @@ import asyncio
 import json
 import time
 import unittest
+from types import SimpleNamespace
 
 _IMPORT_ERROR = ""
 try:
@@ -320,15 +321,19 @@ class RealtimeWebSocketHealthTests(unittest.IsolatedAsyncioTestCase):
         watcher.strategy = None
         observed = []
 
+        pushed = []
+
         class _Discovery:
             enabled = True
 
             @staticmethod
             def observe(**kwargs):
                 observed.append(kwargs)
-                return []
+                return [{"symbol": "BTCUSDT", "mode": "live"}, {"symbol": "BTCUSDT", "mode": "shadow"}]
 
         watcher.discovery = _Discovery()
+        watcher.discovery_pusher = SimpleNamespace(push=pushed.append)
+        watcher.feed.symbol_instrument_metadata = {"BTCUSDT": {"instrument_type": "crypto"}}
         await watcher._handle_message(json.dumps({
             "e": "kline",
             "s": "BTCUSDT",
@@ -341,6 +346,9 @@ class RealtimeWebSocketHealthTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(observed[0]["runup_down_pct"], (103 / 104 - 1) * 100)
         self.assertAlmostEqual(observed[0]["rvol"], 3.0)
         self.assertEqual(observed[0]["runup_minutes"], 2)
+        self.assertFalse(observed[0]["is_closed"])
+        self.assertEqual(observed[0]["instrument_type"], "crypto")
+        self.assertEqual(pushed, [{"symbol": "BTCUSDT", "mode": "live"}])
 
     def test_runup_for_down_move_uses_recent_high(self) -> None:
         watcher = _watcher()

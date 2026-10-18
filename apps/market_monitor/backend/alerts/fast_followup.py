@@ -89,7 +89,15 @@ def summarize_followup(
     }
 
 
-def format_fast_followup(*, token: str, symbol: str, direction: str, minutes: int, summary: Dict[str, Any]) -> str:
+def format_fast_followup(
+    *,
+    token: str,
+    symbol: str,
+    direction: str,
+    minutes: int,
+    summary: Dict[str, Any],
+    title: str = "急速异动跟进",
+) -> str:
     move = "上涨" if direction == "up" else "下跌" if direction == "down" else "异动"
     status_text = {
         "continued": f"✅ 状态：{move}延续",
@@ -102,7 +110,7 @@ def format_fast_followup(*, token: str, symbol: str, direction: str, minutes: in
     }.get(str(summary.get("status")), "➖ 状态：横盘震荡")
     return "\n".join(
         [
-            f"**⏱ 急速异动跟进 | {token}（{minutes}分钟后）**",
+            f"**⏱ {title} | {token}（{minutes}分钟后）**",
             (
                 f"💵 推送价 {_fmt_price(summary['entry_price'])} → 现价 {_fmt_price(summary['last_price'])}"
                 f"（{summary['change_pct']:+.2f}%）"

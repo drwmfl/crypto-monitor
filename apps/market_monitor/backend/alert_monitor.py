@@ -48,6 +48,9 @@ def _setup_logging(level: str) -> None:
         level=numeric_level,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+    # httpx logs every request URL at INFO, and Telegram URLs carry the bot token.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def _safe_float(value: object, default: Optional[float] = None) -> Optional[float]:
@@ -193,6 +196,28 @@ def _compute_due_windows(
             due.append(w)
             schedule_state[w] = now + float(_window_seconds(w))
     return due
+
+
+def _poll_batch_size(
+    window: str,
+    *,
+    full_scan_windows: set[str],
+    batch_size_by_window: Dict[str, int],
+    default_batch_size: int,
+    fallback_windows: set[str],
+    fallback_batch_size: int,
+) -> int:
+    """Symbols to scan for one window this cycle (0 = all).
+
+    A window that is normally served by the realtime stream only falls back to REST while the stream is
+    unhealthy. Scanning the whole universe then takes far too long on a degraded network, so fallback
+    windows rotate through the universe in fixed batches instead of full scans.
+    """
+    if window in fallback_windows and fallback_batch_size > 0:
+        return fallback_batch_size
+    if window in full_scan_windows:
+        return 0
+    return batch_size_by_window.get(window, default_batch_size)
 
 
 def _pick_symbol_batch(
@@ -357,6 +382,8 @@ async def run_alert_monitor(config_path: Optional[str] = None) -> None:
     else:
         symbol_batch_size_by_window = {}
     window_cursor_state: Dict[str, int] = {}
+    fallback_batch_size = int(config.data_feed.get("ws_fallback_batch_size", 60))
+    cycle_budget_sec = float(config.data_feed.get("poll_cycle_budget_sec", 120.0))
     realtime_watcher = RealtimeKlineWatcher(
         config=config,
         feed=feed,
@@ -424,6 +451,7 @@ async def run_alert_monitor(config_path: Optional[str] = None) -> None:
                 )
                 last_effective_skip_windows = set(effective_skip_windows)
             poll_windows = [w for w in config.windows if w not in effective_skip_windows]
+            fallback_windows = realtime_watcher.poll_windows_to_skip() - set(effective_skip_windows)
             due_windows = _compute_due_windows(
                 windows=poll_windows,
                 schedule_state=schedule_state,
@@ -448,12 +476,22 @@ async def run_alert_monitor(config_path: Optional[str] = None) -> None:
                 cooldown_skipped = 0
                 per_window_batches: Dict[str, int] = {}
                 scanned_by_window: Dict[str, set[str]] = {}
+                deferred_windows: List[str] = []
 
                 for window in due_windows:
-                    if window in full_scan_windows:
-                        window_batch_size = 0
-                    else:
-                        window_batch_size = symbol_batch_size_by_window.get(window, symbol_batch_size)
+                    if time.monotonic() - cycle_start > cycle_budget_sec:
+                        # Out of time: run this window first thing next cycle instead of a full period later.
+                        schedule_state[window] = now
+                        deferred_windows.append(window)
+                        continue
+                    window_batch_size = _poll_batch_size(
+                        window,
+                        full_scan_windows=full_scan_windows,
+                        batch_size_by_window=symbol_batch_size_by_window,
+                        default_batch_size=symbol_batch_size,
+                        fallback_windows=fallback_windows,
+                        fallback_batch_size=fallback_batch_size,
+                    )
                     batch_symbols = _pick_symbol_batch(
                         window=window,
                         symbols=all_symbols,
@@ -480,6 +518,10 @@ async def run_alert_monitor(config_path: Optional[str] = None) -> None:
                 priority_batches: Dict[str, int] = {}
                 priority_symbols = _pick_priority_symbols(config=config, feed=feed) if priority_due_windows else []
                 for window in priority_due_windows:
+                    if time.monotonic() - cycle_start > cycle_budget_sec:
+                        priority_schedule_state[window] = now
+                        deferred_windows.append(f"priority:{window}")
+                        continue
                     normal_symbols = scanned_by_window.get(window, set())
                     batch_symbols = [symbol for symbol in priority_symbols if symbol not in normal_symbols]
                     if not batch_symbols:
@@ -517,6 +559,14 @@ async def run_alert_monitor(config_path: Optional[str] = None) -> None:
                     notifier.stats(),
                     elapsed,
                 )
+                if deferred_windows or elapsed > cycle_budget_sec:
+                    logger.warning(
+                        "Poll cycle over budget: elapsed=%.1fs budget=%.0fs deferred=%s fallback_windows=%s",
+                        elapsed,
+                        cycle_budget_sec,
+                        deferred_windows,
+                        sorted(fallback_windows),
+                    )
             except Exception as exc:
                 elapsed = time.monotonic() - cycle_start
                 logger.error("Cycle failed (elapsed=%.2fs): %s", elapsed, exc)

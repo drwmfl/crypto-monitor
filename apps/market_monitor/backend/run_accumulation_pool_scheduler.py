@@ -94,6 +94,9 @@ async def main_async() -> int:
         level=getattr(logging, str(args.log_level or "INFO").upper(), logging.INFO),
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
+    # httpx logs every request URL at INFO, and Telegram URLs carry the bot token.
+    for noisy in ("httpx", "httpcore"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
     args.max_attempts = max(1, int(args.max_attempts))
     args.retry_delay_sec = max(1.0, float(args.retry_delay_sec))

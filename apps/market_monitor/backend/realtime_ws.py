@@ -20,7 +20,7 @@ except Exception:  # pragma: no cover
 
 try:
     from alert_config import AlertConfig
-    from alerts.discovery import DiscoveryShadow
+    from alerts.discovery import DiscoveryEngine, DiscoveryPusher
     from binance_ws_routes import FUTURES_MARKET_STREAM_URL, normalize_market_stream_url
     from cooldown import AlertCooldownManager
     from data_feed import BinanceKlineDataFeed
@@ -29,7 +29,7 @@ try:
     from rule_engine import MarketSnapshot, evaluate_snapshot
 except ModuleNotFoundError:
     from apps.market_monitor.backend.alert_config import AlertConfig
-    from apps.market_monitor.backend.alerts.discovery import DiscoveryShadow
+    from apps.market_monitor.backend.alerts.discovery import DiscoveryEngine, DiscoveryPusher
     from apps.market_monitor.backend.binance_ws_routes import (
         FUTURES_MARKET_STREAM_URL,
         normalize_market_stream_url,
@@ -163,17 +163,26 @@ class RealtimeKlineWatcher:
         self._realtime_1m_range_history: Dict[str, List[Tuple[int, float, float]]] = {}
         self._realtime_1m_range_extremes: Dict[str, Tuple[int, float, float, int]] = {}
         self._realtime_1m_last_closed_start: Dict[str, int] = {}
-        self.discovery = DiscoveryShadow.from_config(config.raw)
+        self.discovery = DiscoveryEngine.from_config(config.raw)
+        self.discovery_pusher = DiscoveryPusher.from_config(config.raw, notifier)
         if self.discovery.enabled:
             logger.info(
-                "Discovery shadow enabled: t1=%.1f%% rvol>=%.1f t2=%.1f%% thread=%sh upgrade=%.1f%% cap=%s directions=%s file=%s",
+                (
+                    "Discovery enabled: t1=%.1f%% rvol>=%.1f t2=%.1f%% t2_close_confirm=%s thread=%sh upgrade=%.1f%% "
+                    "cap=%s record=%s push=%s instruments=%s followup=%s/%sm file=%s"
+                ),
                 self.discovery.t1_change_pct,
                 self.discovery.t1_min_rvol,
                 self.discovery.t2_runup_pct,
+                self.discovery.t2_confirm_on_close,
                 self.discovery.thread_ms / 3600000,
                 self.discovery.upgrade_pct,
                 self.discovery.daily_cap,
                 sorted(self.discovery.directions),
+                sorted(self.discovery.push_directions),
+                sorted(self.discovery.instrument_types) or "all",
+                self.discovery_pusher.followup_enabled,
+                self.discovery_pusher.followup_minutes,
                 self.discovery.shadow_path,
             )
         self._dropped_evaluations = 0
@@ -587,6 +596,7 @@ class RealtimeKlineWatcher:
                 low_price=low_price,
                 close_price=close_price,
                 volume=volume,
+                is_closed=is_closed,
             )
             self._update_realtime_1m_volume_history(
                 symbol=symbol,
@@ -788,18 +798,21 @@ class RealtimeKlineWatcher:
         low_price: float,
         close_price: float,
         volume: float,
+        is_closed: bool = True,
     ) -> None:
         discovery = getattr(self, "discovery", None)
         if discovery is None or not discovery.enabled or open_price <= 0:
             return
         try:
+            metadata = getattr(getattr(self, "feed", None), "symbol_instrument_metadata", None) or {}
+            instrument_type = (metadata.get(symbol) or {}).get("instrument_type")
             runup_up, minutes = self._realtime_runup(
                 symbol, direction="up", price=close_price, current_high=high_price, current_low=low_price
             )
             runup_down, _ = self._realtime_runup(
                 symbol, direction="down", price=close_price, current_high=high_price, current_low=low_price
             )
-            discovery.observe(
+            rows = discovery.observe(
                 symbol=symbol,
                 now_ms=int(time.time() * 1000),
                 price=close_price,
@@ -808,9 +821,16 @@ class RealtimeKlineWatcher:
                 runup_up_pct=runup_up,
                 runup_down_pct=runup_down,
                 runup_minutes=minutes,
+                is_closed=is_closed,
+                instrument_type=instrument_type,
             )
+            pusher = getattr(self, "discovery_pusher", None)
+            if pusher is not None:
+                for row in rows:
+                    if row.get("mode") == "live":
+                        pusher.push(row)
         except Exception:
-            logger.exception("Discovery shadow observe failed: symbol=%s", symbol)
+            logger.exception("Discovery observe failed: symbol=%s", symbol)
 
     def _realtime_1m_rvol(self, symbol: str, volume: float) -> Optional[float]:
         history = getattr(self, "_realtime_1m_volume_history", {}).get(symbol) or []

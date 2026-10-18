@@ -726,14 +726,17 @@
     ],
     "ws_local_agg_skip_poll_windows": true,
     "ws_local_agg_bootstrap_concurrency": 2,
-    "ws_local_agg_history_limit": 200
+    "ws_local_agg_history_limit": 200,
+    "ws_fallback_batch_size": 60,
+    "poll_cycle_budget_sec": 120,
+    "snapshot_timeout_sec": 20
   },
   "discovery": {
     "enabled": true,
-    "mode": "shadow",
     "t1_change_pct": 4.0,
     "t1_min_rvol": 1.2,
     "t2_runup_pct": 8.0,
+    "t2_confirm_on_close": true,
     "thread_hours": 4.0,
     "upgrade_pct": 15.0,
     "daily_cap": 3,
@@ -741,6 +744,15 @@
       "up",
       "down"
     ],
+    "push_directions": [
+      "up"
+    ],
+    "instrument_types": [
+      "crypto"
+    ],
+    "followup_enabled": true,
+    "followup_minutes": 15,
+    "followup_hold_pct": 1.0,
     "timezone_offset_hours": 8,
     "shadow_file": "discovery_shadow.jsonl",
     "state_file": "discovery_state.json"

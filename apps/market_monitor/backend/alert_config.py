@@ -163,17 +163,22 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         ],
     },
     # Discovery triggers (T1 fast spike, T2 steady run) with per-symbol move threads.
-    # mode "shadow" records what would be pushed to discovery_shadow.jsonl and sends nothing.
+    # Every alert of a recorded direction goes to discovery_shadow.jsonl; only push_directions reach Telegram.
     "discovery": {
         "enabled": False,
-        "mode": "shadow",
         "t1_change_pct": 4.0,
         "t1_min_rvol": 1.2,
         "t2_runup_pct": 8.0,
+        "t2_confirm_on_close": False,
         "thread_hours": 4.0,
         "upgrade_pct": 15.0,
         "daily_cap": 3,
         "directions": ["up", "down"],
+        "push_directions": [],
+        "instrument_types": [],
+        "followup_enabled": True,
+        "followup_minutes": 15,
+        "followup_hold_pct": 1.0,
         "timezone_offset_hours": 8,
         "shadow_file": "discovery_shadow.jsonl",
         "state_file": "discovery_state.json",

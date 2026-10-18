@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -8,35 +9,57 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
+    from alerts.fast_followup import FastFollowUpClient, format_fast_followup, summarize_followup
     from candidates.storage_paths import resolve_runtime_dir
 except ModuleNotFoundError:
+    from apps.market_monitor.backend.alerts.fast_followup import (
+        FastFollowUpClient,
+        format_fast_followup,
+        summarize_followup,
+    )
     from apps.market_monitor.backend.candidates.storage_paths import resolve_runtime_dir
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DISCOVERY: Dict[str, Any] = {
     "enabled": False,
-    "mode": "shadow",
     "t1_change_pct": 4.0,
     "t1_min_rvol": 1.2,
     "t2_runup_pct": 8.0,
+    "t2_confirm_on_close": False,
     "thread_hours": 4.0,
     "upgrade_pct": 15.0,
     "daily_cap": 3,
     "directions": ["up", "down"],
+    "push_directions": [],
+    "instrument_types": [],
+    "followup_enabled": True,
+    "followup_minutes": 15,
+    "followup_hold_pct": 1.0,
     "timezone_offset_hours": 8,
     "shadow_file": "discovery_shadow.jsonl",
     "state_file": "discovery_state.json",
 }
 
+TRIGGER_LABELS = {
+    ("T1", "up"): "1分钟急拉",
+    ("T1", "down"): "1分钟急跌",
+    ("T2", "up"): "持续拉升",
+    ("T2", "down"): "持续下跌",
+}
 
-class DiscoveryShadow:
-    """Two triggers plus a per-symbol move thread, recorded instead of pushed.
+
+class DiscoveryEngine:
+    """Two triggers plus a per-symbol move thread.
 
     T1 fast spike : the current 1m candle has moved >= t1_change_pct with rvol >= t1_min_rvol.
-    T2 steady run : price is >= t2_runup_pct away from the recent 1m extreme (low for up, high for down).
+    T2 steady run : price is >= t2_runup_pct away from the recent 1m extreme (low for up, high for down);
+                    with t2_confirm_on_close only a closed 1m candle counts, which drops intra-minute wicks.
     Thread        : the first trigger opens a thread; inside thread_hours only a further move of
                     upgrade_pct beyond the last alert price records again; daily_cap per symbol and direction.
+
+    Every alert is written to the shadow file. Directions listed in push_directions are marked
+    mode "live" for the caller to push; the rest stay mode "shadow".
     """
 
     def __init__(self, settings: Optional[Dict[str, Any]] = None) -> None:
@@ -47,13 +70,15 @@ class DiscoveryShadow:
         self.t1_change_pct = max(0.0, _to_float(self.settings.get("t1_change_pct"), 4.0))
         self.t1_min_rvol = max(0.0, _to_float(self.settings.get("t1_min_rvol"), 1.2))
         self.t2_runup_pct = max(0.0, _to_float(self.settings.get("t2_runup_pct"), 8.0))
+        self.t2_confirm_on_close = _parse_bool(self.settings.get("t2_confirm_on_close"), False)
         self.thread_ms = int(max(0.0, _to_float(self.settings.get("thread_hours"), 4.0)) * 3600 * 1000)
         self.upgrade_pct = max(0.0, _to_float(self.settings.get("upgrade_pct"), 15.0))
         self.daily_cap = max(1, int(_to_float(self.settings.get("daily_cap"), 3)))
-        directions = self.settings.get("directions") or ["up", "down"]
-        if isinstance(directions, str):
-            directions = [item.strip() for item in directions.split(",")]
-        self.directions = {str(item).strip().lower() for item in directions if str(item).strip().lower() in {"up", "down"}}
+        self.directions = _direction_set(self.settings.get("directions"), default={"up", "down"})
+        self.push_directions = _direction_set(self.settings.get("push_directions"), default=set()) & self.directions
+        self.instrument_types = {
+            str(item).strip().lower() for item in _as_list(self.settings.get("instrument_types")) if str(item).strip()
+        }
         self.tz = timezone(timedelta(hours=_to_float(self.settings.get("timezone_offset_hours"), 8.0)))
         self.runtime_dir: Optional[Path] = None
         self.shadow_path: Optional[Path] = None
@@ -65,11 +90,9 @@ class DiscoveryShadow:
         self._threads: Dict[str, Dict[str, float]] = {}
         self._day_counts: Dict[str, int] = {}
         self._load_state()
-        if self.enabled and str(self.settings.get("mode") or "shadow").strip().lower() != "shadow":
-            logger.warning("Discovery mode %r is not implemented yet; recording in shadow mode only.", self.settings.get("mode"))
 
     @classmethod
-    def from_config(cls, config: Dict[str, Any]) -> "DiscoveryShadow":
+    def from_config(cls, config: Dict[str, Any]) -> "DiscoveryEngine":
         raw = config.get("discovery", {}) if isinstance(config, dict) else {}
         return cls(raw if isinstance(raw, dict) else {})
 
@@ -84,8 +107,12 @@ class DiscoveryShadow:
         runup_up_pct: Optional[float],
         runup_down_pct: Optional[float],
         runup_minutes: int,
+        is_closed: bool = True,
+        instrument_type: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         if not self.enabled or price <= 0:
+            return []
+        if self.instrument_types and str(instrument_type or "crypto").strip().lower() not in self.instrument_types:
             return []
         recorded: List[Dict[str, Any]] = []
         for direction in ("up", "down"):
@@ -96,12 +123,14 @@ class DiscoveryShadow:
                 change_1m_pct=change_1m_pct,
                 rvol=rvol,
                 runup_pct=runup_up_pct if direction == "up" else runup_down_pct,
+                is_closed=is_closed,
             )
             if not triggers:
                 continue
-            kind = self._thread_decision(symbol, direction, now_ms, price)
-            if kind is None:
+            decision = self._thread_decision(symbol, direction, now_ms, price)
+            if decision is None:
                 continue
+            kind, prev_price = decision
             row = {
                 "created_at": datetime.fromtimestamp(now_ms / 1000, timezone.utc).isoformat(),
                 "symbol": symbol,
@@ -109,16 +138,18 @@ class DiscoveryShadow:
                 "triggers": triggers,
                 "kind": kind,
                 "price": price,
+                "prev_price": prev_price,
                 "change_1m_pct": _round(change_1m_pct),
                 "rvol": _round(rvol),
                 "runup_pct": _round(runup_up_pct if direction == "up" else runup_down_pct),
                 "runup_minutes": runup_minutes,
                 "day_count": self._day_counts.get(self._day_key(symbol, direction, now_ms), 0),
-                "mode": "shadow",
+                "mode": "live" if direction in self.push_directions else "shadow",
             }
             recorded.append(row)
             logger.info(
-                "Discovery shadow alert: symbol=%s dir=%s triggers=%s kind=%s price=%s change_1m=%s runup=%s/%sm",
+                "Discovery alert: mode=%s symbol=%s dir=%s triggers=%s kind=%s price=%s change_1m=%s runup=%s/%sm",
+                row["mode"],
                 symbol,
                 direction,
                 "+".join(triggers),
@@ -140,6 +171,7 @@ class DiscoveryShadow:
         change_1m_pct: Optional[float],
         rvol: Optional[float],
         runup_pct: Optional[float],
+        is_closed: bool,
     ) -> List[str]:
         sign = 1.0 if direction == "up" else -1.0
         triggers: List[str] = []
@@ -149,16 +181,21 @@ class DiscoveryShadow:
             and (self.t1_min_rvol <= 0 or (rvol is not None and rvol >= self.t1_min_rvol))
         ):
             triggers.append("T1")
-        if runup_pct is not None and sign * runup_pct >= self.t2_runup_pct:
+        if (
+            runup_pct is not None
+            and sign * runup_pct >= self.t2_runup_pct
+            and (is_closed or not self.t2_confirm_on_close)
+        ):
             triggers.append("T2")
         return triggers
 
-    def _thread_decision(self, symbol: str, direction: str, now_ms: int, price: float) -> Optional[str]:
+    def _thread_decision(self, symbol: str, direction: str, now_ms: int, price: float) -> Optional[tuple]:
         day_key = self._day_key(symbol, direction, now_ms)
         if self._day_counts.get(day_key, 0) >= self.daily_cap:
             return None
         thread_key = f"{symbol}:{direction}"
         thread = self._threads.get(thread_key)
+        prev_price = None
         if thread and now_ms - thread["ts"] < self.thread_ms:
             last = thread["price"]
             threshold = last * (1 + self.upgrade_pct / 100) if direction == "up" else last * (1 - self.upgrade_pct / 100)
@@ -166,11 +203,12 @@ class DiscoveryShadow:
             if not extended:
                 return None
             kind = "upgrade"
+            prev_price = last
         else:
             kind = "new"
         self._threads[thread_key] = {"ts": now_ms, "price": price}
         self._day_counts[day_key] = self._day_counts.get(day_key, 0) + 1
-        return kind
+        return kind, prev_price
 
     def _day_key(self, symbol: str, direction: str, now_ms: int) -> str:
         day = datetime.fromtimestamp(now_ms / 1000, self.tz).date().isoformat()
@@ -220,6 +258,170 @@ class DiscoveryShadow:
             tmp.replace(self.state_path)
         except Exception as exc:
             logger.warning("Discovery state save failed: %s", exc)
+
+
+# Earlier name, kept so existing imports keep working.
+DiscoveryShadow = DiscoveryEngine
+
+
+def format_discovery_alert(row: Dict[str, Any], *, followup_minutes: Optional[int] = None) -> str:
+    symbol = str(row.get("symbol") or "")
+    token = _token_name(symbol)
+    direction = str(row.get("direction") or "up")
+    up = direction == "up"
+    runup = _to_float(row.get("runup_pct"), 0.0)
+    minutes = int(_to_float(row.get("runup_minutes"), 60.0))
+    move_icon = "📈" if up else "📉"
+    lines: List[str] = []
+    if row.get("kind") == "upgrade":
+        prev = _to_float(row.get("prev_price"), 0.0)
+        price = _to_float(row.get("price"), 0.0)
+        extra = (price / prev - 1) * 100 if prev > 0 else 0.0
+        lines.append(f"**🔥 异动加速 | {token}（触发1次）**")
+        lines.append(
+            f"{move_icon} 较上次提醒 {_fmt_price(prev)} → {_fmt_price(price)}（{extra:+.2f}%）"
+            f" | 近{minutes}分钟 {runup:+.2f}%"
+        )
+        lines.append("⚠️ 加速阶段，注意过热回落" if up else "⚠️ 加速下跌，注意急跌后的反弹")
+    else:
+        lines.append(f"**🔎 异动发现 | {token}（触发1次）**")
+        parts = [f"近{minutes}分钟 {runup:+.2f}%"]
+        change_1m = row.get("change_1m_pct")
+        if change_1m is not None:
+            parts.append(f"1分钟 {_to_float(change_1m, 0.0):+.2f}%")
+        rvol = row.get("rvol")
+        if rvol is not None:
+            parts.append(f"RVOL {_to_float(rvol, 0.0):.2f}x")
+        lines.append(f"{move_icon} " + " | ".join(parts))
+    triggers = [TRIGGER_LABELS.get((str(t), direction), str(t)) for t in row.get("triggers") or []]
+    if triggers:
+        lines.append("🧭 触发：" + " + ".join(triggers))
+    lines.append(f"💵 现价 {_fmt_price(row.get('price'))}")
+    if followup_minutes:
+        lines.append(f"⏱ {followup_minutes}分钟后跟进")
+    lines.append(f"🔗 https://www.binance.com/futures/{symbol}")
+    return "\n".join(lines)
+
+
+class DiscoveryPusher:
+    """Sends live discovery alerts through the notifier and follows each one up after a delay."""
+
+    def __init__(self, settings: Optional[Dict[str, Any]], notifier: Any, *, client: Any = None) -> None:
+        merged = dict(DEFAULT_DISCOVERY)
+        merged.update(settings or {})
+        self.notifier = notifier
+        self.followup_enabled = _parse_bool(merged.get("followup_enabled"), True)
+        self.followup_minutes = max(1, int(_to_float(merged.get("followup_minutes"), 15)))
+        self.followup_hold_pct = max(0.0, _to_float(merged.get("followup_hold_pct"), 1.0))
+        self.client = client or FastFollowUpClient()
+        self._tasks: set = set()
+
+    @classmethod
+    def from_config(cls, config: Dict[str, Any], notifier: Any) -> "DiscoveryPusher":
+        raw = config.get("discovery", {}) if isinstance(config, dict) else {}
+        return cls(raw if isinstance(raw, dict) else {}, notifier)
+
+    def push(self, row: Dict[str, Any]) -> Optional[asyncio.Task]:
+        if self.notifier is None or not hasattr(self.notifier, "notify_text"):
+            return None
+        task = asyncio.create_task(self._send(row), name=f"discovery_push_{row.get('symbol')}")
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    async def close(self) -> None:
+        tasks = list(self._tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _followup_delay_sec(self) -> float:
+        return float(self.followup_minutes * 60)
+
+    async def _send(self, row: Dict[str, Any]) -> None:
+        symbol = str(row.get("symbol") or "")
+        try:
+            message = format_discovery_alert(row, followup_minutes=self.followup_minutes if self.followup_enabled else None)
+            sent = await self.notifier.notify_text(
+                message,
+                symbol=symbol,
+                rule_name="discovery_upgrade" if row.get("kind") == "upgrade" else "discovery_alert",
+                level="high",
+                metadata={
+                    "alert_type": "discovery_alert",
+                    "kind": row.get("kind"),
+                    "direction": row.get("direction"),
+                    "triggers": row.get("triggers"),
+                    "runup_pct": row.get("runup_pct"),
+                },
+            )
+            logger.info("Discovery push: symbol=%s kind=%s sent=%s", symbol, row.get("kind"), sent)
+            if not sent or not self.followup_enabled:
+                return
+            sent_ms = int(time.time() * 1000)
+            await asyncio.sleep(self._followup_delay_sec())
+            bars = await self.client.fetch_1m_bars(symbol, start_ms=sent_ms - sent_ms % 60000, limit=self.followup_minutes + 1)
+            summary = summarize_followup(
+                bars,
+                entry_price=_to_float(row.get("price"), 0.0),
+                direction=str(row.get("direction") or "up"),
+                hold_pct=self.followup_hold_pct,
+            )
+            if summary is None:
+                logger.warning("Discovery follow-up skipped, no candles: symbol=%s", symbol)
+                return
+            followup = format_fast_followup(
+                token=_token_name(symbol),
+                symbol=symbol,
+                direction=str(row.get("direction") or "up"),
+                minutes=self.followup_minutes,
+                summary=summary,
+                title="异动跟进",
+            )
+            # No symbol here: a follow-up must not bump the daily push counter in the title.
+            await self.notifier.notify_text(
+                followup,
+                rule_name="discovery_followup",
+                level="medium",
+                metadata={"symbol": symbol, "alert_type": "discovery_followup", "status": summary["status"]},
+            )
+            logger.info("Discovery follow-up: symbol=%s status=%s change=%.2f", symbol, summary["status"], summary["change_pct"])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Discovery push failed: symbol=%s", symbol)
+
+
+def _token_name(symbol: str) -> str:
+    text = str(symbol or "").strip().upper()
+    for suffix in ("USDT", "USDC", "FDUSD", "BUSD", "USD"):
+        if text.endswith(suffix) and len(text) > len(suffix):
+            return text[: -len(suffix)]
+    return text or "UNKNOWN"
+
+
+def _fmt_price(value: Any) -> str:
+    number = _to_float(value, 0.0)
+    if number <= 0:
+        return "N/A"
+    return f"{number:.8f}".rstrip("0").rstrip(".")
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return []
+
+
+def _direction_set(value: Any, *, default: set) -> set:
+    if value is None:
+        return set(default)
+    return {str(item).strip().lower() for item in _as_list(value) if str(item).strip().lower() in {"up", "down"}}
 
 
 def _round(value: Optional[float]) -> Optional[float]:
