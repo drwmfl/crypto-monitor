@@ -173,12 +173,15 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "thread_hours": 4.0,
         "upgrade_pct": 15.0,
         "daily_cap": 3,
+        "cap_exempt_runup_pct": 0.0,
+        "cap_exempt_max": 2,
         "directions": ["up", "down"],
         "push_directions": [],
         "instrument_types": [],
         "followup_enabled": True,
         "followup_minutes": 15,
         "followup_hold_pct": 1.0,
+        "followup_skip_statuses": [],
         "timezone_offset_hours": 8,
         "shadow_file": "discovery_shadow.jsonl",
         "state_file": "discovery_state.json",
@@ -243,6 +246,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "actionable_policy_version": "edge3-shadow-v1",
         "actionable_shadow_legacy_edge_min_confirmations": 4,
         "actionable_allowed_directions": ["up", "down"],
+        "legacy_push_directions": ["up", "down"],
         "factor_retry_enabled": True,
         "factor_retry_delay_sec": 4.0,
         "factor_retry_min_completeness_pct": 80.0,
@@ -265,6 +269,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "extreme_fast_followup_enabled": False,
         "extreme_fast_followup_minutes": 15,
         "extreme_fast_followup_hold_pct": 1.0,
+        "extreme_fast_followup_skip_statuses": [],
         "strong_direct_windows": ["1m"],
         "strong_direct_direct_windows": ["1m"],
         "strong_direct_change_pct": {
@@ -2029,6 +2034,15 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
     alert_strategy["actionable_allowed_directions"] = normalized_directions or list(
         strategy_defaults.get("actionable_allowed_directions", ["up", "down"])
     )
+    legacy_directions = alert_strategy.get("legacy_push_directions")
+    if isinstance(legacy_directions, str):
+        legacy_directions = _parse_csv_list(legacy_directions)
+    if not isinstance(legacy_directions, list):
+        legacy_directions = list(strategy_defaults.get("legacy_push_directions", ["up", "down"]))
+    # An empty list is allowed on purpose: it retires every legacy push.
+    alert_strategy["legacy_push_directions"] = [
+        str(item).strip().lower() for item in legacy_directions if str(item).strip().lower() in {"up", "down"}
+    ]
     edge_required_checks = alert_strategy.get("actionable_edge_required_confirmation_keys_any")
     if isinstance(edge_required_checks, str):
         edge_required_checks = _parse_csv_list(edge_required_checks)

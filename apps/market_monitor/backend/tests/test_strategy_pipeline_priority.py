@@ -454,6 +454,84 @@ class StrategyPipelinePriorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("symbol", followup.kwargs)
         pipeline.followup_client.fetch_1m_bars.assert_awaited_once()
 
+    async def test_retired_direction_mutes_legacy_push(self) -> None:
+        candidate = self._candidate()
+        pipeline = self._pipeline(candidate, AlertDecision(True, alert_type="actionable_alert", reason="accepted"))
+        pipeline.settings["legacy_push_directions"] = ["down"]
+        notifier = SimpleNamespace(notify_text=AsyncMock(return_value=True))
+
+        with patch.object(strategy_pipeline_module, "score_candidate", return_value=(100.0, {}, "high")), patch.object(
+            strategy_pipeline_module,
+            "score_risk",
+            return_value=(27.0, "low", {}),
+        ), self.assertLogs("strategy_pipeline", level="INFO") as logs:
+            result = await pipeline.process_event(
+                {"symbol": "METUSDT", "rule_name": "early_start", "direction": "up", "window": "15m", "change_pct": 6.68},
+                source="ws",
+                notifier=notifier,
+            )
+
+        self.assertFalse(result.alert_sent)
+        notifier.notify_text.assert_not_awaited()
+        self.assertEqual(pipeline.policy.sent, [])
+        self.assertEqual(sum("Legacy push muted" in line for line in logs.output), 1)
+
+    async def test_extreme_fast_up_is_muted_without_followup(self) -> None:
+        candidate = self._candidate()
+        candidate.latest_features.update(
+            {"event_type": "short_breakout", "rule_name": "short_breakout", "window": "1m", "change_pct": 8.2, "rvol": 4.5}
+        )
+        pipeline = self._pipeline(candidate, AlertDecision(False, alert_type="none", reason="below_threshold"))
+        pipeline.settings.update(
+            {
+                "extreme_fast_alert_enabled": True,
+                "extreme_fast_change_pct": {"1m": 8.0, "5m": 10.0},
+                "extreme_fast_min_rvol": 4.0,
+                "extreme_fast_followup_enabled": True,
+                "legacy_push_directions": ["down"],
+            }
+        )
+        pipeline._schedule_fast_followup = Mock()
+        notifier = SimpleNamespace(notify_text=AsyncMock(return_value=True))
+
+        with patch.object(strategy_pipeline_module, "score_candidate", return_value=(40.0, {}, "medium")), patch.object(
+            strategy_pipeline_module,
+            "score_risk",
+            return_value=(80.0, "high", {}),
+        ):
+            result = await pipeline.process_event(
+                {"symbol": "METUSDT", "rule_name": "short_breakout", "direction": "up", "window": "1m",
+                 "change_pct": 8.2, "rvol": 4.5, "trigger_source": "ws"},
+                source="ws",
+                notifier=notifier,
+            )
+
+        self.assertFalse(result.alert_sent)
+        notifier.notify_text.assert_not_awaited()
+        pipeline._schedule_fast_followup.assert_not_called()
+
+    def test_kept_direction_is_not_muted(self) -> None:
+        candidate = self._candidate()
+        candidate.latest_features["direction"] = "down"
+        pipeline = self._pipeline(candidate, AlertDecision(False, alert_type="none", reason="below_threshold"))
+        pipeline.settings["legacy_push_directions"] = ["down"]
+
+        self.assertFalse(pipeline._legacy_push_muted(candidate, "strong_direct_alert"))
+
+    async def test_flat_fast_followup_is_not_sent(self) -> None:
+        candidate = self._candidate()
+        pipeline = self._pipeline(candidate, AlertDecision(False, alert_type="none", reason="below_threshold"))
+        pipeline.settings["extreme_fast_followup_skip_statuses"] = ["flat"]
+        pipeline._followup_delay_sec = lambda minutes: 0.0
+        pipeline.followup_client = SimpleNamespace(fetch_1m_bars=AsyncMock(return_value=[[0, 100.0, 100.6, 99.7, 100.2]]))
+        notifier = SimpleNamespace(notify_text=AsyncMock(return_value=True))
+
+        await pipeline._run_fast_followup(
+            symbol="METUSDT", token="MET", direction="up", entry_price=100.0, sent_ms=0, notifier=notifier
+        )
+
+        notifier.notify_text.assert_not_awaited()
+
     async def test_startup_requires_min_confirmations(self) -> None:
         candidate = self._candidate()
         candidate.confirmation = {"passed_count": 2, "stage": "tracking"}

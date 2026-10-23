@@ -381,7 +381,53 @@ class AlertStrategyPipeline:
             risk_score=candidate.risk_score,
         )
 
+    def _legacy_push_muted(self, candidate: Any, alert_type: str) -> bool:
+        """True when this direction's legacy pushes were retired (discovery alerts cover it).
+
+        A muted push counts as not sent, so no cooldown or follow-up is recorded; what would have been
+        sent goes to legacy_muted_pushes.jsonl, at most once per coin and type every 30 minutes.
+        """
+        allowed = self.settings.get("legacy_push_directions", ["up", "down"])
+        if isinstance(allowed, str):
+            allowed = [item.strip() for item in allowed.split(",")]
+        if not isinstance(allowed, list):
+            allowed = ["up", "down"]
+        direction = str((candidate.latest_features or {}).get("direction") or "").strip().lower()
+        if direction not in {"up", "down"} or direction in {str(item).strip().lower() for item in allowed}:
+            return False
+        muted_last = getattr(self, "_legacy_muted_last", None)
+        if muted_last is None:
+            muted_last = {}
+            self._legacy_muted_last = muted_last
+        key = (candidate.symbol, alert_type, direction)
+        now_ts = time.time()
+        if now_ts - muted_last.get(key, 0.0) >= 1800:
+            muted_last[key] = now_ts
+            logger.info("Legacy push muted: symbol=%s type=%s dir=%s", candidate.symbol, alert_type, direction)
+            runtime_dir = getattr(getattr(self, "event_store", None), "runtime_dir", None)
+            if runtime_dir is not None:
+                latest = candidate.latest_features or {}
+                row = {
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "symbol": candidate.symbol,
+                    "alert_type": alert_type,
+                    "direction": direction,
+                    "score": candidate.score,
+                    "risk_score": candidate.risk_score,
+                    "event_type": latest.get("event_type"),
+                    "window": latest.get("window"),
+                    "change_pct": latest.get("change_pct"),
+                }
+                try:
+                    with (runtime_dir / "legacy_muted_pushes.jsonl").open("a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+                except Exception as exc:
+                    logger.debug("Legacy muted record write failed: %s", exc)
+        return True
+
     async def _send_decision(self, *, notifier: Any, candidate: Any, decision: AlertDecision) -> bool:
+        if self._legacy_push_muted(candidate, decision.alert_type):
+            return False
         detail_level = str(self.settings.get("telegram_detail_level") or "compact")
         message = format_strategy_alert(candidate, decision, detail_level=detail_level)
         level = "high" if decision.alert_type in {"actionable_alert", "risk_alert"} else "medium"
@@ -1196,6 +1242,8 @@ class AlertStrategyPipeline:
         return _to_int(self.settings.get(fallback_key), default)
 
     async def _send_strong_direct(self, *, notifier: Any, candidate: Any, fast_path: bool = False) -> bool:
+        if self._legacy_push_muted(candidate, "strong_direct_alert"):
+            return False
         detail_level = str(self.settings.get("telegram_detail_level") or "compact")
         reason = UNCONFIRMED_FAST_REASON if fast_path else "strong_direct"
         decision = AlertDecision(True, alert_type="strong_direct_alert", reason=reason)
@@ -1272,6 +1320,12 @@ class AlertStrategyPipeline:
             summary = summarize_followup(bars, entry_price=entry_price, direction=direction, hold_pct=hold_pct)
             if summary is None:
                 logger.warning("Fast follow-up skipped, no candles: symbol=%s", symbol)
+                return
+            skip = self.settings.get("extreme_fast_followup_skip_statuses") or []
+            if isinstance(skip, str):
+                skip = [item.strip() for item in skip.split(",")]
+            if summary["status"] in {str(item).strip().lower() for item in skip}:
+                logger.info("Fast follow-up not sent: symbol=%s status=%s", symbol, summary["status"])
                 return
             message = format_fast_followup(
                 token=token,

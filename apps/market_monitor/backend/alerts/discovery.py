@@ -30,12 +30,15 @@ DEFAULT_DISCOVERY: Dict[str, Any] = {
     "thread_hours": 4.0,
     "upgrade_pct": 15.0,
     "daily_cap": 3,
+    "cap_exempt_runup_pct": 0.0,
+    "cap_exempt_max": 2,
     "directions": ["up", "down"],
     "push_directions": [],
     "instrument_types": [],
     "followup_enabled": True,
     "followup_minutes": 15,
     "followup_hold_pct": 1.0,
+    "followup_skip_statuses": [],
     "timezone_offset_hours": 8,
     "shadow_file": "discovery_shadow.jsonl",
     "state_file": "discovery_state.json",
@@ -74,6 +77,8 @@ class DiscoveryEngine:
         self.thread_ms = int(max(0.0, _to_float(self.settings.get("thread_hours"), 4.0)) * 3600 * 1000)
         self.upgrade_pct = max(0.0, _to_float(self.settings.get("upgrade_pct"), 15.0))
         self.daily_cap = max(1, int(_to_float(self.settings.get("daily_cap"), 3)))
+        self.cap_exempt_runup_pct = max(0.0, _to_float(self.settings.get("cap_exempt_runup_pct"), 0.0))
+        self.cap_exempt_max = max(0, int(_to_float(self.settings.get("cap_exempt_max"), 2)))
         self.directions = _direction_set(self.settings.get("directions"), default={"up", "down"})
         self.push_directions = _direction_set(self.settings.get("push_directions"), default=set()) & self.directions
         self.instrument_types = {
@@ -89,6 +94,7 @@ class DiscoveryEngine:
             self.state_path = self.runtime_dir / str(self.settings.get("state_file") or "discovery_state.json")
         self._threads: Dict[str, Dict[str, float]] = {}
         self._day_counts: Dict[str, int] = {}
+        self._exempt_counts: Dict[str, int] = {}
         self._load_state()
 
     @classmethod
@@ -127,10 +133,11 @@ class DiscoveryEngine:
             )
             if not triggers:
                 continue
-            decision = self._thread_decision(symbol, direction, now_ms, price)
+            runup_pct = runup_up_pct if direction == "up" else runup_down_pct
+            decision = self._thread_decision(symbol, direction, now_ms, price, runup_pct)
             if decision is None:
                 continue
-            kind, prev_price = decision
+            kind, prev_price, cap_exempt = decision
             row = {
                 "created_at": datetime.fromtimestamp(now_ms / 1000, timezone.utc).isoformat(),
                 "symbol": symbol,
@@ -141,9 +148,10 @@ class DiscoveryEngine:
                 "prev_price": prev_price,
                 "change_1m_pct": _round(change_1m_pct),
                 "rvol": _round(rvol),
-                "runup_pct": _round(runup_up_pct if direction == "up" else runup_down_pct),
+                "runup_pct": _round(runup_pct),
                 "runup_minutes": runup_minutes,
                 "day_count": self._day_counts.get(self._day_key(symbol, direction, now_ms), 0),
+                "cap_exempt": cap_exempt,
                 "mode": "live" if direction in self.push_directions else "shadow",
             }
             recorded.append(row)
@@ -189,9 +197,17 @@ class DiscoveryEngine:
             triggers.append("T2")
         return triggers
 
-    def _thread_decision(self, symbol: str, direction: str, now_ms: int, price: float) -> Optional[tuple]:
+    def _thread_decision(
+        self,
+        symbol: str,
+        direction: str,
+        now_ms: int,
+        price: float,
+        runup_pct: Optional[float] = None,
+    ) -> Optional[tuple]:
         day_key = self._day_key(symbol, direction, now_ms)
-        if self._day_counts.get(day_key, 0) >= self.daily_cap:
+        capped = self._day_counts.get(day_key, 0) >= self.daily_cap
+        if capped and not self._cap_exempt(day_key, direction, runup_pct):
             return None
         thread_key = f"{symbol}:{direction}"
         thread = self._threads.get(thread_key)
@@ -208,7 +224,18 @@ class DiscoveryEngine:
             kind = "new"
         self._threads[thread_key] = {"ts": now_ms, "price": price}
         self._day_counts[day_key] = self._day_counts.get(day_key, 0) + 1
-        return kind, prev_price
+        if capped:
+            self._exempt_counts[day_key] = self._exempt_counts.get(day_key, 0) + 1
+        return kind, prev_price, capped
+
+    def _cap_exempt(self, day_key: str, direction: str, runup_pct: Optional[float]) -> bool:
+        """A move that is already this large is the case the cap must not hide; allow a few extra per day."""
+        if self.cap_exempt_runup_pct <= 0 or runup_pct is None:
+            return False
+        sign = 1.0 if direction == "up" else -1.0
+        if sign * runup_pct < self.cap_exempt_runup_pct:
+            return False
+        return self._exempt_counts.get(day_key, 0) < self.cap_exempt_max
 
     def _day_key(self, symbol: str, direction: str, now_ms: int) -> str:
         day = datetime.fromtimestamp(now_ms / 1000, self.tz).date().isoformat()
@@ -242,6 +269,9 @@ class DiscoveryEngine:
             }
         if isinstance(counts, dict):
             self._day_counts = {str(k): int(v) for k, v in counts.items()}
+        exempt = payload.get("exempt_counts") if isinstance(payload, dict) else None
+        if isinstance(exempt, dict):
+            self._exempt_counts = {str(k): int(v) for k, v in exempt.items()}
 
     def _save_state(self, now_ms: int) -> None:
         if self.state_path is None:
@@ -249,10 +279,18 @@ class DiscoveryEngine:
         today = datetime.fromtimestamp(now_ms / 1000, self.tz).date().isoformat()
         self._threads = {k: v for k, v in self._threads.items() if now_ms - v["ts"] < self.thread_ms}
         self._day_counts = {k: v for k, v in self._day_counts.items() if k.startswith(today)}
+        self._exempt_counts = {k: v for k, v in self._exempt_counts.items() if k.startswith(today)}
         try:
             tmp = self.state_path.with_suffix(".tmp")
             tmp.write_text(
-                json.dumps({"saved_at": time.time(), "threads": self._threads, "day_counts": self._day_counts}),
+                json.dumps(
+                    {
+                        "saved_at": time.time(),
+                        "threads": self._threads,
+                        "day_counts": self._day_counts,
+                        "exempt_counts": self._exempt_counts,
+                    }
+                ),
                 encoding="utf-8",
             )
             tmp.replace(self.state_path)
@@ -313,6 +351,9 @@ class DiscoveryPusher:
         self.followup_enabled = _parse_bool(merged.get("followup_enabled"), True)
         self.followup_minutes = max(1, int(_to_float(merged.get("followup_minutes"), 15)))
         self.followup_hold_pct = max(0.0, _to_float(merged.get("followup_hold_pct"), 1.0))
+        self.followup_skip_statuses = {
+            str(item).strip().lower() for item in _as_list(merged.get("followup_skip_statuses")) if str(item).strip()
+        }
         self.client = client or FastFollowUpClient()
         self._tasks: set = set()
 
@@ -370,6 +411,14 @@ class DiscoveryPusher:
             )
             if summary is None:
                 logger.warning("Discovery follow-up skipped, no candles: symbol=%s", symbol)
+                return
+            if summary["status"] in self.followup_skip_statuses:
+                logger.info(
+                    "Discovery follow-up not sent: symbol=%s status=%s change=%.2f",
+                    symbol,
+                    summary["status"],
+                    summary["change_pct"],
+                )
                 return
             followup = format_fast_followup(
                 token=_token_name(symbol),

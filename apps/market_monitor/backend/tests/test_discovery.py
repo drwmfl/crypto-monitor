@@ -142,6 +142,53 @@ class DiscoveryShadowTests(unittest.TestCase):
         self.assertEqual((upgrade[0]["kind"], upgrade[0]["prev_price"]), ("upgrade", 1.0))
 
 
+class DiscoveryCapExemptionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.runtime_dir = self._tmp.name
+        self._env = patch.dict("os.environ", {"ALERT_STRATEGY_RUNTIME_DIR": self.runtime_dir})
+        self._env.start()
+
+    def tearDown(self) -> None:
+        self._env.stop()
+        self._tmp.cleanup()
+
+    def _shadow(self) -> DiscoveryShadow:
+        return DiscoveryShadow({
+            "enabled": True, "runtime_dir": self.runtime_dir, "daily_cap": 1, "thread_hours": 0,
+            "cap_exempt_runup_pct": 15.0, "cap_exempt_max": 2,
+        })
+
+    def test_big_move_gets_through_a_used_daily_cap_a_limited_number_of_times(self) -> None:
+        shadow = self._shadow()
+        results = [
+            _observe(shadow, runup_up_pct=runup, now_ms=T0 + i * MINUTE)
+            for i, runup in enumerate([9.0, 10.0, 16.0, 17.0, 18.0])
+        ]
+
+        self.assertEqual([len(r) for r in results], [1, 0, 1, 1, 0])
+        self.assertEqual([r[0]["cap_exempt"] for r in results if r], [False, True, True])
+
+    def test_exemption_needs_a_big_move_in_the_alert_direction(self) -> None:
+        shadow = self._shadow()
+        _observe(shadow, runup_up_pct=0.0, runup_down_pct=-9.0)
+
+        small = _observe(shadow, runup_up_pct=0.0, runup_down_pct=-12.0, now_ms=T0 + MINUTE)
+        big = _observe(shadow, runup_up_pct=0.0, runup_down_pct=-16.0, now_ms=T0 + 2 * MINUTE)
+
+        self.assertEqual(small, [])
+        self.assertTrue(big[0]["cap_exempt"])
+
+    def test_exemptions_used_survive_restart(self) -> None:
+        shadow = self._shadow()
+        for i, runup in enumerate([9.0, 16.0, 17.0]):
+            _observe(shadow, runup_up_pct=runup, now_ms=T0 + i * MINUTE)
+
+        restarted = self._shadow()
+
+        self.assertEqual(_observe(restarted, runup_up_pct=25.0, now_ms=T0 + 5 * MINUTE), [])
+
+
 class DiscoveryMessageTests(unittest.TestCase):
     def test_new_alert_message(self) -> None:
         row = {
@@ -199,6 +246,17 @@ class DiscoveryPusherTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("**⏱ 异动跟进 | CTK（15分钟后）**", calls[1].args[0])
         self.assertIn("✅ 状态：上涨延续", calls[1].args[0])
         self.assertNotIn("symbol", calls[1].kwargs)
+
+    async def test_flat_followup_is_not_sent(self) -> None:
+        pusher = self._pusher()
+        pusher.followup_skip_statuses = {"flat"}
+        pusher.client.fetch_1m_bars = AsyncMock(return_value=[[0, 100.0, 100.8, 99.6, 100.3]])
+
+        with self.assertLogs("alerts.discovery", level="INFO") as logs:
+            await pusher.push(dict(self.ROW))
+
+        self.assertEqual(pusher.notifier.notify_text.await_count, 1)
+        self.assertTrue(any("follow-up not sent" in line and "status=flat" in line for line in logs.output))
 
     async def test_no_followup_when_alert_not_sent(self) -> None:
         pusher = self._pusher(sent=False)

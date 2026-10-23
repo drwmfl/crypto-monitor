@@ -312,6 +312,9 @@
     "actionable_allowed_directions": [
       "up"
     ],
+    "legacy_push_directions": [
+      "down"
+    ],
     "factor_retry_enabled": true,
     "factor_retry_delay_sec": 4.0,
     "factor_retry_min_completeness_pct": 80.0,
@@ -342,6 +345,9 @@
     "extreme_fast_followup_enabled": true,
     "extreme_fast_followup_minutes": 15,
     "extreme_fast_followup_hold_pct": 1.0,
+    "extreme_fast_followup_skip_statuses": [
+      "flat"
+    ],
     "strong_direct_windows": [
       "1m"
     ],
@@ -740,6 +746,8 @@
     "thread_hours": 4.0,
     "upgrade_pct": 15.0,
     "daily_cap": 3,
+    "cap_exempt_runup_pct": 15.0,
+    "cap_exempt_max": 2,
     "directions": [
       "up",
       "down"
@@ -753,6 +761,9 @@
     "followup_enabled": true,
     "followup_minutes": 15,
     "followup_hold_pct": 1.0,
+    "followup_skip_statuses": [
+      "flat"
+    ],
     "timezone_offset_hours": 8,
     "shadow_file": "discovery_shadow.jsonl",
     "state_file": "discovery_state.json"

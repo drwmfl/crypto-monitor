@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import socket
 from typing import Any, Dict, List, Optional
@@ -15,9 +16,18 @@ Bar = List[float]  # [open_time_ms, open, high, low, close]
 class FastFollowUpClient:
     """Fetches the 1m candles printed since a fast alert went out."""
 
-    def __init__(self, *, base_url: str = "https://fapi.binance.com", timeout_sec: float = 5.0) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str = "https://fapi.binance.com",
+        timeout_sec: float = 5.0,
+        retries: int = 1,
+        retry_delay_sec: float = 3.0,
+    ) -> None:
         self.base_url = str(base_url or "https://fapi.binance.com").rstrip("/")
         self.timeout_sec = max(1.0, float(timeout_sec or 5.0))
+        self.retries = max(0, int(retries))
+        self.retry_delay_sec = max(0.0, float(retry_delay_sec))
         self._proxy = (
             os.getenv("ALERT_HTTPS_PROXY")
             or os.getenv("HTTPS_PROXY")
@@ -28,6 +38,20 @@ class FastFollowUpClient:
         )
 
     async def fetch_1m_bars(self, symbol: str, *, start_ms: int, limit: int) -> List[Bar]:
+        """Fetch the candles, retrying a failed or timed-out request (degraded networks are common here)."""
+        attempt = 0
+        while True:
+            try:
+                return await self._fetch_once(symbol, start_ms=start_ms, limit=limit)
+            except Exception:
+                # aiohttp reports its total timeout as TimeoutError; a real task cancellation is not an
+                # Exception and still propagates.
+                if attempt >= self.retries:
+                    raise
+            attempt += 1
+            await asyncio.sleep(self.retry_delay_sec)
+
+    async def _fetch_once(self, symbol: str, *, start_ms: int, limit: int) -> List[Bar]:
         if aiohttp is None:
             raise RuntimeError("aiohttp is not installed")
         params = {"symbol": symbol, "interval": "1m", "startTime": int(start_ms), "limit": max(1, int(limit))}

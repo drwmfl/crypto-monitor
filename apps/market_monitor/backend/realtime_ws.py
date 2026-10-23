@@ -169,7 +169,7 @@ class RealtimeKlineWatcher:
             logger.info(
                 (
                     "Discovery enabled: t1=%.1f%% rvol>=%.1f t2=%.1f%% t2_close_confirm=%s thread=%sh upgrade=%.1f%% "
-                    "cap=%s record=%s push=%s instruments=%s followup=%s/%sm file=%s"
+                    "cap=%s cap_exempt=%.1f%%x%s record=%s push=%s instruments=%s followup=%s/%sm skip=%s file=%s"
                 ),
                 self.discovery.t1_change_pct,
                 self.discovery.t1_min_rvol,
@@ -178,11 +178,14 @@ class RealtimeKlineWatcher:
                 self.discovery.thread_ms / 3600000,
                 self.discovery.upgrade_pct,
                 self.discovery.daily_cap,
+                self.discovery.cap_exempt_runup_pct,
+                self.discovery.cap_exempt_max,
                 sorted(self.discovery.directions),
                 sorted(self.discovery.push_directions),
                 sorted(self.discovery.instrument_types) or "all",
                 self.discovery_pusher.followup_enabled,
                 self.discovery_pusher.followup_minutes,
+                sorted(self.discovery_pusher.followup_skip_statuses),
                 self.discovery.shadow_path,
             )
         self._dropped_evaluations = 0

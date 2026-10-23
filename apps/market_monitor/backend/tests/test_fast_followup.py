@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
+from unittest.mock import AsyncMock
 
 try:
-    from alerts.fast_followup import format_fast_followup, summarize_followup
+    from alerts.fast_followup import FastFollowUpClient, format_fast_followup, summarize_followup
 except ModuleNotFoundError:
-    from apps.market_monitor.backend.alerts.fast_followup import format_fast_followup, summarize_followup
+    from apps.market_monitor.backend.alerts.fast_followup import (
+        FastFollowUpClient,
+        format_fast_followup,
+        summarize_followup,
+    )
 
 
 BARS_UP_THEN_FADE = [
@@ -47,6 +53,33 @@ class SummarizeFollowUpTests(unittest.TestCase):
         self.assertIn("推送价 0.1369 → 现价 0.1384（+1.10%）", message)
         self.assertIn("⚠️ 状态：冲高回落（期间最多涨 34.84%，已回吐过半）", message)
         self.assertIn("https://www.binance.com/futures/CTKUSDT", message)
+
+
+class FollowUpClientRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_retries_once_after_a_timeout(self) -> None:
+        client = FastFollowUpClient(retry_delay_sec=0)
+        client._fetch_once = AsyncMock(side_effect=[asyncio.TimeoutError(), [[0, 1.0, 1.0, 1.0, 1.0]]])
+
+        bars = await client.fetch_1m_bars("CTKUSDT", start_ms=0, limit=16)
+
+        self.assertEqual(bars, [[0, 1.0, 1.0, 1.0, 1.0]])
+        self.assertEqual(client._fetch_once.await_count, 2)
+
+    async def test_gives_up_after_the_retry(self) -> None:
+        client = FastFollowUpClient(retry_delay_sec=0)
+        client._fetch_once = AsyncMock(side_effect=asyncio.TimeoutError())
+
+        with self.assertRaises(asyncio.TimeoutError):
+            await client.fetch_1m_bars("CTKUSDT", start_ms=0, limit=16)
+        self.assertEqual(client._fetch_once.await_count, 2)
+
+    async def test_task_cancellation_is_not_retried(self) -> None:
+        client = FastFollowUpClient(retry_delay_sec=0)
+        client._fetch_once = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with self.assertRaises(asyncio.CancelledError):
+            await client.fetch_1m_bars("CTKUSDT", start_ms=0, limit=16)
+        self.assertEqual(client._fetch_once.await_count, 1)
 
 
 if __name__ == "__main__":
