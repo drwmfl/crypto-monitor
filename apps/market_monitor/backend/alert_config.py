@@ -217,6 +217,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "position_pressure_risk_enabled": False,
         "position_pressure_confirmation_enabled": False,
         "candidate_ttl_minutes": 120,
+        "candidate_save_interval_sec": 60.0,
+        "candidate_retention_hours": 24.0,
         "min_watch_score": 50.0,
         "min_actionable_score": 75.0,
         "max_watch_risk": 60.0,
@@ -358,6 +360,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                     "enabled": True,
                     "history_file": "oi_history.json",
                     "max_samples_per_symbol": 1200,
+                    "save_interval_sec": 600.0,
                     "bootstrap_ttl_sec": 300,
                     "bootstrap_refresh_sec": 3600,
                     "max_latest_sample_age_sec": 1800,
@@ -399,7 +402,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                     "basis_bootstrap_ttl_sec": 3600,
                     "basis_bootstrap_retry_sec": 1800,
                     "min_stats_samples": 20,
-                    "save_interval_sec": 10.0,
+                    "save_interval_sec": 600.0,
                     "max_window_sample_lag_sec": {
                         "5m": 600,
                         "15m": 1200,
@@ -490,7 +493,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                 "history_file": "smart_money_history.jsonl",
                 "max_history_samples": 360,
                 "min_sample_interval_sec": 45,
-                "save_interval_sec": 10.0,
+                "save_interval_sec": 600.0,
             },
             "position_pressure": {
                 "enabled": True,
@@ -2953,7 +2956,7 @@ def _normalize_config(config: Dict[str, Any]) -> Dict[str, Any]:
         1.0,
         _to_float(
             smart_money.get("save_interval_sec"),
-            _to_float(smart_defaults.get("save_interval_sec"), 10.0),
+            _to_float(smart_defaults.get("save_interval_sec"), 600.0),
         ),
     )
 

@@ -116,6 +116,7 @@ class AlertStrategyPipeline:
                 task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self.candidate_engine.save(force=True)
         await self.factor_enricher.close()
 
     async def process_event(self, payload: Dict[str, Any], *, source: str, notifier: Any) -> StrategyProcessResult:

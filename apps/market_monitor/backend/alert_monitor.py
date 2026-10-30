@@ -318,6 +318,37 @@ def _attach_ws_gap_if_needed(config: AlertConfig, feed: BinanceKlineDataFeed, ev
     )
 
 
+async def _monitor_event_loop_lag(
+    interval_sec: float = 1.0,
+    warn_sec: float = 2.0,
+    report_sec: float = 600.0,
+) -> None:
+    """Log event-loop stalls; a blocked loop stops reading the realtime websocket and Binance drops it."""
+    loop = asyncio.get_running_loop()
+    window_start = loop.time()
+    window_max = 0.0
+    stalls = 0
+    while True:
+        started = loop.time()
+        await asyncio.sleep(interval_sec)
+        lag = loop.time() - started - interval_sec
+        window_max = max(window_max, lag)
+        if lag >= warn_sec:
+            stalls += 1
+            logger.warning("Event loop stalled for %.1fs", lag)
+        if loop.time() - window_start >= report_sec:
+            logger.info(
+                "Event loop lag: max=%.2fs stalls(>=%.0fs)=%s window=%.0fs",
+                window_max,
+                warn_sec,
+                stalls,
+                report_sec,
+            )
+            window_start = loop.time()
+            window_max = 0.0
+            stalls = 0
+
+
 async def _initialize_feed_with_retry(feed: BinanceKlineDataFeed, retry_seconds: int = 15) -> None:
     while True:
         try:
@@ -345,6 +376,7 @@ async def run_alert_monitor(config_path: Optional[str] = None) -> None:
         config.data_feed.get("full_scan_windows", []),
     )
 
+    lag_task = asyncio.create_task(_monitor_event_loop_lag(), name="event_loop_lag")
     notifier = AlertNotifier.from_config(config.raw)
     await notifier.start()
     strategy = AlertStrategyPipeline.from_config(config.raw)
@@ -579,10 +611,12 @@ async def run_alert_monitor(config_path: Optional[str] = None) -> None:
             sleep_for = max(1.0, float(config.poll_interval_sec))
             await asyncio.sleep(sleep_for)
     finally:
-        if realtime_task is not None:
-            realtime_task.cancel()
+        for task in (realtime_task, lag_task):
+            if task is None:
+                continue
+            task.cancel()
             try:
-                await realtime_task
+                await task
             except asyncio.CancelledError:
                 pass
         await strategy.close()

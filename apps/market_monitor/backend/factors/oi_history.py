@@ -396,7 +396,7 @@ class OIHistoryStore:
             return
         self.history_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = self.history_path.with_suffix(self.history_path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps(self._state, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.write_text(json.dumps(self._state, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
         tmp_path.replace(self.history_path)
         self._dirty = False
         self._last_save_ts = now
