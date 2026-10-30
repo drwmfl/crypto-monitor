@@ -10,8 +10,10 @@ from typing import Any, Dict, Iterable, List, Optional
 
 try:
     from candidates.storage_paths import resolve_runtime_dir
+    from state_io import write_json_atomic
 except ModuleNotFoundError:
     from apps.market_monitor.backend.candidates.storage_paths import resolve_runtime_dir
+    from apps.market_monitor.backend.state_io import write_json_atomic
 
 
 WINDOW_MS: Dict[str, int] = {
@@ -386,10 +388,7 @@ class DerivativesHistoryStore:
         now = time.time()
         if self.save_interval_sec > 0 and (now - self._last_save_ts) < self.save_interval_sec:
             return
-        self.history_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = self.history_path.with_suffix(self.history_path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps(self._state, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-        tmp_path.replace(self.history_path)
+        write_json_atomic(self.history_path, self._state)
         self._dirty = False
         self._last_save_ts = now
 

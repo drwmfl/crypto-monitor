@@ -17,9 +17,11 @@ except ImportError:  # pragma: no cover
 try:
     from candidates.storage_paths import resolve_runtime_dir
     from factors.factor_models import FactorSnapshot, recent_health_entry
+    from state_io import write_json_atomic
 except ModuleNotFoundError:
     from apps.market_monitor.backend.candidates.storage_paths import resolve_runtime_dir
     from apps.market_monitor.backend.factors.factor_models import FactorSnapshot, recent_health_entry
+    from apps.market_monitor.backend.state_io import write_json_atomic
 
 
 logger = logging.getLogger(__name__)
@@ -391,16 +393,13 @@ class SmartMoneyProvider:
         if not force and now - self._last_save_ts < self.save_interval_sec:
             return
         self._last_save_ts = now
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": 1,
             "updated_at_ms": int(now * 1000),
             "cache": self._cache,
             "history": {symbol: list(rows) for symbol, rows in self._history.items()},
         }
-        tmp_path = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-        tmp_path.replace(self.state_path)
+        write_json_atomic(self.state_path, payload)
 
 
 def build_smart_money_metrics(

@@ -7,9 +7,11 @@ from typing import Any, Dict, Optional
 try:
     from candidates.candidate_models import Candidate
     from candidates.storage_paths import resolve_runtime_dir
+    from state_io import write_json_atomic
 except ModuleNotFoundError:
     from apps.market_monitor.backend.candidates.candidate_models import Candidate
     from apps.market_monitor.backend.candidates.storage_paths import resolve_runtime_dir
+    from apps.market_monitor.backend.state_io import write_json_atomic
 
 
 class CandidateStore:
@@ -37,13 +39,10 @@ class CandidateStore:
         return candidates
 
     def save_all(self, candidates: Dict[str, Candidate]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "candidates": {
                 key: candidate.to_dict()
                 for key, candidate in sorted(candidates.items(), key=lambda item: item[0])
             }
         }
-        tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
-        tmp_path.write_text(json.dumps(payload, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-        tmp_path.replace(self.path)
+        write_json_atomic(self.path, payload)
