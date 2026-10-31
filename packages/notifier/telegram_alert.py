@@ -46,9 +46,10 @@ def _to_markdown_v2(message: str) -> str:
     return "".join(parts)
 
 
-async def send_telegram_alert(token: str, chat_id: str, message: str) -> bool:
+async def send_telegram_alert(token: str, chat_id: str, message: str, silent: bool = False) -> bool:
     """
     Send a Telegram alert message asynchronously.
+    silent=True delivers the message without a notification sound.
     Returns True when sent successfully, otherwise False.
     """
     token = (token or "").strip()
@@ -83,6 +84,7 @@ async def send_telegram_alert(token: str, chat_id: str, message: str) -> bool:
                 text=payload,
                 parse_mode="MarkdownV2",
                 disable_web_page_preview=True,
+                disable_notification=bool(silent),
                 connect_timeout=connect_timeout,
                 read_timeout=read_timeout,
                 write_timeout=write_timeout,

@@ -165,6 +165,10 @@ class RealtimeKlineWatcher:
         self._realtime_1m_last_closed_start: Dict[str, int] = {}
         self.discovery = DiscoveryEngine.from_config(config.raw)
         self.discovery_pusher = DiscoveryPusher.from_config(config.raw, notifier)
+        push_router = getattr(strategy, "push_router", None)
+        if push_router is not None:
+            self.discovery_pusher.router = push_router
+            push_router.feature_provider = self._push_features
         if self.discovery.enabled:
             logger.info(
                 (
@@ -723,7 +727,8 @@ class RealtimeKlineWatcher:
         history = volume_history.setdefault(symbol, [])
         self._realtime_1m_volume_history = volume_history
         history.append(float(volume))
-        limit = max(20, int(getattr(self.feed, "volume_lookback", 20) or 20))
+        # rvol uses the last volume_lookback candles; the push router's 5m volume multiple needs an hour.
+        limit = max(RUNUP_LOOKBACK_MINUTES, int(getattr(self.feed, "volume_lookback", 20) or 20))
         if len(history) > limit:
             del history[:-limit]
 
@@ -829,14 +834,39 @@ class RealtimeKlineWatcher:
             )
             pusher = getattr(self, "discovery_pusher", None)
             if pusher is not None:
+                routing = bool(getattr(pusher, "routing", False))
                 for row in rows:
-                    if row.get("mode") == "live":
+                    # With the push router on it decides per row and direction; otherwise only live rows push.
+                    if routing or row.get("mode") == "live":
                         pusher.push(row)
         except Exception:
             logger.exception("Discovery observe failed: symbol=%s", symbol)
 
+    def _push_features(self, symbol: str, direction: str) -> Dict[str, Any]:
+        """Context for the push router: minutes since the 60m extreme, 5m volume multiple, 24h quote volume."""
+        features: Dict[str, Any] = {}
+        ranges = getattr(self, "_realtime_1m_range_history", {}).get(symbol) or []
+        if len(ranges) >= 30:
+            if direction == "down":
+                extreme = max(ranges, key=lambda row: row[1])
+            else:
+                extreme = min(ranges, key=lambda row: row[2])
+            features["speed_min"] = int((ranges[-1][0] - extreme[0]) // 60000) + 1
+        volumes = getattr(self, "_realtime_1m_volume_history", {}).get(symbol) or []
+        if len(volumes) >= 15:
+            prior = volumes[:-5]
+            baseline = sum(prior) / len(prior) * 5 if prior else 0.0
+            if baseline > 0:
+                features["vol5x"] = sum(volumes[-5:]) / baseline
+        quote_volume = getattr(getattr(self, "feed", None), "symbol_quote_volume", None) or {}
+        if quote_volume.get(symbol):
+            features["qv24"] = float(quote_volume[symbol])
+        return features
+
     def _realtime_1m_rvol(self, symbol: str, volume: float) -> Optional[float]:
         history = getattr(self, "_realtime_1m_volume_history", {}).get(symbol) or []
+        lookback = int(getattr(getattr(self, "feed", None), "volume_lookback", 20) or 20)
+        history = history[-lookback:]
         if not history or volume <= 0:
             return None
         baseline = sum(history) / len(history)

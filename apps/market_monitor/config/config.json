@@ -770,5 +770,43 @@
     "timezone_offset_hours": 8,
     "shadow_file": "discovery_shadow.jsonl",
     "state_file": "discovery_state.json"
+  },
+  "push_router": {
+    "enabled": true,
+    "thread_minutes": 60,
+    "context_window_minutes": 30,
+    "followups_silent": true,
+    "shadow_file": "push_router_shadow.jsonl",
+    "legacy": {
+      "up": {
+        "ring_types": ["strong_direct_alert", "actionable_alert", "startup_alert"],
+        "silent_types": ["risk_alert"],
+        "windows": ["1m", "5m"]
+      },
+      "down": {
+        "ring_types": ["strong_direct_alert"],
+        "silent_types": [],
+        "windows": ["1m", "5m"]
+      }
+    },
+    "discovery": {
+      "t2_full_runup_pct": 10.0,
+      "up": {
+        "t1_max_speed_minutes": 30,
+        "t2_low_enabled": true,
+        "t2_low_min_vol5x": 2.0,
+        "t2_low_ring_vol5x": 3.0,
+        "t2_high_min_qv24": 0,
+        "upgrade_mode": "silent"
+      },
+      "down": {
+        "t1_max_speed_minutes": 0,
+        "t2_low_enabled": false,
+        "t2_low_min_vol5x": 0,
+        "t2_low_ring_vol5x": 0,
+        "t2_high_min_qv24": 5000000,
+        "upgrade_mode": "silent"
+      }
+    }
   }
 }

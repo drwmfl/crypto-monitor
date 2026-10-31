@@ -15,6 +15,7 @@ try:
     from alerts.event_deduper import EventDeduper
     from alerts.alert_policy import AlertDecision, AlertPolicy
     from alerts.fast_followup import FastFollowUpClient, format_fast_followup, summarize_followup
+    from alerts.push_router import PushRouter
     from alerts.tg_formatter import UNCONFIRMED_FAST_REASON, format_strategy_alert
     from alerts.trade_confirmation import confirmation_count, confirmation_stage, evaluate_trade_confirmation
     from candidates.candidate_engine import CandidateEngine
@@ -33,6 +34,7 @@ except ModuleNotFoundError:
         format_fast_followup,
         summarize_followup,
     )
+    from apps.market_monitor.backend.alerts.push_router import PushRouter
     from apps.market_monitor.backend.alerts.tg_formatter import UNCONFIRMED_FAST_REASON, format_strategy_alert
     from apps.market_monitor.backend.alerts.trade_confirmation import (
         confirmation_count,
@@ -89,12 +91,36 @@ class AlertStrategyPipeline:
             base_url=str(binance_settings.get("base_url") or "https://fapi.binance.com"),
         )
         self._symbol_locks: Dict[str, asyncio.Lock] = {}
+        # Shared with the discovery pusher; disabled unless the top-level push_router config enables it.
+        self.push_router: Optional[PushRouter] = None
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> "AlertStrategyPipeline":
         raw_settings = config.get("alert_strategy", {}) if isinstance(config, dict) else {}
         settings = raw_settings if isinstance(raw_settings, dict) else {}
-        return cls(settings=settings)
+        pipeline = cls(settings=settings)
+        pipeline.push_router = PushRouter.from_config(config if isinstance(config, dict) else {})
+        return pipeline
+
+    def _active_router(self) -> Optional[PushRouter]:
+        router = getattr(self, "push_router", None)
+        return router if router is not None and router.enabled else None
+
+    def _route_legacy(self, candidate: Any, alert_type: str):
+        router = self._active_router()
+        if router is None:
+            return None
+        latest = candidate.latest_features or {}
+        return router.route_legacy(
+            symbol=candidate.symbol,
+            direction=str(latest.get("direction") or ""),
+            alert_type=alert_type,
+            window=str(latest.get("window") or ""),
+        )
+
+    def _followups_silent(self) -> bool:
+        router = self._active_router()
+        return bool(router and router.followups_silent)
 
     @property
     def enabled(self) -> bool:
@@ -427,12 +453,19 @@ class AlertStrategyPipeline:
         return True
 
     async def _send_decision(self, *, notifier: Any, candidate: Any, decision: AlertDecision) -> bool:
-        if self._legacy_push_muted(candidate, decision.alert_type):
+        route = self._route_legacy(candidate, decision.alert_type)
+        if route is not None:
+            if not route.send:
+                return False
+        elif self._legacy_push_muted(candidate, decision.alert_type):
             return False
         detail_level = str(self.settings.get("telegram_detail_level") or "compact")
         message = format_strategy_alert(candidate, decision, detail_level=detail_level)
+        if route is not None:
+            message = self.push_router.decorate(message, route)
         level = "high" if decision.alert_type in {"actionable_alert", "risk_alert"} else "medium"
         if hasattr(notifier, "notify_text"):
+            extra = {"silent": True} if route is not None and route.silent else {}
             sent = await notifier.notify_text(
                 message,
                 symbol=candidate.symbol,
@@ -446,9 +479,12 @@ class AlertStrategyPipeline:
                     "confirmation_stage": confirmation_stage(candidate),
                     "alert_type": decision.alert_type,
                 },
+                **extra,
             )
             if sent:
                 self._record_factor_quality(candidate, decision.alert_type, decision.reason)
+            elif route is not None:
+                self.push_router.release(route)
             return sent
         logger.warning("Notifier does not support notify_text; strategy alert dropped: %s", candidate.symbol)
         return False
@@ -1243,13 +1279,20 @@ class AlertStrategyPipeline:
         return _to_int(self.settings.get(fallback_key), default)
 
     async def _send_strong_direct(self, *, notifier: Any, candidate: Any, fast_path: bool = False) -> bool:
-        if self._legacy_push_muted(candidate, "strong_direct_alert"):
+        route = self._route_legacy(candidate, "strong_direct_alert")
+        if route is not None:
+            if not route.send:
+                return False
+        elif self._legacy_push_muted(candidate, "strong_direct_alert"):
             return False
         detail_level = str(self.settings.get("telegram_detail_level") or "compact")
         reason = UNCONFIRMED_FAST_REASON if fast_path else "strong_direct"
         decision = AlertDecision(True, alert_type="strong_direct_alert", reason=reason)
         message = format_strategy_alert(candidate, decision, detail_level=detail_level)
+        if route is not None:
+            message = self.push_router.decorate(message, route)
         if hasattr(notifier, "notify_text"):
+            extra = {"silent": True} if route is not None and route.silent else {}
             sent = await notifier.notify_text(
                 message,
                 symbol=candidate.symbol,
@@ -1265,9 +1308,12 @@ class AlertStrategyPipeline:
                     "strong_direct": True,
                     "fast_path": fast_path,
                 },
+                **extra,
             )
             if sent:
                 self._record_factor_quality(candidate, "strong_direct_alert", reason)
+            elif route is not None:
+                self.push_router.release(route)
             return sent
         logger.warning("Notifier does not support notify_text; strong direct alert dropped: %s", candidate.symbol)
         return False
@@ -1336,11 +1382,13 @@ class AlertStrategyPipeline:
                 summary=summary,
             )
             # No symbol here: a follow-up must not bump the daily push counter in the title.
+            extra = {"silent": True} if self._followups_silent() else {}
             sent = await notifier.notify_text(
                 message,
                 rule_name="strategy_fast_followup",
                 level="medium",
                 metadata={"symbol": symbol, "alert_type": "fast_followup", "status": summary["status"]},
+                **extra,
             )
             logger.info(
                 "Fast follow-up processed: symbol=%s minutes=%s change=%.2f status=%s sent=%s",

@@ -356,6 +356,12 @@ class DiscoveryPusher:
         }
         self.client = client or FastFollowUpClient()
         self._tasks: set = set()
+        # Set by the realtime watcher to the strategy pipeline's PushRouter (strategy A).
+        self.router: Any = None
+
+    @property
+    def routing(self) -> bool:
+        return self.router is not None and bool(getattr(self.router, "enabled", False))
 
     @classmethod
     def from_config(cls, config: Dict[str, Any], notifier: Any) -> "DiscoveryPusher":
@@ -365,7 +371,13 @@ class DiscoveryPusher:
     def push(self, row: Dict[str, Any]) -> Optional[asyncio.Task]:
         if self.notifier is None or not hasattr(self.notifier, "notify_text"):
             return None
-        task = asyncio.create_task(self._send(row), name=f"discovery_push_{row.get('symbol')}")
+        route = None
+        if self.routing:
+            # Routed synchronously so the shared thread is claimed before any other push can run.
+            route = self.router.route_discovery(row)
+            if not route.send:
+                return None
+        task = asyncio.create_task(self._send(row, route), name=f"discovery_push_{row.get('symbol')}")
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
         return task
@@ -380,10 +392,15 @@ class DiscoveryPusher:
     def _followup_delay_sec(self) -> float:
         return float(self.followup_minutes * 60)
 
-    async def _send(self, row: Dict[str, Any]) -> None:
+    async def _send(self, row: Dict[str, Any], route: Any = None) -> None:
         symbol = str(row.get("symbol") or "")
         try:
             message = format_discovery_alert(row, followup_minutes=self.followup_minutes if self.followup_enabled else None)
+            extra: Dict[str, Any] = {}
+            if route is not None:
+                message = self.router.decorate(message, route)
+                if route.silent:
+                    extra["silent"] = True
             sent = await self.notifier.notify_text(
                 message,
                 symbol=symbol,
@@ -396,8 +413,11 @@ class DiscoveryPusher:
                     "triggers": row.get("triggers"),
                     "runup_pct": row.get("runup_pct"),
                 },
+                **extra,
             )
             logger.info("Discovery push: symbol=%s kind=%s sent=%s", symbol, row.get("kind"), sent)
+            if not sent and route is not None:
+                self.router.release(route)
             if not sent or not self.followup_enabled:
                 return
             sent_ms = int(time.time() * 1000)
@@ -429,11 +449,13 @@ class DiscoveryPusher:
                 title="异动跟进",
             )
             # No symbol here: a follow-up must not bump the daily push counter in the title.
+            followup_extra = {"silent": True} if self.routing and self.router.followups_silent else {}
             await self.notifier.notify_text(
                 followup,
                 rule_name="discovery_followup",
                 level="medium",
                 metadata={"symbol": symbol, "alert_type": "discovery_followup", "status": summary["status"]},
+                **followup_extra,
             )
             logger.info("Discovery follow-up: symbol=%s status=%s change=%.2f", symbol, summary["status"], summary["change_pct"])
         except asyncio.CancelledError:

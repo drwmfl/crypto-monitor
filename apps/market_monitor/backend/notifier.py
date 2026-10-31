@@ -375,6 +375,7 @@ class AlertNotifier:
         rule_name: str = "strategy_alert",
         level: str = "medium",
         metadata: Optional[Dict[str, Any]] = None,
+        silent: bool = False,
     ) -> bool:
         normalized_level = str(level or "medium").strip().lower()
         if normalized_level == "low" and not self.send_low_priority:
@@ -396,7 +397,7 @@ class AlertNotifier:
             message = self._apply_daily_push_title(message, daily_push_count)
 
         if not self.queue_enabled:
-            ok = await self._send_now(message)
+            ok = await self._send_now(message, silent=silent)
             if ok:
                 logger.info("Strategy alert sent: symbol=%s rule=%s level=%s", symbol, rule_name, normalized_level)
             else:
@@ -411,6 +412,7 @@ class AlertNotifier:
             level=normalized_level,
             metadata=metadata or {},
         )
+        item["silent"] = bool(silent)
         await self._enqueue_item(item)
         logger.info(
             "Strategy alert queued: symbol=%s rule=%s level=%s | queue_stats=%s",
@@ -730,7 +732,7 @@ class AlertNotifier:
                     self._schedule_retry(item_id=item_id, delay_sec=max(0.1, next_retry_ts - now_ts))
                     continue
 
-                ok = await self._send_now(str(item.get("message", "")))
+                ok = await self._send_now(str(item.get("message", "")), silent=bool(item.get("silent")))
                 if ok:
                     self._pending.pop(item_id, None)
                     await self._persist_pending()
@@ -780,8 +782,15 @@ class AlertNotifier:
             finally:
                 self._queue.task_done()
 
-    async def _send_now(self, message: str) -> bool:
+    async def _send_now(self, message: str, silent: bool = False) -> bool:
         try:
+            if silent:
+                return await send_telegram_alert(
+                    token=self.token,
+                    chat_id=self.chat_id,
+                    message=message,
+                    silent=True,
+                )
             return await send_telegram_alert(
                 token=self.token,
                 chat_id=self.chat_id,

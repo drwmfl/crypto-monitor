@@ -186,6 +186,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "shadow_file": "discovery_shadow.jsonl",
         "state_file": "discovery_state.json",
     },
+    # Strategy A router over both strategies; full defaults live in alerts/push_router.py.
+    # Disabled = the legacy pipeline and discovery push independently, as before.
+    "push_router": {
+        "enabled": False,
+    },
     "alert_strategy": {
         "enabled": True,
         "direct_tg_enabled": False,
