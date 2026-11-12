@@ -127,11 +127,89 @@ class PushRouterTests(unittest.TestCase):
         self.assertIn("🤝 30分钟内同时命中：异动持续", lines)
         self.assertIn("🔕 次要信号（静音）", lines)
 
+    def test_dropped_families_can_be_readmitted_silently(self) -> None:
+        router = PushRouter({"enabled": True, "runtime_dir": self.tmp.name, "discovery": {
+            "up": {"t1_slow_mode": "silent", "t2_low_weak_mode": "silent"}, "down": {"t2_low_enabled": True}}})
+        features = {"vol5x": 1.2, "speed_min": 45}
+        router.feature_provider = lambda symbol, direction: dict(features)
+        weak = router.route_discovery(_row("A1USDT"))
+        self.assertTrue(weak.send and weak.silent)
+        self.assertEqual(weak.reason, "t2_low_weak_silent")
+        slow = router.route_discovery(_row("A2USDT", triggers=("T1",)))
+        self.assertTrue(slow.send and slow.silent)
+        self.assertEqual(slow.reason, "t1_slow_silent")
+        down = router.route_discovery(_row("D1USDT", "down", runup=8.5))
+        self.assertTrue(down.send and down.silent)
+
+    def test_ring_takes_over_thread_held_by_silent_push(self) -> None:
+        first = self.router.route_legacy(symbol="AAAUSDT", direction="up", alert_type="risk_alert", window="1m")
+        self.assertTrue(first.send and first.silent)
+        ring = self.router.route_legacy(symbol="AAAUSDT", direction="up", alert_type="startup_alert", window="1m")
+        self.assertTrue(ring.send)
+        self.assertFalse(ring.silent)
+        again = self.router.route_legacy(symbol="AAAUSDT", direction="up", alert_type="startup_alert", window="1m")
+        self.assertFalse(again.send)
+        silent_again = self.router.route_legacy(symbol="AAAUSDT", direction="up", alert_type="risk_alert", window="1m")
+        self.assertFalse(silent_again.send)
+
+    def test_blocked_instrument_types_are_dropped(self) -> None:
+        router = PushRouter({"enabled": True, "runtime_dir": self.tmp.name, "blocked_instrument_types": ["stock"]})
+        r = router.route_legacy(symbol="TSLAUSDT", direction="up", alert_type="startup_alert", window="1m", instrument_type="stock")
+        self.assertFalse(r.send)
+        self.assertEqual(r.reason, "instrument_blocked")
+        r = router.route_legacy(symbol="AAAUSDT", direction="up", alert_type="startup_alert", window="1m", instrument_type="crypto")
+        self.assertTrue(r.send)
+        r = router.route_legacy(symbol="BBBUSDT", direction="up", alert_type="startup_alert", window="1m")
+        self.assertTrue(r.send)
+
     def test_every_verdict_is_recorded(self) -> None:
         self.router.route_legacy(symbol="AAAUSDT", direction="down", alert_type="risk_alert", window="1m")
         rows = [json.loads(line) for line in (Path(self.tmp.name) / "push_router_shadow.jsonl").read_text("utf-8").splitlines()]
         self.assertEqual(rows[-1]["reason"], "legacy_type_filtered")
         self.assertFalse(rows[-1]["send"])
+
+
+class BurstDigestTests(unittest.IsolatedAsyncioTestCase):
+    def _router(self, tmp: str, notifier) -> PushRouter:
+        router = PushRouter({"enabled": True, "runtime_dir": tmp, "burst": {
+            "enabled": True, "min_coins": 3, "window_sec": 60, "quiet_sec": 0.05, "max_hold_sec": 0.2}})
+        router.notifier = notifier
+        router.feature_provider = lambda symbol, direction: {"qv24": 1e7}
+        return router
+
+    async def test_market_wide_move_is_merged_into_one_digest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            notifier = SimpleNamespace(notify_text=AsyncMock(return_value=True))
+            router = self._router(tmp, notifier)
+            routes = [router.route_discovery(_row(f"C{i}USDT", "down", triggers=("T1",), runup=-6.0)) for i in range(6)]
+            # The first two still go out on their own; from the third coin on they are held for the digest.
+            self.assertEqual([r.send for r in routes], [True, True, False, False, False, False])
+            self.assertEqual(routes[2].reason, "market_burst:t1_ring")
+            await asyncio.sleep(0.4)
+            self.assertEqual(notifier.notify_text.await_count, 1)
+            message = notifier.notify_text.await_args.args[0]
+            self.assertIn("市场集体急跌 | 4 个币同时异动", message)
+            self.assertIn("• C5 | 异动1分钟急变 | -6.0% | 24h额 1000万", message)
+            self.assertEqual(notifier.notify_text.await_args.kwargs["rule_name"], "market_burst")
+            # Absorbed coins keep their thread, and the other direction is unaffected.
+            self.assertFalse(router.route_discovery(_row("C5USDT", "down", triggers=("T1",))).send)
+            self.assertTrue(router.route_discovery(_row("C5USDT", "up", triggers=("T1",))).send)
+
+    async def test_same_coin_repeats_do_not_trigger_burst(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            notifier = SimpleNamespace(notify_text=AsyncMock(return_value=True))
+            router = self._router(tmp, notifier)
+            for _ in range(5):
+                router.route_discovery(_row("AAAUSDT", "down", triggers=("T1",)))
+            self.assertTrue(router.route_discovery(_row("BBBUSDT", "down", triggers=("T1",))).send)
+            await asyncio.sleep(0.3)
+            self.assertEqual(notifier.notify_text.await_count, 0)
+
+    def test_burst_is_off_without_notifier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            router = self._router(tmp, None)
+            routes = [router.route_discovery(_row(f"C{i}USDT", "down", triggers=("T1",))) for i in range(6)]
+            self.assertTrue(all(r.send for r in routes))
 
 
 class DiscoveryPusherRoutingTests(unittest.TestCase):
@@ -232,6 +310,11 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(router.enabled)
         self.assertEqual(router.thread_sec, 3600)
         self.assertEqual(router.discovery["up"]["t2_low_min_vol5x"], 2.0)
+        self.assertEqual(router.discovery["up"]["t2_low_weak_mode"], "silent")
+        self.assertTrue(router.discovery["down"]["t2_low_enabled"])
+        self.assertEqual(router.blocked_instruments, {"stock"})
+        self.assertTrue(router.burst_enabled)
+        self.assertEqual(router.burst_min_coins, 6)
 
 
 if __name__ == "__main__":

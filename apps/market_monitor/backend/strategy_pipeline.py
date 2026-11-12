@@ -116,6 +116,8 @@ class AlertStrategyPipeline:
             direction=str(latest.get("direction") or ""),
             alert_type=alert_type,
             window=str(latest.get("window") or ""),
+            instrument_type=latest.get("instrument_type"),
+            change_pct=latest.get("change_pct"),
         )
 
     def _followups_silent(self) -> bool:

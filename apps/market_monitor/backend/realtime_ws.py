@@ -169,6 +169,7 @@ class RealtimeKlineWatcher:
         if push_router is not None:
             self.discovery_pusher.router = push_router
             push_router.feature_provider = self._push_features
+            push_router.notifier = notifier
         if self.discovery.enabled:
             logger.info(
                 (
