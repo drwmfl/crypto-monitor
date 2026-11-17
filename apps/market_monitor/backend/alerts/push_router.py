@@ -25,6 +25,13 @@ DEFAULT_PUSH_ROUTER: Dict[str, Any] = {
     # A ringing signal may take over a thread that so far only carried a silent push.
     "ring_overrides_silent_thread": True,
     "blocked_instrument_types": [],
+    # Inside an active thread, a signal whose price moved min_move_pct beyond the last delivered push
+    # rings again instead of being dropped, so an accelerating move is not silenced for a full thread.
+    "escalation": {
+        "enabled": False,
+        "min_move_pct": 15.0,
+        "directions": ["up"],
+    },
     # Market-wide moves: once min_coins coins fire in one direction within window_sec, further pushes
     # are held back and delivered as a single digest message.
     "burst": {
@@ -102,6 +109,8 @@ class Route:
     co_signals: List[str] = field(default_factory=list)
     claimed_at: float = 0.0
     move_pct: Optional[float] = None
+    escalation_pct: Optional[float] = None
+    base_reason: str = ""
 
 
 class PushRouter:
@@ -126,6 +135,12 @@ class PushRouter:
         self.blocked_instruments = {
             str(item).strip().lower() for item in _as_list(merged.get("blocked_instrument_types")) if str(item).strip()
         }
+        escalation = merged.get("escalation") if isinstance(merged.get("escalation"), dict) else {}
+        self.escalation_enabled = _parse_bool(escalation.get("enabled"), False)
+        self.escalation_min_pct = max(0.1, _to_float(escalation.get("min_move_pct"), 15.0))
+        self.escalation_directions = {
+            str(item).strip().lower() for item in _as_list(escalation.get("directions")) if str(item).strip()
+        }
         burst = merged.get("burst") if isinstance(merged.get("burst"), dict) else {}
         self.burst_enabled = _parse_bool(burst.get("enabled"), False)
         self.burst_min_coins = max(2, int(_to_float(burst.get("min_coins"), 6)))
@@ -140,7 +155,8 @@ class PushRouter:
         if self.enabled:
             runtime_dir = resolve_runtime_dir(merged)
             self.shadow_path = runtime_dir / str(merged.get("shadow_file") or "push_router_shadow.jsonl")
-        self._threads: Dict[Tuple[str, str], Tuple[float, bool]] = {}
+        # coin+direction -> (claimed at, claimed by a silent push, price of that push)
+        self._threads: Dict[Tuple[str, str], Tuple[float, bool, float]] = {}
         self._burst_recent: Dict[str, List[Tuple[float, str]]] = {}
         self._burst_pending: Dict[str, List[Tuple[float, Route]]] = {}
         self._burst_tasks: Dict[str, asyncio.Task] = {}
@@ -174,6 +190,7 @@ class PushRouter:
         window: str,
         instrument_type: Any = None,
         change_pct: Any = None,
+        price: Any = None,
     ) -> Route:
         symbol = str(symbol or "").upper()
         direction = str(direction or "").lower()
@@ -183,6 +200,8 @@ class PushRouter:
         features = self.features(symbol, direction)
         if change_pct is not None:
             features["move_pct"] = _to_float(change_pct, 0.0)
+        if _to_float(price, 0.0) > 0:
+            features["price"] = _to_float(price, 0.0)
         rules = self.legacy.get(direction) if isinstance(self.legacy.get(direction), dict) else None
         if rules is None:
             # Unknown direction: nothing to filter on, keep the old behaviour.
@@ -216,6 +235,8 @@ class PushRouter:
         features = self.features(symbol, direction)
         if row.get("runup_pct") is not None:
             features["move_pct"] = _to_float(row.get("runup_pct"), 0.0)
+        if _to_float(row.get("price"), 0.0) > 0:
+            features["price"] = _to_float(row.get("price"), 0.0)
         rules = self.discovery.get(direction) if isinstance(self.discovery.get(direction), dict) else {}
         speed = features.get("speed_min")
         vol5x = features.get("vol5x")
@@ -269,6 +290,9 @@ class PushRouter:
 
     def decorate(self, message: str, route: Route) -> str:
         extra: List[str] = []
+        if route.escalation_pct is not None:
+            verb = "涨" if route.direction == "up" else "跌"
+            extra.append(f"🚀 行情加速：较上次推送再{verb} {abs(route.escalation_pct):.1f}%")
         parts = []
         speed = route.features.get("speed_min")
         if speed is not None:
@@ -318,17 +342,24 @@ class PushRouter:
             features=features,
             co_signals=co_signals,
             move_pct=features.pop("move_pct", None),
+            base_reason=reason,
         )
+        price = _to_float(features.get("price"), 0.0)
+        last = self._threads.get(key)
+        active = last is not None and now - last[0] < self.thread_sec
+        blocked = send and active and not (self.ring_overrides_silent and last[1] and not silent)
+        if active and (blocked or not send) and reason != "instrument_blocked":
+            escalation = self._escalation_pct(direction, price, last[2])
+            if escalation is not None:
+                send, blocked = True, False
+                route.send, route.silent, route.reason = True, False, "escalation_ring"
+                route.escalation_pct = escalation
         if send:
-            last = self._threads.get(key)
-            blocked = last is not None and now - last[0] < self.thread_sec
-            if blocked and self.ring_overrides_silent and last[1] and not silent:
-                blocked = False
             if blocked:
                 route.send = False
                 route.reason = f"thread_dedupe:{reason}"
             else:
-                self._threads[key] = (now, silent)
+                self._threads[key] = (now, route.silent, price)
                 route.claimed_at = now
                 if self._absorb_into_burst(route, now):
                     # The thread stays claimed: the coin is reported through the digest.
@@ -336,6 +367,12 @@ class PushRouter:
                     route.reason = f"market_burst:{reason}"
         self._record(route, now)
         return route
+
+    def _escalation_pct(self, direction: str, price: float, last_price: float) -> Optional[float]:
+        if not self.escalation_enabled or direction not in self.escalation_directions or price <= 0 or last_price <= 0:
+            return None
+        move = (price / last_price - 1) * 100 if direction == "up" else (1 - price / last_price) * 100
+        return move if move >= self.escalation_min_pct else None
 
     def _absorb_into_burst(self, route: Route, now: float) -> bool:
         if not self.burst_enabled or self.notifier is None or not hasattr(self.notifier, "notify_text"):
@@ -421,6 +458,9 @@ class PushRouter:
             "features": {k: _round(v) for k, v in route.features.items()},
             "co_signals": route.co_signals,
         }
+        if route.escalation_pct is not None:
+            row["escalation_pct"] = _round(route.escalation_pct)
+            row["base_reason"] = route.base_reason
         try:
             with self.shadow_path.open("a", encoding="utf-8") as fh:
                 fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")

@@ -118,6 +118,7 @@ class AlertStrategyPipeline:
             window=str(latest.get("window") or ""),
             instrument_type=latest.get("instrument_type"),
             change_pct=latest.get("change_pct"),
+            price=latest.get("price"),
         )
 
     def _followups_silent(self) -> bool:

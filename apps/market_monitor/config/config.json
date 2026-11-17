@@ -779,6 +779,11 @@
     "shadow_file": "push_router_shadow.jsonl",
     "ring_overrides_silent_thread": true,
     "blocked_instrument_types": ["stock"],
+    "escalation": {
+      "enabled": true,
+      "min_move_pct": 15.0,
+      "directions": ["up"]
+    },
     "burst": {
       "enabled": true,
       "min_coins": 6,
@@ -802,7 +807,7 @@
     "discovery": {
       "t2_full_runup_pct": 10.0,
       "up": {
-        "t1_max_speed_minutes": 30,
+        "t1_max_speed_minutes": 0,
         "t1_slow_mode": "silent",
         "t2_low_weak_mode": "silent",
         "t2_low_enabled": true,

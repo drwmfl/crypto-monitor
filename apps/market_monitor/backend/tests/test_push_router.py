@@ -162,6 +162,60 @@ class PushRouterTests(unittest.TestCase):
         r = router.route_legacy(symbol="BBBUSDT", direction="up", alert_type="startup_alert", window="1m")
         self.assertTrue(r.send)
 
+    def _escalating_router(self, **escalation) -> PushRouter:
+        settings = {"enabled": True, "min_move_pct": 15.0, "directions": ["up"]}
+        settings.update(escalation)
+        return PushRouter({"enabled": True, "runtime_dir": self.tmp.name, "escalation": settings})
+
+    def test_escalation_rings_again_when_price_runs_past_last_push(self) -> None:
+        router = self._escalating_router()
+        legacy = dict(symbol="AAAUSDT", direction="up", window="1m")
+        self.assertTrue(router.route_legacy(alert_type="startup_alert", price=1.0, **legacy).send)
+        # +10% inside the thread: still deduped.
+        self.assertFalse(router.route_legacy(alert_type="strong_direct_alert", price=1.10, **legacy).send)
+        # +16%: rings again, even for a type that would otherwise be silent or filtered.
+        r = router.route_legacy(alert_type="risk_alert", price=1.16, **legacy)
+        self.assertTrue(r.send)
+        self.assertFalse(r.silent)
+        self.assertEqual(r.reason, "escalation_ring")
+        self.assertIn("🚀 行情加速：较上次推送再涨 16.0%", router.decorate("title\n🔗 https://x", r).split("\n"))
+        # The next escalation is measured from the escalated push, not from the first one.
+        self.assertFalse(router.route_legacy(alert_type="startup_alert", price=1.30, **legacy).send)
+        filtered = router.route_legacy(symbol="AAAUSDT", direction="up", alert_type="startup_alert", window="15m", price=1.34)
+        self.assertEqual(filtered.reason, "escalation_ring")
+        rows = [json.loads(line) for line in (Path(self.tmp.name) / "push_router_shadow.jsonl").read_text("utf-8").splitlines()]
+        self.assertEqual(rows[-1]["base_reason"], "legacy_window_filtered")
+        self.assertEqual(rows[-1]["features"]["price"], 1.34)
+
+    def test_escalation_applies_to_discovery_rows_and_only_inside_a_thread(self) -> None:
+        router = self._escalating_router()
+        router.feature_provider = lambda symbol, direction: {"vol5x": 4.0}
+        # No earlier push: a filtered signal stays filtered whatever its price.
+        self.assertFalse(router.route_legacy(symbol="BBBUSDT", direction="up", alert_type="startup_alert", window="15m", price=9.0).send)
+        self.assertTrue(router.route_discovery(dict(_row("AAAUSDT"), price=1.0)).send)
+        upgrade = router.route_discovery(dict(_row("AAAUSDT", kind="upgrade"), price=1.2))
+        self.assertEqual(upgrade.reason, "escalation_ring")
+        self.assertFalse(upgrade.silent)
+
+    def test_escalation_respects_direction_and_missing_price(self) -> None:
+        router = self._escalating_router()
+        down = dict(symbol="AAAUSDT", direction="down", alert_type="strong_direct_alert", window="1m")
+        self.assertTrue(router.route_legacy(price=1.0, **down).send)
+        self.assertFalse(router.route_legacy(price=0.7, **down).send)
+        up = dict(symbol="BBBUSDT", direction="up", alert_type="startup_alert", window="1m")
+        self.assertTrue(router.route_legacy(**up).send)
+        self.assertFalse(router.route_legacy(price=5.0, **up).send)
+        blocked = PushRouter({"enabled": True, "runtime_dir": self.tmp.name, "blocked_instrument_types": ["stock"],
+                              "escalation": {"enabled": True, "directions": ["up"]}})
+        stock = dict(symbol="TSLAUSDT", direction="up", alert_type="startup_alert", window="1m")
+        blocked._threads[("TSLAUSDT", "up")] = (__import__("time").time(), False, 1.0)
+        self.assertFalse(blocked.route_legacy(price=2.0, instrument_type="stock", **stock).send)
+
+    def test_escalation_is_off_by_default(self) -> None:
+        legacy = dict(symbol="AAAUSDT", direction="up", alert_type="startup_alert", window="1m")
+        self.assertTrue(self.router.route_legacy(price=1.0, **legacy).send)
+        self.assertFalse(self.router.route_legacy(price=2.0, **legacy).send)
+
     def test_every_verdict_is_recorded(self) -> None:
         self.router.route_legacy(symbol="AAAUSDT", direction="down", alert_type="risk_alert", window="1m")
         rows = [json.loads(line) for line in (Path(self.tmp.name) / "push_router_shadow.jsonl").read_text("utf-8").splitlines()]
@@ -315,6 +369,10 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(router.blocked_instruments, {"stock"})
         self.assertTrue(router.burst_enabled)
         self.assertEqual(router.burst_min_coins, 6)
+        self.assertEqual(router.discovery["up"]["t1_max_speed_minutes"], 0)
+        self.assertTrue(router.escalation_enabled)
+        self.assertEqual(router.escalation_min_pct, 15.0)
+        self.assertEqual(router.escalation_directions, {"up"})
 
 
 if __name__ == "__main__":
