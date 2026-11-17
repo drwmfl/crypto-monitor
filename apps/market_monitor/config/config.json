@@ -344,7 +344,7 @@
     "extreme_fast_min_rvol": 4.0,
     "extreme_fast_recent_alert_suppress_minutes": 45,
     "extreme_fast_shadow_only": false,
-    "extreme_fast_followup_enabled": true,
+    "extreme_fast_followup_enabled": false,
     "extreme_fast_followup_minutes": 15,
     "extreme_fast_followup_hold_pct": 1.0,
     "extreme_fast_followup_skip_statuses": [
@@ -761,7 +761,7 @@
     "instrument_types": [
       "crypto"
     ],
-    "followup_enabled": true,
+    "followup_enabled": false,
     "followup_minutes": 15,
     "followup_hold_pct": 1.0,
     "followup_skip_statuses": [
@@ -779,6 +779,7 @@
     "shadow_file": "push_router_shadow.jsonl",
     "ring_overrides_silent_thread": true,
     "blocked_instrument_types": ["stock"],
+    "silent_compact": true,
     "escalation": {
       "enabled": true,
       "min_move_pct": 15.0,
@@ -814,7 +815,7 @@
         "t2_low_min_vol5x": 2.0,
         "t2_low_ring_vol5x": 3.0,
         "t2_high_min_qv24": 0,
-        "upgrade_mode": "silent"
+        "upgrade_mode": "drop"
       },
       "down": {
         "t1_max_speed_minutes": 0,

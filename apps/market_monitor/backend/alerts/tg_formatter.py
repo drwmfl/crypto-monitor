@@ -16,14 +16,14 @@ ALERT_TYPE_LABELS = {
     "watchlist_alert": "观察候选",
     "actionable_alert": "高价值候选",
     "risk_alert": "高风险提醒",
-    "strong_direct_alert": "急速异动",
+    "strong_direct_alert": "异动发现",
     "startup_alert": "启动预警",
 }
 ALERT_TYPE_ICONS = {
     "watchlist_alert": "👀",
     "actionable_alert": "💎",
     "risk_alert": "🚨",
-    "strong_direct_alert": "⚡",
+    "strong_direct_alert": "🔎",
     "startup_alert": "🚀",
 }
 
@@ -54,22 +54,31 @@ def format_strategy_alert(
     change = _fmt_pct(latest.get("change_pct"))
     badge = instrument_badge(latest.get("instrument_type"))
     title_badge = f" | {badge}" if badge else ""
-    if decision.reason == UNCONFIRMED_FAST_REASON:
-        alert_label = f"{alert_label}·未确认"
-
-    lines = [
-        f"**{alert_icon} {alert_label} | {token_name}（触发{trigger_count}次）{title_badge}**",
-        _market_line(
-            direction=direction,
-            window=str(latest.get("window") or windows or "N/A"),
-            change=change,
-            rvol=_fmt_x(latest.get("rvol")),
-            price=price,
-        ),
-    ]
-    runup_line = _runup_line(latest)
-    if runup_line:
-        lines.append(runup_line)
+    lines = [f"**{alert_icon} {alert_label} | {token_name}（触发{trigger_count}次）{title_badge}**"]
+    if decision.alert_type == "strong_direct_alert":
+        # Same trigger as the discovery engine's 1-minute spike, so it is shown as the same card;
+        # what this pipeline adds is the factor confirmation.
+        lines.extend(
+            _spike_lines(
+                latest,
+                direction=direction,
+                window=str(latest.get("window") or windows or "N/A"),
+                confirmed=decision.reason != UNCONFIRMED_FAST_REASON,
+            )
+        )
+    else:
+        lines.append(
+            _market_line(
+                direction=direction,
+                window=str(latest.get("window") or windows or "N/A"),
+                change=change,
+                rvol=_fmt_x(latest.get("rvol")),
+                price=price,
+            )
+        )
+        runup_line = _runup_line(latest)
+        if runup_line:
+            lines.append(runup_line)
     oi_line = _oi_summary_line(derivatives)
     if oi_line:
         lines.append(oi_line)
@@ -126,6 +135,25 @@ def _market_line(
 ) -> str:
     icon = {"上涨": "📈", "下跌": "📉"}.get(direction, "📊")
     return f"{icon} 异动：{window}{direction} {change} | RVOL {rvol} | 现价 {price}"
+
+
+def _spike_lines(latest: Dict[str, Any], *, direction: str, window: str, confirmed: bool) -> list[str]:
+    icon = {"上涨": "📈", "下跌": "📉"}.get(direction, "📊")
+    span = {"1m": "1分钟", "5m": "5分钟", "15m": "15分钟"}.get(window, window)
+    parts: list[str] = []
+    runup = _safe_optional_float(latest.get("runup_pct"))
+    if runup is not None:
+        minutes = max(1, int(_safe_float(latest.get("runup_minutes"), 1.0)))
+        parts.append(f"近{minutes}分钟 {runup:+.2f}%")
+    parts.append(f"{span} {_fmt_pct(latest.get('change_pct'))}")
+    rvol = _fmt_x(latest.get("rvol"))
+    if rvol != "N/A":
+        parts.append(f"RVOL {rvol}")
+    move = {"上涨": "急拉", "下跌": "急跌"}.get(direction, "急变")
+    trigger = f"🧭 触发：{span}{move}" + (" + 多因子确认" if confirmed else "（幅度过大，未等确认）")
+    price = _safe_optional_float(latest.get("price"))
+    price_text = f"{price:.8f}".rstrip("0").rstrip(".") if price and price > 0 else "N/A"
+    return [f"{icon} " + " | ".join(parts), trigger, f"💵 现价 {price_text}"]
 
 
 def _runup_line(latest: Dict[str, Any]) -> str:

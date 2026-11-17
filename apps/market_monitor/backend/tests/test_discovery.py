@@ -215,7 +215,7 @@ class DiscoveryMessageTests(unittest.TestCase):
 
         message = format_discovery_alert(row)
 
-        self.assertIn("**🔥 异动加速 | CTK（触发1次）**", message)
+        self.assertIn("**🔥 行情加速 | CTK（触发1次）**", message)
         self.assertIn("较上次提醒 0.1369 → 0.16（+16.87%） | 近61分钟 +42.10%", message)
         self.assertIn("⚠️ 加速阶段，注意过热回落", message)
         self.assertNotIn("分钟后跟进", message)

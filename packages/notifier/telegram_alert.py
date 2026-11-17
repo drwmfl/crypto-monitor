@@ -21,21 +21,24 @@ def _to_markdown_v2(message: str) -> str:
     Convert plain text / **bold** message into safe MarkdownV2 text.
     - Normal text will be escaped.
     - **bold** segments are converted to MarkdownV2 *bold*.
+    - [text](https://url) becomes an inline link.
     """
     if not message:
         return ""
 
-    bold_pattern = re.compile(r"\*\*(.+?)\*\*")
+    token_pattern = re.compile(r"\*\*(.+?)\*\*|\[([^\[\]\n]+)\]\((https?://[^\s()\\]+)\)")
     parts = []
     last_end = 0
 
-    for match in bold_pattern.finditer(message):
+    for match in token_pattern.finditer(message):
         normal_text = message[last_end:match.start()]
-        bold_text = match.group(1)
-
         if normal_text:
             parts.append(_escape_markdown_v2(normal_text))
-        parts.append(f"*{_escape_markdown_v2(bold_text)}*")
+        if match.group(1) is not None:
+            parts.append(f"*{_escape_markdown_v2(match.group(1))}*")
+        else:
+            # Inside the (...) part of a link only ")" and "\" need escaping; the pattern excludes both.
+            parts.append(f"[{_escape_markdown_v2(match.group(2))}]({match.group(3)})")
 
         last_end = match.end()
 

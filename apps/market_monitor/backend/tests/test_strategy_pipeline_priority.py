@@ -317,8 +317,9 @@ class StrategyPipelinePriorityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.alert_type, "strong_direct_alert")
         notifier.notify_text.assert_awaited_once()
         message = notifier.notify_text.await_args.args[0]
-        self.assertIn("**⚡ 急速异动·未确认 | MET", message)
-        self.assertIn("📏 已涨幅：近30分钟 +21.60%", message)
+        self.assertIn("**🔎 异动发现 | MET", message)
+        self.assertIn("📈 近30分钟 +21.60% | 1分钟 +8.20%", message)
+        self.assertIn("🧭 触发：1分钟急拉（幅度过大，未等确认）", message)
         self.assertNotIn("📊 OI：", message)
         self.assertEqual(pipeline.event_deduper.sent, [("METUSDT", "strong_direct_alert")])
         self.assertEqual(pipeline.policy.sent, [("METUSDT", "strong_direct_alert")])

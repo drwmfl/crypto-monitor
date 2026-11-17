@@ -115,7 +115,7 @@ class StrategyTemplateIconTests(unittest.TestCase):
         expected = {
             "actionable_alert": "**💎 高价值候选 |",
             "risk_alert": "**🚨 高风险提醒 |",
-            "strong_direct_alert": "**⚡ 急速异动 |",
+            "strong_direct_alert": "**🔎 异动发现 |",
             "startup_alert": "**🚀 启动预警 |",
         }
 
@@ -130,7 +130,13 @@ class StrategyTemplateIconTests(unittest.TestCase):
                 for prefix in ("📊 OI：", "⚖️ 仓位：", "🧲 收筹："):
                     self.assertTrue(any(line.startswith(prefix) for line in lines), prefix)
                 self.assertTrue(lines[-1].startswith("🔗 https://www.binance.com/futures/"))
-                self.assertTrue(lines[1].startswith("📈 异动："))
+                if alert_type == "strong_direct_alert":
+                    # Shown as the discovery engine's spike card, plus the factor confirmation.
+                    self.assertEqual(lines[1], "📈 1分钟 +4.17% | RVOL 7.20x")
+                    self.assertEqual(lines[2], "🧭 触发：1分钟急拉 + 多因子确认")
+                    self.assertEqual(lines[3], "💵 现价 0.07239")
+                else:
+                    self.assertTrue(lines[1].startswith("📈 异动："))
                 self.assertEqual(any(line.startswith("✅ 确认：") for line in lines), alert_type == "actionable_alert")
                 self.assertEqual(any(line.startswith("⚠️ 风险：") for line in lines), alert_type == "risk_alert")
                 self.assertEqual(
@@ -199,8 +205,22 @@ class StrategyTemplateIconTests(unittest.TestCase):
         )
 
         lines = message.splitlines()
-        self.assertTrue(lines[0].startswith("**⚡ 急速异动 |"))
-        self.assertTrue(lines[1].startswith("📉 异动：1m下跌 -7.60%"))
+        self.assertTrue(lines[0].startswith("**🔎 异动发现 |"))
+        self.assertTrue(lines[1].startswith("📉 1分钟 -7.60%"))
+        self.assertEqual(lines[2], "🧭 触发：1分钟急跌 + 多因子确认")
+
+    def test_unconfirmed_fast_alert_says_so_in_the_trigger_line(self) -> None:
+        candidate = self._candidate()
+        candidate.latest_features.update({"runup_pct": 21.6, "runup_minutes": 30})
+
+        message = format_strategy_alert(
+            candidate,
+            AlertDecision(True, alert_type="strong_direct_alert", reason="extreme_fast_unconfirmed"),
+        )
+
+        lines = message.splitlines()
+        self.assertEqual(lines[1], "📈 近30分钟 +21.60% | 1分钟 +4.17% | RVOL 7.20x")
+        self.assertEqual(lines[2], "🧭 触发：1分钟急拉（幅度过大，未等确认）")
 
     def test_verbose_optional_lines_keep_semantic_icons(self) -> None:
         message = format_strategy_alert(

@@ -355,6 +355,97 @@ class LegacyPipelineRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await pipeline._send_strong_direct(notifier=working, candidate=self._candidate("down")))
 
 
+class CompactSilentTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.features = {"vol5x": 2.5}
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _router(self, **settings):
+        router = PushRouter({"enabled": True, "runtime_dir": self.tmp.name, "silent_compact": True, **settings})
+        router.feature_provider = lambda symbol, direction: dict(self.features)
+        return router
+
+    def test_silent_discovery_push_becomes_one_line_with_link_on_the_coin(self) -> None:
+        router = self._router()
+        route = router.route_discovery(dict(_row("AKEUSDT", runup=8.4), price=0.002701))
+        self.assertTrue(route.send and route.silent)
+        message = router.decorate("**🔎 异动发现 | AKE（触发1次）**\n📈 近60分钟 +8.40%\n🔗 https://x", route)
+        self.assertEqual(
+            message,
+            "🔕 📈 [AKE](https://www.binance.com/futures/AKEUSDT) 持续拉升 +8.4% | 5分钟量 2.5倍 | 现价 0.002701",
+        )
+
+    def test_ringing_push_keeps_the_full_card(self) -> None:
+        self.features = {"vol5x": 4.0}
+        router = self._router()
+        route = router.route_discovery(_row("AKEUSDT"))
+        self.assertFalse(route.silent)
+        message = router.decorate("**🔎 异动发现 | AKE（触发1次）**\n🔗 https://x", route)
+        self.assertEqual(message.split("\n")[0], "**🔎 异动发现 | AKE（触发1次）**")
+        self.assertNotIn("🔕", message)
+
+    def test_silent_risk_alert_keeps_its_reason(self) -> None:
+        router = self._router()
+        route = router.route_legacy(symbol="AKEUSDT", direction="up", alert_type="risk_alert", window="1m",
+                                    change_pct=5.2, price=1.5)
+        message = router.decorate("**🚨 高风险提醒 | AKE（触发1次）**\n⚠️ 风险：1m涨幅过热 | 量能确认偏弱\n🔗 https://x", route)
+        self.assertEqual(
+            message,
+            "🔕 📈 [AKE](https://www.binance.com/futures/AKEUSDT) 高风险提醒 +5.2% | 风险：1m涨幅过热 | 量能确认偏弱"
+            " | 5分钟量 2.5倍 | 现价 1.5",
+        )
+
+    def test_silent_upgrade_shows_move_since_previous_alert(self) -> None:
+        router = self._router()
+        row = dict(_row("AKEUSDT", "down", kind="upgrade", runup=-30.0), price=0.8, prev_price=1.0)
+        route = router.route_discovery(row)
+        self.assertTrue(route.send and route.silent)
+        self.assertTrue(router.decorate("x", route).startswith(
+            "🔕 📉 [AKE](https://www.binance.com/futures/AKEUSDT) 行情加速 较上次 -20.0%"))
+
+    def test_non_ascii_symbol_is_percent_encoded_in_the_link(self) -> None:
+        router = self._router()
+        route = router.route_discovery(_row("币安人生USDT"))
+        self.assertIn("[币安人生](https://www.binance.com/futures/%E5%B8%81%E5%AE%89%E4%BA%BA%E7%94%9FUSDT)",
+                      router.decorate("x", route))
+
+    def test_dropped_up_upgrade_still_escalates_inside_a_thread(self) -> None:
+        router = self._router(
+            escalation={"enabled": True, "min_move_pct": 15.0, "directions": ["up"]},
+            discovery={"up": {"upgrade_mode": "drop"}},
+        )
+        # On its own an up upgrade is no longer pushed.
+        alone = router.route_discovery(dict(_row("BBBUSDT", kind="upgrade"), price=1.2, prev_price=1.0))
+        self.assertFalse(alone.send)
+        self.assertEqual(alone.reason, "upgrade_drop")
+        # Inside a thread, +15% beyond the delivered push rings as an escalation, without a duplicate line.
+        self.features = {"vol5x": 4.0}
+        self.assertTrue(router.route_discovery(dict(_row("AAAUSDT"), price=1.0)).send)
+        upgrade = router.route_discovery(dict(_row("AAAUSDT", kind="upgrade"), price=1.2, prev_price=1.0))
+        self.assertEqual(upgrade.reason, "escalation_ring")
+        self.assertFalse(upgrade.silent)
+        self.assertNotIn("🚀 行情加速", router.decorate("**🔥 行情加速 | AAA（触发1次）**\n🔗 https://x", upgrade))
+
+
+class MarkdownLinkTests(unittest.TestCase):
+    def test_link_survives_markdown_v2_conversion(self) -> None:
+        from packages.notifier.telegram_alert import _to_markdown_v2
+
+        text = _to_markdown_v2("🔕 📈 [AKE](https://www.binance.com/futures/AKEUSDT) 持续拉升 +8.4% | 现价 0.0027")
+        self.assertEqual(
+            text,
+            "🔕 📈 [AKE](https://www.binance.com/futures/AKEUSDT) 持续拉升 \\+8\\.4% \\| 现价 0\\.0027",
+        )
+
+    def test_bold_and_plain_brackets_are_unchanged(self) -> None:
+        from packages.notifier.telegram_alert import _to_markdown_v2
+
+        self.assertEqual(_to_markdown_v2("**A | B** [x] (y)"), "*A \\| B* \\[x\\] \\(y\\)")
+
+
 class ConfigTests(unittest.TestCase):
     def test_production_config_enables_router_with_strategy_a(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -373,6 +464,12 @@ class ConfigTests(unittest.TestCase):
         self.assertTrue(router.escalation_enabled)
         self.assertEqual(router.escalation_min_pct, 15.0)
         self.assertEqual(router.escalation_directions, {"up"})
+        # Plan 1 (11-17): no follow-ups, no separate up upgrade push, silent pushes as one line.
+        self.assertTrue(router.silent_compact)
+        self.assertEqual(router.discovery["up"]["upgrade_mode"], "drop")
+        self.assertEqual(router.discovery["down"]["upgrade_mode"], "silent")
+        self.assertFalse(config.raw["discovery"]["followup_enabled"])
+        self.assertFalse(config.raw["alert_strategy"]["extreme_fast_followup_enabled"])
 
 
 if __name__ == "__main__":

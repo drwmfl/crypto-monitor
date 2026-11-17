@@ -76,7 +76,8 @@ class ConfigNormalizationTests(unittest.TestCase):
         strategy = load_alert_config(config_path=str(CONFIG_PATH)).raw["alert_strategy"]
 
         self.assertFalse(strategy["extreme_fast_shadow_only"])
-        self.assertTrue(strategy["extreme_fast_followup_enabled"])
+        # Follow-ups were switched off on 2026-11-17: their status did not predict what came next.
+        self.assertFalse(strategy["extreme_fast_followup_enabled"])
         self.assertEqual(strategy["extreme_fast_followup_minutes"], 15)
         self.assertEqual(strategy["startup_alert_min_confirmations"], 3)
         self.assertEqual(strategy["actionable_allowed_directions"], ["up"])

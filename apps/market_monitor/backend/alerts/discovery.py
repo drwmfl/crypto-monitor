@@ -315,7 +315,7 @@ def format_discovery_alert(row: Dict[str, Any], *, followup_minutes: Optional[in
         prev = _to_float(row.get("prev_price"), 0.0)
         price = _to_float(row.get("price"), 0.0)
         extra = (price / prev - 1) * 100 if prev > 0 else 0.0
-        lines.append(f"**🔥 异动加速 | {token}（触发1次）**")
+        lines.append(f"**🔥 行情加速 | {token}（触发1次）**")
         lines.append(
             f"{move_icon} 较上次提醒 {_fmt_price(prev)} → {_fmt_price(price)}（{extra:+.2f}%）"
             f" | 近{minutes}分钟 {runup:+.2f}%"

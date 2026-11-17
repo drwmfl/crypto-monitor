@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 try:
     from candidates.storage_paths import resolve_runtime_dir
@@ -25,6 +26,8 @@ DEFAULT_PUSH_ROUTER: Dict[str, Any] = {
     # A ringing signal may take over a thread that so far only carried a silent push.
     "ring_overrides_silent_thread": True,
     "blocked_instrument_types": [],
+    # Silent pushes are delivered as a single line instead of the full card.
+    "silent_compact": False,
     # Inside an active thread, a signal whose price moved min_move_pct beyond the last delivered push
     # rings again instead of being dropped, so an accelerating move is not silenced for a full thread.
     "escalation": {
@@ -80,16 +83,35 @@ DEFAULT_PUSH_ROUTER: Dict[str, Any] = {
 }
 
 LEGACY_LABELS = {
-    "strong_direct_alert": "强势直推",
+    "strong_direct_alert": "急变已确认",
     "actionable_alert": "可操作",
     "startup_alert": "启动",
     "risk_alert": "风险",
 }
 DISCOVERY_LABELS = {
-    "upgrade": "异动加速",
+    "upgrade": "行情加速",
     "T1": "异动1分钟急变",
     "T2_low": "异动持续",
     "T2_high": "异动持续",
+}
+# Names used in the one-line form of a silent push: (family, direction) -> wording.
+COMPACT_NAMES = {
+    ("T1", "up"): "1分钟急拉",
+    ("T1", "down"): "1分钟急跌",
+    ("T2_low", "up"): "持续拉升",
+    ("T2_low", "down"): "持续下跌",
+    ("T2_high", "up"): "持续拉升",
+    ("T2_high", "down"): "持续下跌",
+    ("upgrade", "up"): "行情加速",
+    ("upgrade", "down"): "行情加速",
+    ("risk_alert", "up"): "高风险提醒",
+    ("risk_alert", "down"): "高风险提醒",
+    ("strong_direct_alert", "up"): "1分钟急拉",
+    ("strong_direct_alert", "down"): "1分钟急跌",
+    ("actionable_alert", "up"): "高价值候选",
+    ("actionable_alert", "down"): "高价值候选",
+    ("startup_alert", "up"): "启动预警",
+    ("startup_alert", "down"): "启动预警",
 }
 
 
@@ -132,6 +154,7 @@ class PushRouter:
         self.legacy = merged.get("legacy") if isinstance(merged.get("legacy"), dict) else {}
         self.discovery = merged.get("discovery") if isinstance(merged.get("discovery"), dict) else {}
         self.ring_overrides_silent = _parse_bool(merged.get("ring_overrides_silent_thread"), True)
+        self.silent_compact = _parse_bool(merged.get("silent_compact"), False)
         self.blocked_instruments = {
             str(item).strip().lower() for item in _as_list(merged.get("blocked_instrument_types")) if str(item).strip()
         }
@@ -237,6 +260,10 @@ class PushRouter:
             features["move_pct"] = _to_float(row.get("runup_pct"), 0.0)
         if _to_float(row.get("price"), 0.0) > 0:
             features["price"] = _to_float(row.get("price"), 0.0)
+            prev_price = _to_float(row.get("prev_price"), 0.0)
+            if family == "upgrade" and prev_price > 0:
+                # Move since the discovery engine's previous alert on this coin.
+                features["step_pct"] = (features["price"] / prev_price - 1) * 100.0
         rules = self.discovery.get(direction) if isinstance(self.discovery.get(direction), dict) else {}
         speed = features.get("speed_min")
         vol5x = features.get("vol5x")
@@ -289,8 +316,11 @@ class PushRouter:
             self._threads.pop(key, None)
 
     def decorate(self, message: str, route: Route) -> str:
+        if route.silent and self.silent_compact:
+            return self._compact(message, route)
         extra: List[str] = []
-        if route.escalation_pct is not None:
+        # An upgrade row already says "行情加速" in its title and shows the price step.
+        if route.escalation_pct is not None and route.family != "upgrade":
             verb = "涨" if route.direction == "up" else "跌"
             extra.append(f"🚀 行情加速：较上次推送再{verb} {abs(route.escalation_pct):.1f}%")
         parts = []
@@ -314,6 +344,30 @@ class PushRouter:
         lines = message.split("\n")
         link_at = next((i for i in range(len(lines) - 1, -1, -1) if lines[i].startswith("🔗")), len(lines))
         return "\n".join(lines[:link_at] + extra + lines[link_at:])
+
+    @staticmethod
+    def _compact(message: str, route: Route) -> str:
+        """One-line form of a silent push; the coin name carries the chart link."""
+        up = route.direction == "up"
+        name = COMPACT_NAMES.get((route.family, route.direction), route.label)
+        url = f"https://www.binance.com/futures/{quote(route.symbol, safe='')}"
+        head = f"🔕 {'📈' if up else '📉'} [{_token_name(route.symbol)}]({url}) {name}"
+        step = route.features.get("step_pct")
+        if route.family == "upgrade" and step is not None:
+            head += f" 较上次 {step:+.1f}%"
+        elif route.move_pct is not None:
+            head += f" {route.move_pct:+.1f}%"
+        parts = [head]
+        risk = next((line for line in message.split("\n") if line.startswith("⚠️ 风险：")), "")
+        if risk:
+            parts.append(risk[len("⚠️ "):])
+        vol5x = route.features.get("vol5x")
+        if vol5x is not None:
+            parts.append(f"5分钟量 {vol5x:.1f}倍")
+        price = _to_float(route.features.get("price"), 0.0)
+        if price > 0:
+            parts.append("现价 " + f"{price:.8f}".rstrip("0").rstrip("."))
+        return " | ".join(parts)
 
     def _finish_route(
         self,
